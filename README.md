@@ -79,6 +79,7 @@ Provides path resolution and workspace helper utilities:
 ### 2. `src/get_metadata.py`
 Fetches and stores bibliographic metadata:
 - `get_entry_discovery(arXiv_id)`: Retrieves paper metadata including title, authors, submission date, revision dates, venue, categories, and abstract.
+- `get_entry_discovery_batch(arXiv_ids)`: Same metadata for many papers with few requests (up to 100 IDs per arXiv API call); returns `None` for IDs arXiv does not have.
 - `save_metadata(arXiv_id, metadata)`: Serializes and saves the metadata dictionary to `metadata.json` under the paper directory.
 
 ### 3. `src/get_full_source.py`
@@ -126,12 +127,26 @@ pip install -r src/requirements.txt
 
 ## Usage
 
-### Running via Jupyter Notebook
-Launch the scraping notebook:
+### Running on Google Colab (benchmark testbed)
+`src/scraper.ipynb` is the end-to-end entry point of the scraper. It crawls all 25,000 assigned papers on one Colab CPU instance across several sessions and resumes from on-disk state.
+
+1. Open [`src/scraper.ipynb` in Colab](https://colab.research.google.com/github/DuyNhat1705/Intro2DS-Group3-Source/blob/main/src/scraper.ipynb) and choose *Runtime → Change runtime type → CPU*.
+2. Recommended: add a Semantic Scholar API key under *Secrets* named `S2_API_KEY` (enable notebook access).
+3. *Runtime → Run all*. The notebook clones this repository and installs `src/requirements.txt`; if it asks for a restart, use *Runtime → Restart session* and *Run all* again.
+4. Google Drive is mounted and `data/` is stored at `MyDrive/Intro2DS-Group3/data`, so progress survives across sessions.
+5. A session crawls until everything is done, until `MAX_RUN_HOURS` (11.5 h), or until a service refuses requests; the analysis part then rebuilds the tables and statistics. Keep the browser tab open.
+6. In each new session, open the notebook and *Run all* again; finished work is never repeated.
+
+All parameters are in the single configuration cell (§2): `RANGES_TO_RUN`, `SAMPLE_N` (e.g. `20` for a trial run), `METADATA_BATCH_SIZE`, `ARXIV_DELAY` (≥ 3 s), `COOLDOWN_SEC` / `MAX_COOLDOWNS` (pause on persistent HTTP 429), `MAX_RUN_HOURS`, and `PERSIST_TO_DRIVE`.
+
+Outputs: one folder per paper in `data/` (`metadata.json`, `references.json`, `v1/`, `v2/`, … with only `.tex`/`.bib` files), the tables `data/tables/{papers,references,references_all}.parquet`, run logs in `data/run_logs/`, and small statistics files for the Jupyter Book report in `data/report_exports/`.
+
+### Running locally
 ```bash
+pip install -r src/requirements.txt
 jupyter lab src/scraper.ipynb
 ```
-Follow the cells to run metadata collection, source extraction, and reference queries for target arXiv IDs.
+Open the notebook from inside the repository; `data/` is created at the repository root.
 
 ### Using as Python Modules
 Import functions into custom scraping scripts or batch pipelines:
@@ -161,3 +176,6 @@ The project uses the following libraries specified in `src/requirements.txt`:
 - [`arxiv`](https://pypi.org/project/arxiv/) (`==4.0.1`): Wrapper for the arXiv API.
 - [`requests`](https://pypi.org/project/requests/) (`==2.34.0`): HTTP requests for scraping and API queries.
 - [`psutil`](https://pypi.org/project/psutil/) (`==7.2.2`): Process and system resource monitoring.
+- [`pandas`](https://pypi.org/project/pandas/) (`==3.1.0`) and [`pyarrow`](https://pypi.org/project/pyarrow/) (`==26.0.0`): Data tables and Parquet output.
+- [`tqdm`](https://pypi.org/project/tqdm/) (`==4.70.1`): Progress bars.
+- [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Quick sanity-check plots in the notebook.

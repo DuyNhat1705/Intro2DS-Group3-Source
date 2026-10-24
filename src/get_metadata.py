@@ -59,7 +59,8 @@ def _fetch_arxiv_results_with_retry(
     id_list: List[str],
     progress_prefix: str = "",
 ) -> List[arxiv.Result]:
-    search = arxiv.Search(id_list=id_list)
+    # max_results mặc định của arxiv.Search là 100: đặt bằng số id để batch không bị cắt bớt
+    search = arxiv.Search(id_list=id_list, max_results=len(id_list))
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -136,21 +137,34 @@ def get_entry_discovery(
         raise ValueError(f"{progress_prefix}Không tìm thấy bài báo: {base_id}")
 
     latest_paper = latest_results[0]
-    
+
     # Hậu tố vN ở entry_id của bản mới nhất chính là tổng số version của bài báo
     num_versions = _extract_version_num(latest_paper.entry_id)
 
+    version_results: List[arxiv.Result] = []
+    if num_versions > 1:
+        # Nếu có nhiều version, gom toàn bộ ID từ v1 -> vN vào 1 lần gọi API để lấy ngày của từng bản
+        version_ids = [f"{base_id}v{v}" for v in range(1, num_versions + 1)]
+        logger.info(f"{progress_prefix}Bài {base_id} có {num_versions} versions, đang lấy lịch sử ngày...")
+        version_results = _fetch_arxiv_results_with_retry(version_ids, progress_prefix=progress_prefix)
+
+    metadata = _build_metadata(base_id, latest_paper, version_results)
+    logger.info(
+        f"{progress_prefix}Xong {base_id} (v{num_versions}, ngày nộp: {metadata['submission_date']}, "
+        f"sửa: {len(metadata['revised_dates'])} lần)."
+    )
+    return metadata
+
+
+def _build_metadata(base_id: str, latest_paper: arxiv.Result, version_results: List[arxiv.Result]) -> Dict[str, Any]:
+    """Dựng metadata từ bản mới nhất và (nếu có nhiều version) kết quả v1..vN; dùng chung cho bản đơn và batch."""
+    num_versions = _extract_version_num(latest_paper.entry_id)
 
     # Lấy submission_date và revised_dates
     if num_versions == 1:
         submission_date = latest_paper.published.date().isoformat() if latest_paper.published else ""
         revised_dates: List[str] = []
     else:
-        # Nếu có nhiều version, gom toàn bộ ID từ v1 -> vN vào 1 lần gọi API để lấy ngày của từng bản
-        version_ids = [f"{base_id}v{v}" for v in range(1, num_versions + 1)]
-        logger.info(f"{progress_prefix}Bài {base_id} có {num_versions} versions, đang lấy lịch sử ngày...")
-        version_results = _fetch_arxiv_results_with_retry(version_ids, progress_prefix=progress_prefix)
-
         # Sắp xếp lại các version theo thứ tự
         version_results_sorted = sorted(
             version_results,
@@ -197,11 +211,49 @@ def get_entry_discovery(
         "categories": list(latest_paper.categories) if latest_paper.categories else [],
         "abstract": clean_abstract,
     }
-
-    logger.info(
-        f"{progress_prefix}Xong {base_id} (v{num_versions}, ngày nộp: {submission_date}, sửa: {len(revised_dates)} lần)."
-    )
     return metadata
+
+
+# Số id tối đa trong một request id_list (giới hạn 1 trang kết quả của _ARXIV_CLIENT)
+BATCH_SIZE = 100
+
+
+def _chunks(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def get_entry_discovery_batch(arXiv_ids: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Metadata của nhiều bài với ít request: {base_id: metadata | None (không tìm thấy)}.
+
+    Một request cho bản mới nhất của mỗi BATCH_SIZE bài, cộng các request gom v1..vN của
+    những bài có nhiều version. Kết quả giống get_entry_discovery từng bài.
+    arXiv trả kết quả theo relevance (không theo thứ tự id) và bỏ qua id không tồn tại,
+    nên kết quả được ghép theo short id.
+    """
+    base_ids = list(dict.fromkeys(_strip_version(a) for a in arXiv_ids))
+    if not base_ids:
+        return {}
+
+    latest: Dict[str, arxiv.Result] = {}
+    for chunk in _chunks(base_ids, BATCH_SIZE):
+        for res in _fetch_arxiv_results_with_retry(chunk, progress_prefix=f"[batch {chunk[0]}..] "):
+            latest[_strip_version(res.get_short_id())] = res
+
+    # Gom v1..vN của mọi bài nhiều version trong batch vào ít request nhất có thể
+    version_ids = [f"{b}v{v}" for b, res in latest.items()
+                   for v in range(1, _extract_version_num(res.entry_id) + 1)
+                   if _extract_version_num(res.entry_id) > 1]
+    versions: Dict[str, List[arxiv.Result]] = {}
+    for chunk in _chunks(version_ids, BATCH_SIZE):
+        for res in _fetch_arxiv_results_with_retry(chunk, progress_prefix=f"[versions {chunk[0]}..] "):
+            versions.setdefault(_strip_version(res.get_short_id()), []).append(res)
+
+    out = {b: _build_metadata(b, latest[b], versions.get(b, [])) if b in latest else None for b in base_ids}
+    logger.info(
+        f"Batch {base_ids[0]}..{base_ids[-1]}: {len(latest)}/{len(base_ids)} bài tìm thấy, "
+        f"{len(version_ids)} id version."
+    )
+    return out
 
 
 def save_metadata(arXiv_id: str, metadata: Dict[str, Any]) -> Path:

@@ -211,6 +211,7 @@ def download_version(arxiv_id: str, version: int, delay: float = REQUEST_DELAY,
             r = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=120)
         except requests.RequestException as e:
             _mark_request_end()
+            last_status = None  # attempt này không có HTTP status; không để 429 cũ quyết định loại lỗi
             log.warning("%s: network error (%s), attempt %d/%d", url, e, attempt, max_retries)
             _sleep(delay * 2 ** attempt)
             continue
