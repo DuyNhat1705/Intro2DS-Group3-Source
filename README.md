@@ -130,7 +130,7 @@ pip install -r src/requirements.txt
 ### Running on Google Colab (benchmark testbed)
 `src/scraper.ipynb` is the end-to-end entry point of the scraper. It crawls all 25,000 assigned papers on one Colab CPU instance across several sessions and resumes from on-disk state.
 
-1. Open [`src/scraper.ipynb` in Colab](https://colab.research.google.com/github/DuyNhat1705/Intro2DS-Group3-Source/blob/main/src/scraper.ipynb) and choose *Runtime → Change runtime type → CPU*.
+1. Open [`src/scraper.ipynb` in Colab](https://colab.research.google.com/github/DuyNhat1705/Intro2DS-Group3-Source/blob/scraper/src/scraper.ipynb) and choose *Runtime → Change runtime type → CPU*.
 2. Recommended: add a Semantic Scholar API key under *Secrets* named `S2_API_KEY` (enable notebook access).
 3. *Runtime → Run all*. The notebook clones this repository and installs `src/requirements.txt`; if it asks for a restart, use *Runtime → Restart session* and *Run all* again.
 4. Google Drive is mounted and `data/` is stored at `MyDrive/Intro2DS-Group3/data`, so progress survives across sessions.
