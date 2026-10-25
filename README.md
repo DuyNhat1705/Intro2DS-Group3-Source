@@ -49,15 +49,17 @@ Intro2DS-Group3-Source/
 │       │   ├── sections/
 │       │   │   ├── introduction.tex
 │       │   │   └── methodology.tex
-│       │   ├── references.bib
-│       │   └── figures/
+│       │   └── references/
+│       │       ├── references.bib
+│       │       └── references.bbl
 │       │
 │       ├── v2/                      # LaTeX source tree for version 2
 │       │   ├── main.tex
 │       │   ├── sections/
 │       │   │   ├── introduction.tex
 │       │   │   └── methodology.tex
-│       │   └── references.bib
+│       │   └── references/
+│       │       └── references.bib
 │       │
 │       └── v3/                      # LaTeX source tree for version 3
 │           ├── main.tex
@@ -82,9 +84,9 @@ Fetches and stores bibliographic metadata:
 - `save_metadata(arXiv_id, metadata)`: Serializes and saves the metadata dictionary to `metadata.json` under the paper directory.
 
 ### 3. `src/get_full_source.py`
-Handles raw LaTeX source archives:
-- `get_source(arXiv_id, num_versions)`: Downloads the gzipped tar archive containing TeX sources, bibliography `.bib` files, style/class files, figures, and compiled assets.
-- `save_source(arXiv_id, version, source)`: Extracts and stores source files into version-specific subdirectories (e.g., `v1/`, `v2/`).
+Downloads and selectively extracts LaTeX source files:
+- `get_source(arXiv_id)`: Reads `arxiv_id` and `num_versions` from the paper's `metadata.json`, tracks versions `v1` through `vN`, then downloads and extracts each version.
+- `save_source(arXiv_id, version, source)`: Extracts `.tex`, `.bib`, `.bbl`, and common text-based LaTeX support files, then moves non-main `.tex` files under `sections/` and bibliography files under `references/` so each file is stored only once. A source without `main.tex` keeps its original TeX filenames under `sections/`; no file is renamed to `main.tex`. Figure/image files are skipped.
 
 ### 4. `src/get_extracting_reference.py`
 Extracts citation network information:

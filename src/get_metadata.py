@@ -5,6 +5,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Các khoảng arXiv ID cần thu thập; start_id/end_id là phần số sau dấu chấm.
+ARXIV_ID_RANGES = [
+    {"year": 2026, "month": 9, "start_id": "27834", "end_id": "32833"},
+    {"year": 2026, "month": 9, "start_id": "17834", "end_id": "22833"},
+    {"year": 2026, "month": 8, "start_id": "14007", "end_id": "19006"},
+    {"year": 2026, "month": 8, "start_id": "04007", "end_id": "09006"},
+    {"year": 2025, "month": 11, "start_id": "06709", "end_id": "11708"},
+]
+
 import arxiv
 import requests
 
@@ -293,8 +302,25 @@ def process_batch_metadata(
 
 
 if __name__ == "__main__":
-    START_ID = "2310.00001"
-    END_ID = "2310.00050"
-    id_list = generate_arxiv_ids(START_ID, END_ID)
+    id_list: List[str] = []
+    for id_range in ARXIV_ID_RANGES:
+        year = int(id_range["year"])
+        month = int(id_range["month"])
+        start_id = int(id_range["start_id"])
+        end_id = int(id_range["end_id"])
 
+        if not 1 <= month <= 12:
+            raise ValueError(f"Tháng không hợp lệ trong ARXIV_ID_RANGES: {month}")
+        if start_id > end_id:
+            raise ValueError(
+                f"start_id lớn hơn end_id trong khoảng: {id_range}"
+            )
+
+        arxiv_prefix = f"{year % 100:02d}{month:02d}"
+        id_list.extend(
+            f"{arxiv_prefix}.{number:05d}"
+            for number in range(start_id, end_id + 1)
+        )
+
+    logger.info("Tổng số arXiv ID trong các khoảng: %d", len(id_list))
     results = process_batch_metadata(id_list, skip_existing=True)
