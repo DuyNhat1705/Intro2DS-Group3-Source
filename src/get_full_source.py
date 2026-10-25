@@ -613,7 +613,36 @@ def scrape_batch(papers: Union[Iterable[str], Dict[str, Optional[int]]], delay: 
             save_state(state)
     return state
 
+def process_paper(arxiv_id: str, state: Optional[dict] = None, keep_archive: Optional[bool] = None) -> dict:
+    """Paper đã tải xong: extract .tex/.bib và ghi sizes["full"] + sizes["tex_bib"]. Không tải gì."""
+    keep = KEEP_ARCHIVE if keep_archive is None else keep_archive
+    own = state is None
+    state = load_state() if own else state
+    entry = state["papers"].get(arxiv_id)
+    if not entry or not entry.get("completed"):
+        return {"completed": False}
 
+    old = entry.get("sizes", {}).get("full", {}).get("versions", {})
+    full_versions = {int(k): v for k, v in old.items()}  # key là str nếu đọc từ JSON
+    for v, vdir in _version_dirs(arxiv_id, None):
+        archive = _find_archive(vdir)
+        if archive is None:  # đã xử lý ở lần trước, hoặc version không có tex/bib
+            continue
+        archive_bytes = archive.stat().st_size
+        _, full_bytes, full_disk = _extract_archive(vdir, archive, only_tex_bib=True)
+        full_versions[v] = {"archive_bytes": archive_bytes, "extracted_bytes": full_bytes,
+                            "total_bytes": archive_bytes + full_bytes,
+                            "archive_disk_bytes": _disk(archive_bytes), "extracted_disk_bytes": full_disk,
+                            "total_disk_bytes": _disk(archive_bytes) + full_disk}
+        if not keep:
+            archive.unlink()
+
+    if full_versions:
+        record_sizes(arxiv_id, "full", state, snapshot=_with_totals(full_versions))
+    record_sizes(arxiv_id, "tex_bib", state)
+    if own:
+        save_state(state)
+    return {"completed": True, "sizes": entry["sizes"]}
 # --------------------------------------------------------------------------- #
 # Notebook workflow
 # --------------------------------------------------------------------------- #
