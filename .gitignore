@@ -217,3 +217,8 @@ data/
 *data/
 
 docs
+scraper_v2_prep
+
+# AWS credentials
+*accessKeys*.csv
+.env
