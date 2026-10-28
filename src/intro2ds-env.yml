@@ -1,0 +1,18 @@
+name: intro2ds
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12        # pandas 3.x cần Python >= 3.11
+  - pip
+  - ipykernel          # để VS Code / Jupyter chọn được kernel
+  - notebook           # để chạy được lệnh `jupyter notebook`
+  - pip:
+      # Giữ đúng phiên bản trong src/requirements.txt (ô kiểm tra ở §1 so sánh đúng từng phiên bản)
+      - arxiv==4.0.1
+      - requests==2.34.0
+      - psutil==7.2.2
+      - pandas==3.1.0
+      - pyarrow==26.0.0
+      - tqdm==4.70.1
+      - matplotlib==3.11.2
+ 

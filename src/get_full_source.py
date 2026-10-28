@@ -688,6 +688,27 @@ def scrape_batch(papers: Union[Iterable[str], Dict[str, Optional[int]]], pacer: 
     return state
 
 
+def process_paper(arxiv_id: str, state: Optional[dict] = None, keep_archive: Optional[bool] = None) -> dict:
+    """Paper đã tải xong mà archive còn trên đĩa (dữ liệu của bản cũ): extract .tex/.bib và ghi sizes. Không tải gì.
+    scrape_paper cũng tự làm việc này cho các version như vậy; hàm này dùng khi chỉ muốn extract."""
+    keep = KEEP_ARCHIVE if keep_archive is None else keep_archive
+    own = state is None
+    state = load_state() if own else state
+    entry = state["papers"].get(arxiv_id)
+    if not entry or not entry.get("completed"):
+        return {"completed": False}
+    for v in range(1, entry["num_versions"] + 1):
+        if _todo(entry, arxiv_id, v) == "adopt":
+            data = _find_archive(_version_dir(arxiv_id, v)).read_bytes()
+            store_version(entry, arxiv_id, v, Fetched(data, len(data)), keep)
+    with STATE_LOCK:
+        if entry.get("completed") and "tex_bib" not in entry.get("sizes", {}):
+            entry["sizes"] = sizes_from_versions(entry)
+    if own:
+        save_state(state)
+    return {"completed": True, "sizes": entry.get("sizes")}
+
+
 if __name__ == "__main__":
     # Kết quả (trạng thái từng version, kích thước trước/sau khi bỏ hình, thời gian) nằm trong STATE_FILE
     final = scrape_batch(PAPERS)
