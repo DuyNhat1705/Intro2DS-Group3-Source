@@ -54,7 +54,6 @@ Intro2DS-Group3-Source/
 |   ├── get_extracting_reference.py  # Milestone 1: citation API references
 |   ├── scraper.ipynb                # Milestone 1: collection and reporting
 |   ├── gather_clean_tex.py          # Milestone 2: multi-file gathering and cleanup
-|   ├── tests/                       # Milestone 2: unit tests (python -m unittest)
 |   ├── hierarchy.py                 # Milestone 2: tree and element-table interfaces
 |   ├── bibtex.py                    # Milestone 2: bibliography interfaces
 |   ├── parser.ipynb                 # Milestone 2: notebook placeholder
@@ -253,12 +252,6 @@ tex = gather_tex(Path("data/2310-12345/v1"))   # None for an empty version
 cleaned = cleanup_latex(tex.source)            # input of construct_hierarchy
 locate(tex, tex.source.find("\\section"))      # ('main.tex', 57): where this piece comes from
 show_before_after(sorted(Path("data/2310-12345").glob("v*")))  # interactive viewer in a cell
-```
-
-Unit tests (standard library only):
-
-```bash
-python -m unittest discover -s src/tests -v
 ```
 
 
