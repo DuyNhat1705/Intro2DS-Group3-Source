@@ -53,7 +53,8 @@ Intro2DS-Group3-Source/
 |   ├── get_full_source.py           # Milestone 1: versioned .tex/.bib downloads
 |   ├── get_extracting_reference.py  # Milestone 1: citation API references
 |   ├── scraper.ipynb                # Milestone 1: collection and reporting
-|   ├── gather_clean_tex.py          # Milestone 2: gathering/cleanup interfaces
+|   ├── gather_clean_tex.py          # Milestone 2: multi-file gathering and cleanup
+|   ├── tests/                       # Milestone 2: unit tests (python -m unittest)
 |   ├── hierarchy.py                 # Milestone 2: tree and element-table interfaces
 |   ├── bibtex.py                    # Milestone 2: bibliography interfaces
 |   ├── parser.ipynb                 # Milestone 2: notebook placeholder
@@ -103,10 +104,29 @@ End-to-end orchestration: entry discovery (batched arXiv API) → every version 
 
 The following interfaces describe the intended processing stages.
 
-#### A. `src/gather_clean_tex.py`
+#### A. `src/gather_clean_tex.py` (implemented)
 
-- `gather_tex(version_dir, encoding="utf-8-sig")`: Intended to find the compilation root, expand reachable inputs in compilation order, and collect referenced bibliography files. Returns a `GatherTex` object; an existing directory without TeX files represents an empty version, distinct from a missing directory, ambiguous root, or unresolved include.
-- `cleanup_latex(source)`: Intended to remove non-semantic formatting and normalize mathematics while preserving structural commands and citations.
+- `gather_tex(version_dir, encoding="utf-8-sig")`: Rebuilds what LaTeX compiles for one version and returns a `GatherTex` (`root`, `source`, `tex_files`, `bib_files`, `missing`, `root_reason`, `notes`, `origins`).
+  - **Root**: the `.tex` file declaring `\documentclass` outside comments (`standalone`/`subfiles` fragments excluded). Ties are broken by `\begin{document}`, not being included by another file, a conventional name (`main`, `ms`, `paper`, ...), then size; the rule used is stored in `root_reason`.
+  - **Compilation path**: `\input` (with or without braces), `\include` (+ `\includeonly`), `\subfile`, `\import`/`\subimport`, followed transitively in order. Paths resolve against the root's directory, as LaTeX does. Commented-out commands, `comment` environments, and inactive `\iffalse` / `\newif` branches (`\ifanon ... \else ... \fi` with `\anontrue`/`\anonfalse`) are skipped. The usual "is this macro empty / defined?" tests are decided too (`\if\relax\detokenize{..}\relax`, `\ifx\M\empty`, `\ifx\M\undefined`, `\ifdefined`, `\ifcsname`, and `\ifxetex`/`\ifluatex`, false on arXiv's pdfLaTeX); a test on a macro parameter (`#1`) or on a package's macro is kept verbatim and counted in `notes`. Cycles are cut. Unreached files are ignored, and `\input{#1.sum}` inside a definition is not taken for a file.
+  - **Bibliography**: `.bib` files named by `\bibliography{a,b}` / `\addbibresource`. Unreferenced `.bib` files are ignored.
+  - **Outcomes**: `None` for an empty version (the directory exists, no `.tex`); `FileNotFoundError` for a missing directory; `NoRootError` / `AmbiguousRootError` (subclasses of `GatherError`) when the root cannot be determined. A missing include or `.bib` (e.g. a TikZ file or a `.bbl` the crawler did not keep) is recorded in `missing` and does not fail the version.
+  - `source` keeps everything else intact, including `thebibliography`/`\bibitem`, for `bibtex.extract_bibtex`.
+  - **Source map (T15)**: `origins[i]` is the `(file, line)` that line `i` of `source` was copied from; `locate(tex, offset)` answers "where does this come from?" and `chars_by_file(tex)` tells how much each file contributes. Missing includes and `.bib` files are reported with their location, e.g. `include not found: fig.tikz (sec/results.tex:42)`.
+- `cleanup_latex(source, steps=None)`: Turns `GatherTex.source` into the cleaned text consumed by `hierarchy.construct_hierarchy`. Steps, in order (`CLEANUP_STEPS`):
+  1. `comments`: as above.
+  2. `macros`: expands the authors' `\newcommand`/`\renewcommand`/`\def`/`\let`/`\DeclareMathOperator`/`\newenvironment` (with arguments and optional defaults), xparse `\NewDocumentCommand` with `m` / `O{..}` arguments and `\NewCommandCopy`, so that e.g. `\be ... \ee` becomes an equation. Macros relying on TeX internals are left unexpanded.
+  3. `body`: keeps `\begin{document}...\end{document}`; a preamble `\title` and a preamble abstract (`acmart` and several journal classes declare it before `\begin{document}`) are carried over.
+  4. `math`: inline math becomes `$...$`; block math (`\[..\]`, `$$..$$`, `equation*`, `align`, `eqnarray`, `gather`, `multline`, ...) becomes `\begin{equation}...\end{equation}`, multi-line forms wrapped in `aligned`/`alignedat`/`gathered` so they stay valid LaTeX; `\label`/`\tag`/`\nonumber` are removed; `\ifmmode A\else B\fi` becomes A in math and B in text.
+  5. `formatting`: drops switches (`\centering`, `\midrule`, `\small`, ...), layout commands with their arguments (`\vspace{..}`, `\label{..}`, author/affiliation front matter), float options (`[htbp]`), list label options (`\begin{enumerate}[label=(\roman*)]`), TeX length assignments (`\hangindent=1em`), line-break spacing (`\\[2pt]` → `\\`, `\tabularnewline` → `\\`) and layout environments (`center`, `minipage`); unwraps decorations (`\textbf{x}` → `x`, `\textcolor{c}{x}` → `x`); `\includegraphics` keeps only its path; siunitx is written out (`\SI{3}{\milli\meter}` → `3 mm`, also `\si`, `\num`, `\qty`, `\SIrange`, `\ang`) and `\detokenize{a_b}` → `a\_b`.
+  6. `canonical`: one spelling per content (accents → Unicode, LaTeX quotes/dashes/`\ldots`/`\textdagger`/`\S` → characters, bare `{...}` groups removed while table column specifications keep theirs; in math, spacing/sizing commands and insignificant whitespace removed, `x^{2}` → `x^2`), so the same sentence in two versions becomes the same string.
+  7. `whitespace`: collapses spaces, keeps exactly one blank line between paragraphs.
+
+  Kept on purpose: sectioning (incl. `\section*`), `\appendix`, `abstract`, lists and `\item`, `figure`/`table`/`\caption`, theorem-like environments, every `\cite` variant, `thebibliography`/`\bibitem`. The function is idempotent.
+- `validate_cleaned(text)`: self-check of a cleaned text (balanced braces/environments, even `$`, no leftover math delimiters, formatting, definitions or undecided conditionals) → list of issue codes.
+- `gather_report(version_dir)` / `scan_corpus(data_dir, workers=1)`: one statistics row per version (status, root choice, used/unused `.tex`, used `.bib`, missing files by extension, timings, cleanup issues, characters per file) for the parsing-statistics section of the report.
+- `dedup_ablation(sources_by_version)`: paragraphs before/after exact deduplication at each cleanup level (`ABLATION_LEVELS`: raw, whitespace, math, full), showing what each cleanup step contributes.
+- `clean_blocks(tex)`, `before_after_html(version_dirs)`, `show_before_after(version_dirs)` (T17): every body block of `source` next to its cleaned text, with the file and line it comes from. The whole document is cleaned once with invisible markers between blocks, so each pair is exactly what `cleanup_latex` produces. The HTML is self-contained (one drop-down entry per version, removed tokens struck out, added ones highlighted) and works in a notebook cell or a built Jupyter Book page.
 
 #### B. `src/hierarchy.py`
 
@@ -201,6 +221,44 @@ To open the Milestone 2 notebook in the same environment:
 
 ```bash
 jupyter notebook src/parser.ipynb
+```
+
+### 4. Milestone 2: gathering and cleanup from the command line
+
+From the repository root, gather and clean every `data/<paper>/v<N>/` directory, print a summary (status counts, root choices, missing files by extension, cleanup issues, timings), and write one CSV row per version:
+
+```bash
+python src/gather_clean_tex.py data --out gather_report.csv --workers 2 --check-idempotence
+```
+
+To inspect the result by hand, add `--dump-dir <dir>` (it must be outside `data/`). It writes `<dir>/<paper>/v<N>/source.tex` (gathered, comments stripped) and `cleaned.tex` (after cleanup):
+
+```bash
+python src/gather_clean_tex.py data --dump-dir cleaned_output
+```
+
+To write the before/after viewer (T17) for the first 20 versions to an HTML file:
+
+```bash
+python src/gather_clean_tex.py data --html before_after.html --html-limit 20
+```
+
+Inside Python or a notebook (with `src/` on the path):
+
+```python
+from pathlib import Path
+from gather_clean_tex import gather_tex, cleanup_latex, locate, show_before_after
+
+tex = gather_tex(Path("data/2310-12345/v1"))   # None for an empty version
+cleaned = cleanup_latex(tex.source)            # input of construct_hierarchy
+locate(tex, tex.source.find("\\section"))      # ('main.tex', 57): where this piece comes from
+show_before_after(sorted(Path("data/2310-12345").glob("v*")))  # interactive viewer in a cell
+```
+
+Unit tests (standard library only):
+
+```bash
+python -m unittest discover -s src/tests -v
 ```
 
 
