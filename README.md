@@ -7,16 +7,17 @@
 
 ## Table of Contents
 
-- [Project Overview](#project-overview)
-- [Directory Structure](#directory-structure)
-- [Modules and Functionality](#modules-and-functionality)
-- [Installation and Setup](#installation-and-setup)
-- [Usage](#usage)
-- [Dependencies](#dependencies)
+- [Project Overview](#i-project-overview)
+- [Directory Structure](#ii-directory-structure)
+- [Modules and Functionality](#iii-modules-and-functionality)
+- [Installation and Setup](#iv-installation-and-setup)
+- [Usage](#v-usage)
+- [Dependencies](#vi-dependencies)
 
 ---
 
-## Milestone 1 Overview
+## I. Project Overview
+### 1. Milestone 1 Overview
 
 The goal of this project is to build an automated pipeline to crawl and collect scientific literature data from arXiv and academic APIs (such as Semantic Scholar). For each target paper, the pipeline collects:
 
@@ -26,100 +27,108 @@ The goal of this project is to build an automated pipeline to crawl and collect 
 
 ---
 
-## Directory Structure
+### 2. Milestone 2 Overview
 
-The repository is organized into source scripts (`src/`) and the generated paper repository (`data/`):
+Milestone 2 transforms the raw LaTeX sources collected in Milestone 1 into a cleaned, standardized hierarchical dataset for the reference-matching pipeline in Milestone 3.
 
-```
+For every publication and every version, the pipeline is designed to:
+
+1. **Gather the compilation path**: Identify the main `.tex` file through its `\documentclass` declaration and follow active `\input` and `\include` commands transitively, ignoring commented commands and unused auxiliary files.
+2. **Build the document hierarchy**: Organize documents, sections, subsections, paragraphs, and list items into a tree. Leaves represent sentences, block formulas, and figures (including tables). Sentence boundaries must preserve mathematics, commands, abbreviations, URLs, and decimal numbers. Include acknowledgements and appendices, but exclude reference sections from the hierarchy.
+3. **Clean and normalize content**: Remove non-semantic formatting and placement commands, standardize inline mathematics to `$...$`, and standardize block mathematics to `\begin{equation}...\end{equation}`.
+4. **Unify bibliography entries**: Extract entries from referenced `.bib` files and convert inline `\bibitem` references to BibTeX. Merge duplicates within and across versions, union their fields, choose canonical citation keys, and rewrite affected citation commands.
+5. **Deduplicate full text across versions**: Store identical cleaned elements once with a shared identifier, while retaining each version's parent-child relationships. Record versions without TeX sources as empty for coverage reporting.
+
+---
+
+## II. Directory Structure
+
+The source code is in `src/` and `data/` holds the local corpus collected in Milestone 1.
+
+```text
 Intro2DS-Group3-Source/
 ├── src/
-│   ├── utils.py                     # Common utilities (path resolver, paper directory mapper)
-│   ├── get_metadata.py              # arXiv metadata collection and persistence
-│   ├── get_full_source.py           # Every version through export.arxiv.org/src, in-memory .tex/.bib extraction
-│   ├── get_extracting_reference.py   # Reference & citation data extraction
-│   ├── scraper.ipynb                # Orchestration notebook (export only, one Colab per range)
-│   ├── requirements.txt             # Python package dependencies
-│   └── ExportS3/                    # Parked scraper v2: hybrid S3 bulk + export
-│       ├── get_full_source_v2.py    # v2 export lane (shares helpers with get_full_source.py)
-│       ├── s3_source.py             # Bulk source from arXiv's requester-pays S3 bucket
-│       ├── scraper_v2.ipynb         # Orchestration notebook v2
-│       └── requirements.txt         # Extra dependency of v2 (boto3)
-├── data/                            # Output directory for crawled paper datasets
-│   └── 2310-12345/                  # Paper folder (arXiv ID with '.' and '/' replaced by '-')
-│       ├── metadata.json            # Bibliographic metadata
-│       ├── references.json          # Extracted reference information
-│       │
-│       ├── v1/                      # LaTeX source tree for version 1
-│       │   ├── main.tex
-│       │   ├── sections/
-│       │   │   ├── introduction.tex
-│       │   │   └── methodology.tex
-│       │   └── references/
-│       │       ├── references.bib
-│       │       └── references.bbl
-│       │
-│       ├── v2/                      # LaTeX source tree for version 2
-│       │   ├── main.tex
-│       │   ├── sections/
-│       │   │   ├── introduction.tex
-│       │   │   └── methodology.tex
-│       │   └── references/
-│       │       └── references.bib
-│       │
-│       └── v3/                      # LaTeX source tree for version 3
-│           ├── main.tex
-│           └── sections/
-│               └── introduction.tex
+|   ├── utils.py                     # Shared paths and GatherTex data structure
+|   ├── get_metadata.py              # Milestone 1: bibliographic metadata
+|   ├── get_full_source.py           # Milestone 1: versioned .tex/.bib downloads
+|   ├── get_extracting_reference.py  # Milestone 1: citation API references
+|   ├── scraper.ipynb                # Milestone 1: collection and reporting
+|   ├── gather_clean_tex.py          # Milestone 2: gathering/cleanup interfaces
+|   ├── hierarchy.py                 # Milestone 2: tree and element-table interfaces
+|   ├── bibtex.py                    # Milestone 2: bibliography interfaces
+|   ├── parser.ipynb                 # Milestone 2: notebook placeholder
+|   ├── intro2ds-env.yml             # Conda environment (Python 3.12)
+|   └── requirements.txt             # Pinned Python dependencies
+├── data/                            # Local generated corpus
+|   └── 2310-12345/                  # Example normalized arXiv ID
+|       ├── metadata.json
+|       ├── references.json
+|       ├── v1/                      # Retained .tex/.bib files and subdirectories
+|       └── v2/
 ├── .gitignore
 └── README.md
 ```
 
 ---
 
-## Modules and Functionality
-
-### 1. `src/utils.py`
+## III. Modules and Functionality
+### 1. Milestone 1
+#### A. `src/utils.py`
 Provides path resolution and workspace helper utilities:
 - `DATA_DIR`: Resolves the absolute path to the root output directory (`data/`).
 - `get_paper_dir(arxiv_id: str)`: Normalizes an arXiv identifier (converting `.` and `/` to `-`) and returns the designated output path within `data/`.
 
-### 2. `src/get_metadata.py`
+#### B. `src/get_metadata.py`
 Fetches and stores bibliographic metadata:
 - `get_entry_discovery(arXiv_id)`: Retrieves paper metadata including title, authors, submission date, revision dates, venue, categories, and abstract.
 - `get_entry_discovery_batch(arXiv_ids)`: Same metadata for many papers with few requests (up to 100 IDs per arXiv API call); returns `None` for IDs arXiv does not have.
 - `save_metadata(arXiv_id, metadata)`: Serializes and saves the metadata dictionary to `metadata.json` under the paper directory.
 
-### 3. `src/get_full_source.py`
+#### C. `src/get_full_source.py`
 Downloads every version through `export.arxiv.org/src/<id>v<n>` and keeps only `.tex`/`.bib`:
 - `Pacer`: at least 3 s between the *starts* of two arXiv requests (the download time counts towards the gap), shared by metadata and source calls; after HTTP 429/5xx it slows down (up to `MAX_REQUEST_DELAY`) and returns to 3 s once requests succeed again.
 - `download_version(arxiv_id, version, pacer)`: streamed GET; a PDF-only version is recognised from `Content-Type` and its body is skipped.
 - `extract_tex_bib(data, vdir)`: one in-memory pass that writes `.tex`/`.bib` (directory structure kept) and measures the whole archive ("size before removing figures"); archives and figures never touch the disk.
 - `scrape_paper(arxiv_id, num_versions)`: every unfinished version, checkpointing the state file (`STATE_FILE`, default `data/source_state.json`) after each one, so an interrupted run resumes.
 
-### 4. `src/get_extracting_reference.py`
+#### D. `src/get_extracting_reference.py`
 Extracts citation network information:
 - `get_extracting_references(arXiv_id)`: Queries academic citation APIs (such as Semantic Scholar) to retrieve referenced papers, mapping citing paper IDs to reference arXiv IDs, titles, authors, and publication dates.
 - `save_extracting_references(arXiv_id, references)`: Writes the extracted reference mappings to `references.json`.
 
-### 5. `src/scraper.ipynb`
+#### E. `src/scraper.ipynb`
 End-to-end orchestration: entry discovery (batched arXiv API) → every version through `/src/` → Semantic Scholar references, plus time/RAM/disk measurement and the statistics exported for the Jupyter Book. The first cell picks which of the five ranges this machine crawls (`RUN_RANGES`), so each member runs their range on their own Colab instance; state/log folders named after the ranges let everyone's `data/` be merged without conflicts.
 
-### 6. `src/ExportS3/` (scraper v2, parked)
-Hybrid variant that reads the v1 of single-version papers from the S3 bulk bucket and everything else through export. It is kept aside until the group has an AWS account that can read `s3://arxiv` (us-east-1).
+### 2. Milestone 2
 
-`get_full_source_v2.py`: the export lane of v2 (same pacing and in-memory extraction as `get_full_source.py`, plus `via` per version and `store_fetched` for versions read from S3).
+The following interfaces describe the intended processing stages.
 
-`s3_source.py`:
-Reads source from the requester-pays bucket `s3://arxiv/src/`:
-- `load_manifest` / `ChunkIndex`: which tar chunk holds which paper.
-- `plan(...)`: splits papers between chunks and export (papers not on S3, `S3_MAX_GB` budget).
-- `process_chunk(...)`: streams one chunk, stores the wanted papers, stops early once all were seen, and resumes a broken stream at the last member boundary (HTTP Range).
+#### A. `src/gather_clean_tex.py`
 
-`scraper_v2.ipynb`: same measurement and analysis parts as `scraper.ipynb`; the source runs in two parallel lanes: S3 for papers that only have v1, export for the other versions and for anything S3 cannot serve. If S3 is unavailable (no key, no permission), every version goes through export.
+- `gather_tex(version_dir, encoding="utf-8-sig")`: Intended to find the compilation root, expand reachable inputs in compilation order, and collect referenced bibliography files. Returns a `GatherTex` object; an existing directory without TeX files represents an empty version, distinct from a missing directory, ambiguous root, or unresolved include.
+- `cleanup_latex(source)`: Intended to remove non-semantic formatting and normalize mathematics while preserving structural commands and citations.
+
+#### B. `src/hierarchy.py`
+
+- `Node`: Represents a node with a local identifier, optional parent identifier, kind, and content.
+- `construct_hierarchy(cleaned_tex)`: Intended to build one version's tree, including a document root with no parent.
+- `rewrite_citations(nodes, key_map)`: Intended to replace citation keys with canonical keys while preserving node identifiers and edges.
+- `build_element_tables(arxiv_id, nodes_by_version)`: Intended to deduplicate cleaned content across versions and return shared `elements` rows and version-specific `hierarchy` rows. `ElementRow` and `HierarchyRow` define their schemas.
+
+#### C. `src/bibtex.py`
+
+- `BibEntry`: Holds a citation key, entry type, and bibliography fields.
+- `extract_bibtex(tex)`: Intended to read referenced `.bib` files and convert reachable `\bibitem` entries.
+- `merge_bibtex(entries_by_version)`: Intended to merge duplicate entries and union their fields, returning unified entries and a citation-key mapping for each version.
+- `build_bibtex_rows(arxiv_id, entries)`: Intended to project merged entries into the final schema defined by `BibtexRow`.
+
+#### D. `src/parser.ipynb`
+
+Reserved for Milestone 2 orchestration. The intended order is gathering and cleanup per version, hierarchy and bibliography extraction, bibliography merging across versions, citation rewriting, then element deduplication and table assembly.
 
 ---
 
-## Installation and Setup
+## IV. Installation and Setup
 
 ### 1. Clone the Repository
 ```bash
@@ -127,8 +136,8 @@ git clone <repository-url>
 cd Intro2DS-Group3-Source
 ```
 
-### 2. Set Up a Python Virtual Environment
-Recommended Python version: 3.9+
+### 2. Using VS Code - Set Up a Python Virtual Environment
+Use Python 3.12+
 
 ```bash
 # Windows (PowerShell)
@@ -145,66 +154,65 @@ source .venv/bin/activate
 pip install -r src/requirements.txt
 ```
 
----
+### 4. Using Conda
 
-## Usage
+As an alternative to the virtual environment above, run these commands from the repository root in a terminal where Conda is available (for example, Anaconda Prompt):
 
-### Running on Google Colab (benchmark testbed)
-`src/scraper.ipynb` is the end-to-end entry point of the scraper. The 25,000 assigned papers form five ranges; each member crawls the range assigned to them on their own Colab CPU instance (one connection and ≥ 3 s between arXiv requests per instance, about 5–6.5 h per range), and the notebook resumes from on-disk state across sessions.
-
-1. Edit the first code cell (*Chọn range*): `RUN_RANGES` = the range numbers this machine crawls, e.g. `[3]`, `[1, 2]`, or `"all"` (one machine crawls every range, ~26 h over 3 sessions). `RANGES` maps the numbers 1–5 to `(YYMM, start, end)`; keep it identical on every member's copy.
-2. Open [`src/scraper.ipynb` in Colab](https://colab.research.google.com/github/DuyNhat1705/Intro2DS-Group3-Source/blob/scraper/src/scraper.ipynb) and choose *Runtime → Change runtime type → CPU*.
-3. Recommended: add a Semantic Scholar API key under *Secrets* named `S2_API_KEY` (enable notebook access). With a key the notebook paces Semantic Scholar at `S2_DELAY_WITH_KEY` (1 s) instead of the module's default 3 s; without a key nothing changes.
-4. *Runtime → Run all*. The notebook clones (or pulls) this repository and installs `src/requirements.txt`; if it asks for a restart, use *Runtime → Restart session* and *Run all* again.
-5. Google Drive is mounted and `data/` is stored at `DRIVE_DATA_DIR` (default `MyDrive/Intro2DS-Group3/data`). Recommended: one member creates `Intro2DS-Group3` on Drive and shares it (*Editor*) with the group, and everyone adds a shortcut to *My Drive*, so all data lands in one place. State and logs go to `data/.state/<WORKER>/` and `data/run_logs/<WORKER>/`, where `WORKER` is derived from the ranges (`R3`, `R1+R2`, `all`), and paper folders never overlap between ranges, so machines never overwrite each other's files (with separate Drives, simply copy the `data/` folders together).
-6. A session crawls until everything is done, until `MAX_RUN_HOURS` (11.5 h), or until a service refuses requests; the analysis part then rebuilds the tables and statistics for this machine's ranges. Keep the browser tab open. In a new session, *Run all* again; finished work is never repeated.
-7. Group report: once `data/` holds everyone's data, set `REPORT_ALL_RANGES = True` (section 5) and run the notebook; sections 9–12 then cover all five ranges and every machine's logs (`wall_time_sec` = longest machine, since they run in parallel; `machine_time_sec` = sum).
-
-Other parameters are in the configuration cell (section 5 of the notebook, which also documents setup in section 2): `SAMPLE_N` (first cell, e.g. `20` for a trial run), `METADATA_BATCH_SIZE`, `S2_DELAY_WITH_KEY`, `ARXIV_DELAY` (≥ 3 s, measured between request starts), `ARXIV_MAX_DELAY` (adaptive slow-down after HTTP 429), `COOLDOWNS_SEC` (growing pauses, 5/10/15 min, on persistent HTTP 429), `SOURCE_WRITE_QUEUE` (versions waiting for the background extract-and-write thread), `MAX_RUN_HOURS`, `SOURCE_STATE_FLUSH_EVERY`, and `PERSIST_TO_DRIVE`.
-
-Outputs: one folder per paper in `data/` (`metadata.json`, `references.json`, `v1/`, `v2/`, … with only `.tex`/`.bib` files), the tables `data/tables/{papers,references,references_all}.parquet`, per-machine state and run logs in `data/.state/<WORKER>/` and `data/run_logs/<WORKER>/`, and small statistics files for the Jupyter Book report in `data/report_exports/`.
-
-### Running scraper v2 (hybrid S3 + export, parked)
-`src/ExportS3/scraper_v2.ipynb` crawls all ranges on one instance (no range selection) and needs `pip install -r src/requirements.txt -r src/ExportS3/requirements.txt`, plus two more Colab Secrets:
-
-1. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of an IAM user allowed to read S3 (e.g. `AmazonS3ReadOnlyAccess`). The bucket is *requester pays*: the group's AWS account pays the egress (~0.09 USD/GB). The `plan` line printed at the start of a run shows how many GB will be read and the estimated cost; `S3_MAX_GB` caps the total.
-2. Optional: before setting `S3_LATEST_FOR_MULTI = True`, run `scraper_v2_prep/scripts/07_verify_s3_latest.py` and enable it only if every checked paper is `s3_is_latest`.
-
-Without AWS keys the notebook still completes, with every version downloaded through export. Locally, set the two variables in the environment (or `~/.aws/credentials`) before starting Jupyter.
-
-### Running locally
 ```bash
-pip install -r src/requirements.txt
-jupyter lab src/scraper.ipynb
-```
-Open the notebook from inside the repository; `data/` is created at the repository root.
-
-### Using as Python Modules
-Import functions into custom scraping scripts or batch pipelines:
-
-```python
-from src.utils import get_paper_dir
-from src.get_metadata import get_entry_discovery, save_metadata
-from src.get_full_source import scrape_paper
-from src.get_extracting_reference import get_extracting_references, save_extracting_references
-
-arxiv_id = "2310.12345"
-
-# Fetch and store metadata
-metadata = get_entry_discovery(arxiv_id)
-save_metadata(arxiv_id, metadata)
-
-# Fetch every version and keep only .tex/.bib (data/2310-12345/v1/, v2/, ...)
-scrape_paper(arxiv_id, metadata["num_versions"])
-
-# Fetch and store references
-references = get_extracting_references(arxiv_id)
-save_extracting_references(arxiv_id, references)
+conda env create -f src/intro2ds-env.yml
+conda activate intro2ds
 ```
 
+The environment file installs Python 3.12, pip, Notebook, ipykernel, and the pinned project dependencies. A separate `pip install -r src/requirements.txt` is not needed for this route.
+
+To synchronize an existing environment after changes to the environment file:
+
+```bash
+conda env update -f src/intro2ds-env.yml --prune
+```
+---
+> Note: You can run the jupyter notebook either by Conda or VS Code. We offer 2 options for you.
+## V. Usage
+
+### 1. Running on Google Colab (benchmark testbed)
+
+1. Upload `scraper.ipynb` on Google Colab and select a **CPU** runtime.
+2. Set `RUN_RANGES` to your assigned ranges (e.g. `[3]`); optionally set `SAMPLE_N = 20` for a trial run. Keep `RANGES` identical across group members.
+3. Optionally add `S2_API_KEY` in Colab **Secrets** and enable notebook access.
+4. Choose **Runtime > Run all**, authorize Google Drive access, and restart the session if prompted. Dependencies are installed automatically.
+5. Data is saved to `MyDrive/Intro2DS-Group3/data` by default. Use a shared Drive folder or merge members' data afterward. Run all again in a new session to resume from saved checkpoints.
+6. Once everyone's data is combined, set `REPORT_ALL_RANGES = True` and rerun to generate the group report statistics.
+
+Outputs include paper metadata, references, versioned `.tex`/`.bib` sources, Parquet tables, checkpoints, run logs, and report statistics under `data/`. Additional settings are documented in the notebook's configuration cell.
+
+### 2. Running locally using VS Code
+In VS Code, open the notebook and use **Select Kernel** to choose the virtual environment has been created.
+
+### 3. Running locally using Conda
+
+From the repository root, activate the environment created during setup and open the collection notebook:
+
+```bash
+conda activate intro2ds
+jupyter notebook src/scraper.ipynb
+```
+
+To open the Milestone 2 notebook in the same environment:
+
+```bash
+jupyter notebook src/parser.ipynb
+```
+
+
+When finished:
+
+```bash
+conda deactivate
+```
 ---
 
-## Dependencies
+> Note: You can run the jupyter notebook either by Conda or VS Code. We offer 2 options for you.
+## VI. Dependencies
 
 The project uses the following libraries specified in `src/requirements.txt`:
 - [`arxiv`](https://pypi.org/project/arxiv/) (`==4.0.1`): Wrapper for the arXiv API.
@@ -213,5 +221,3 @@ The project uses the following libraries specified in `src/requirements.txt`:
 - [`pandas`](https://pypi.org/project/pandas/) (`==3.1.0`) and [`pyarrow`](https://pypi.org/project/pyarrow/) (`==26.0.0`): Data tables and Parquet output.
 - [`tqdm`](https://pypi.org/project/tqdm/) (`==4.70.1`): Progress bars.
 - [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Quick sanity-check plots in the notebook.
-
-Scraper v2 additionally needs [`boto3`](https://pypi.org/project/boto3/) (`==1.43.119`, in `src/ExportS3/requirements.txt`) for the S3 bulk source.

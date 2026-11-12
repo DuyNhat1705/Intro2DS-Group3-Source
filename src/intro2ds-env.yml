@@ -2,7 +2,7 @@ name: intro2ds
 channels:
   - conda-forge
 dependencies:
-  - python=3.12        # pandas 3.x cần Python >= 3.11
+  - python=3.12        
   - pip
   - ipykernel          # để VS Code / Jupyter chọn được kernel
   - notebook           # để chạy được lệnh `jupyter notebook`
