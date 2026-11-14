@@ -23,6 +23,7 @@ file and line every piece of ``source`` comes from. Before/after viewer
 :func:`show_before_after`. From the repository root::
 
     python src/gather_clean_tex.py data --out gather_report.csv --workers 2
+    python src/gather_clean_tex.py data --out gather_report.csv --workers 2 --resume
 """
 
 from __future__ import annotations
@@ -35,13 +36,14 @@ import hashlib
 import html
 import itertools
 import json
+import os
 import re
 import sys
 import time
 import unicodedata
 import warnings
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -54,6 +56,7 @@ __all__ = [
     "GatherError",
     "GatherWarning",
     "NoRootError",
+    "REPORT_FIELDS",
     "before_after_html",
     "chars_by_file",
     "clean_blocks",
@@ -62,6 +65,7 @@ __all__ = [
     "gather_report",
     "gather_tex",
     "locate",
+    "read_checkpoint",
     "scan_corpus",
     "show_before_after",
     "validate_cleaned",
@@ -2178,6 +2182,17 @@ def _version_number(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# Columns of a gather_report row, in CSV order.
+REPORT_FIELDS = (
+    "paper", "version", "status", "root", "root_reason", "n_tex_total", "n_tex_used", "n_tex_unused",
+    "n_bib_total", "n_bib_used", "n_missing", "missing", "missing_ext", "notes", "chars_by_file",
+    "source_chars", "cleaned_chars", "issues", "idempotent", "gather_sec", "cleanup_sec",
+)
+_INT_FIELDS = frozenset({"version", "n_tex_total", "n_tex_used", "n_tex_unused", "n_bib_total",
+                         "n_bib_used", "n_missing", "source_chars", "cleaned_chars"})
+_FLOAT_FIELDS = frozenset({"gather_sec", "cleanup_sec"})
+
+
 def gather_report(version_dir: Path, *, cleanup: bool = True, check_idempotence: bool = False,
                   dump_dir: Path | None = None) -> dict:
     """One statistics row for a version: status, file counts, missing files, timings.
@@ -2193,13 +2208,12 @@ def gather_report(version_dir: Path, *, cleanup: bool = True, check_idempotence:
     files = [p for p in version_dir.rglob("*") if p.is_file()] if version_dir.is_dir() else []
     n_tex = sum(p.suffix.lower() == ".tex" for p in files)
     n_bib = sum(p.suffix.lower() == ".bib" for p in files)
-    row = {
-        "paper": version_dir.parent.name, "version": _version_number(version_dir.name),
-        "status": "", "root": "", "root_reason": "", "n_tex_total": n_tex, "n_tex_used": 0,
-        "n_tex_unused": n_tex, "n_bib_total": n_bib, "n_bib_used": 0, "n_missing": 0,
-        "missing": "", "missing_ext": "", "notes": "", "chars_by_file": "", "source_chars": 0, "cleaned_chars": 0,
-        "issues": "", "idempotent": "", "gather_sec": 0.0, "cleanup_sec": 0.0,
-    }
+    row = dict.fromkeys(REPORT_FIELDS, "")
+    row.update(
+        paper=version_dir.parent.name, version=_version_number(version_dir.name),
+        n_tex_total=n_tex, n_tex_used=0, n_tex_unused=n_tex, n_bib_total=n_bib, n_bib_used=0,
+        n_missing=0, source_chars=0, cleaned_chars=0, gather_sec=0.0, cleanup_sec=0.0,
+    )
     t0 = time.perf_counter()
     try:
         tex = gather_tex(version_dir)
@@ -2255,39 +2269,153 @@ def gather_report(version_dir: Path, *, cleanup: bool = True, check_idempotence:
     return row
 
 
+def _version_dirs(paper_dir: Path) -> list[Path]:
+    return sorted(
+        (d for d in paper_dir.iterdir() if d.is_dir() and _version_number(d.name) is not None),
+        key=lambda d: _version_number(d.name),
+    )
+
+
 def _paper_rows(paper_dir: Path, cleanup: bool, check_idempotence: bool,
-                dump_dir: Path | None = None) -> list[dict]:
+                dump_dir: Path | None = None, skip: frozenset[int] = frozenset()) -> list[dict]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", GatherWarning)
-        versions = sorted(
-            (d for d in paper_dir.iterdir() if d.is_dir() and _version_number(d.name) is not None),
-            key=lambda d: _version_number(d.name),
-        )
         return [gather_report(v, cleanup=cleanup, check_idempotence=check_idempotence, dump_dir=dump_dir)
-                for v in versions]
+                for v in _version_dirs(paper_dir) if _version_number(v.name) not in skip]
+
+
+def _coerce_row(raw: dict) -> dict | None:
+    """A checkpoint CSV row back to gather_report types; ``None`` if it is damaged."""
+    if None in raw or any(v is None for v in raw.values()):
+        return None  # too few or too many fields: a line cut short by a crash
+    row = dict(raw)
+    try:
+        for k in _INT_FIELDS:
+            row[k] = int(row[k])
+        for k in _FLOAT_FIELDS:
+            row[k] = float(row[k])
+    except ValueError:
+        return None
+    row["idempotent"] = {"True": True, "False": False}.get(row["idempotent"], "")
+    return row
+
+
+def read_checkpoint(path: Path) -> list[dict]:
+    """Rows already written to a :func:`scan_corpus` checkpoint CSV (empty if absent).
+
+    Damaged lines (e.g. the last one, if the process was killed mid-write) are
+    dropped so those versions are processed again; a later row for the same
+    version replaces an earlier one.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            return []
+        if tuple(reader.fieldnames) != REPORT_FIELDS:
+            raise ValueError(f"{path} has different columns than this version of the report; "
+                             "write to a new file instead of resuming")
+        rows: dict[tuple[str, int], dict] = {}
+        for raw in reader:
+            row = _coerce_row(raw)
+            if row is not None:
+                rows[row["paper"], row["version"]] = row
+    return list(rows.values())
+
+
+class _Checkpoint:
+    """Append-only CSV that is flushed to disk after every paper."""
+
+    def __init__(self, path: Path, rows: list[dict]):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Rewrite what was kept (drops a truncated last line), then append to it.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, self.path)
+        self._file = open(self.path, "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=REPORT_FIELDS)
+
+    def write(self, rows: list[dict]) -> None:
+        self._writer.writerows(rows)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def close(self) -> None:
+        self._file.close()
 
 
 def scan_corpus(data_dir: Path, *, cleanup: bool = True, check_idempotence: bool = False,
-                workers: int = 1, limit: int | None = None, dump_dir: Path | None = None) -> list[dict]:
+                workers: int = 1, limit: int | None = None, dump_dir: Path | None = None,
+                checkpoint: Path | None = None, resume: bool = False) -> list[dict]:
     """Run :func:`gather_report` on every ``<paper>/v<N>`` directory under ``data_dir``.
 
     ``workers > 1`` processes papers in parallel (call it under
     ``if __name__ == "__main__":`` on Windows).
+
+    With ``checkpoint``, each paper's rows are appended to that CSV as soon as
+    the paper is done, so an interrupted scan keeps its work. ``resume=True``
+    keeps the rows already in the file and processes only the versions it
+    does not list; without it the file is started over. A paper whose worker
+    process dies (out of memory, crash) is reported with a warning and left
+    out of the file, so the next resumed run tries it again.
+
+    Returns every row of the scan, those read back from the checkpoint
+    included, sorted by paper and version.
     """
+    if resume and checkpoint is None:
+        raise ValueError("resume=True needs a checkpoint file")
     papers = sorted(
         p for p in Path(data_dir).iterdir()
         if p.is_dir() and any(_version_number(d.name) is not None for d in p.iterdir() if d.is_dir())
     )
     if limit is not None:
         papers = papers[:limit]
-    if workers <= 1:
-        nested = [_paper_rows(p, cleanup, check_idempotence, dump_dir) for p in papers]
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            nested = list(pool.map(_paper_rows, papers, [cleanup] * len(papers),
-                                   [check_idempotence] * len(papers), [dump_dir] * len(papers),
-                                   chunksize=8))
-    return [row for rows in nested for row in rows]
+    previous = read_checkpoint(checkpoint) if resume else []
+    done: dict[str, set[int]] = {}
+    for row in previous:
+        done.setdefault(row["paper"], set()).add(row["version"])
+    todo = []
+    for p in papers:
+        skip = frozenset(done.get(p.name, ()))
+        if not skip or any(_version_number(v.name) not in skip for v in _version_dirs(p)):
+            todo.append((p, skip))
+
+    sink = _Checkpoint(checkpoint, previous) if checkpoint is not None else None
+    rows = list(previous)
+    failed: list[str] = []
+
+    def keep(paper_rows: list[dict]) -> None:
+        rows.extend(paper_rows)
+        if sink is not None:
+            sink.write(paper_rows)
+
+    try:
+        if workers <= 1:
+            for p, skip in todo:
+                keep(_paper_rows(p, cleanup, check_idempotence, dump_dir, skip))
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_paper_rows, p, cleanup, check_idempotence, dump_dir, skip): p
+                           for p, skip in todo}
+                for fut in as_completed(futures):
+                    try:
+                        keep(fut.result())
+                    except Exception as e:  # BrokenProcessPool, or an error outside gather_report
+                        failed.append(f"{futures[fut].name} ({type(e).__name__})")
+    finally:
+        if sink is not None:
+            sink.close()
+    if failed:
+        warnings.warn(f"{len(failed)} paper(s) not processed, rerun with resume to retry: "
+                      + ", ".join(sorted(failed)), RuntimeWarning, stacklevel=2)
+    rows.sort(key=lambda r: (r["paper"], r["version"]))
+    return rows
 
 
 # ============================================================== T14: ablation
@@ -2488,14 +2616,16 @@ def show_before_after(version_dirs: Iterable[Path], **kwargs):
 # ============================================================== CLI
 
 
-def _summary(rows: list[dict], elapsed: float) -> str:
+def _summary(rows: list[dict], elapsed: float, resumed: int = 0) -> str:
     status = Counter(r["status"] for r in rows)
     ext = Counter(e for r in rows for e in r["missing_ext"].split(";") if e)
     issues = Counter(i for r in rows for i in r["issues"].split(";") if i)
     reasons = Counter(r["root_reason"].split(";")[-1].strip() for r in rows if r["root_reason"])
+    new = len(rows) - resumed
     lines = [
-        f"versions: {len(rows)}   wall time: {elapsed:.1f}s   "
-        f"avg/version: {elapsed / max(len(rows), 1):.3f}s",
+        f"versions: {len(rows)}" + (f" ({resumed} from checkpoint, {new} this run)" if resumed else "")
+        + f"   wall time: {elapsed:.1f}s"
+        + (f"   avg/version this run: {elapsed / new:.3f}s" if new else ""),
         f"gather: {sum(r['gather_sec'] for r in rows):.1f}s   cleanup: {sum(r['cleanup_sec'] for r in rows):.1f}s",
         "status: " + ", ".join(f"{k}={v}" for k, v in status.most_common()),
         "root choice: " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()),
@@ -2513,7 +2643,10 @@ def _summary(rows: list[dict], elapsed: float) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Gather and clean every paper version under a data directory.")
     ap.add_argument("data_dir", type=Path)
-    ap.add_argument("--out", type=Path, help="write one CSV row per version")
+    ap.add_argument("--out", type=Path,
+                    help="CSV with one row per version, written after every paper (checkpoint)")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep the rows already in --out and process only the versions it lacks")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--limit", type=int, help="only the first N papers")
     ap.add_argument("--no-cleanup", action="store_true", help="gather only")
@@ -2525,17 +2658,19 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.dump_dir and args.dump_dir.resolve().is_relative_to(args.data_dir.resolve()):
         ap.error("--dump-dir must not be inside data_dir (it would add .tex files to the papers)")
+    if args.resume and not args.out:
+        ap.error("--resume needs --out (the checkpoint to continue)")
+    try:
+        resumed = len(read_checkpoint(args.out)) if args.resume else 0
+    except ValueError as e:
+        ap.error(str(e))
     t0 = time.perf_counter()
     rows = scan_corpus(args.data_dir, cleanup=not args.no_cleanup, check_idempotence=args.check_idempotence,
-                       workers=args.workers, limit=args.limit, dump_dir=args.dump_dir)
+                       workers=args.workers, limit=args.limit, dump_dir=args.dump_dir,
+                       checkpoint=args.out, resume=args.resume)
     elapsed = time.perf_counter() - t0
-    if args.out and rows:
-        with open(args.out, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-    print(_summary(rows, elapsed))
-    if args.out and rows:
+    print(_summary(rows, elapsed, resumed))
+    if args.out:
         print(f"report: {args.out.resolve()}")
     if args.dump_dir:
         print(f"dumped .tex files: {args.dump_dir.resolve()}")

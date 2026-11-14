@@ -123,7 +123,7 @@ The following interfaces describe the intended processing stages.
 
   Kept on purpose: sectioning (incl. `\section*`), `\appendix`, `abstract`, lists and `\item`, `figure`/`table`/`\caption`, theorem-like environments, every `\cite` variant, `thebibliography`/`\bibitem`. The function is idempotent.
 - `validate_cleaned(text)`: self-check of a cleaned text (balanced braces/environments, even `$`, no leftover math delimiters, formatting, definitions or undecided conditionals) → list of issue codes.
-- `gather_report(version_dir)` / `scan_corpus(data_dir, workers=1)`: one statistics row per version (status, root choice, used/unused `.tex`, used `.bib`, missing files by extension, timings, cleanup issues, characters per file) for the parsing-statistics section of the report.
+- `gather_report(version_dir)` / `scan_corpus(data_dir, workers=1, checkpoint=None, resume=False)`: one statistics row per version (status, root choice, used/unused `.tex`, used `.bib`, missing files by extension, timings, cleanup issues, characters per file) for the parsing-statistics section of the report. With `checkpoint`, rows are appended to that CSV after every paper; `resume=True` skips the versions it already lists. `read_checkpoint(path)` loads such a CSV back with typed columns (`REPORT_FIELDS`).
 - `dedup_ablation(sources_by_version)`: paragraphs before/after exact deduplication at each cleanup level (`ABLATION_LEVELS`: raw, whitespace, math, full), showing what each cleanup step contributes.
 - `clean_blocks(tex)`, `before_after_html(version_dirs)`, `show_before_after(version_dirs)` (T17): every body block of `source` next to its cleaned text, with the file and line it comes from. The whole document is cleaned once with invisible markers between blocks, so each pair is exactly what `cleanup_latex` produces. The HTML is self-contained (one drop-down entry per version, removed tokens struck out, added ones highlighted) and works in a notebook cell or a built Jupyter Book page.
 
@@ -229,6 +229,14 @@ From the repository root, gather and clean every `data/<paper>/v<N>/` directory,
 ```bash
 python src/gather_clean_tex.py data --out gather_report.csv --workers 2 --check-idempotence
 ```
+
+The CSV is a checkpoint: each paper's rows are written and flushed as soon as the paper is done. If the run is interrupted (Colab disconnect, out-of-memory kill, Ctrl+C), run the same command with `--resume`. It keeps the rows already in the file (a line cut short by the interruption is dropped and redone) and processes only the missing versions. Without `--resume`, the file is started over.
+
+```bash
+python src/gather_clean_tex.py data --out gather_report.csv --workers 2 --check-idempotence --resume
+```
+
+If a worker process dies, the papers it took down with it are listed in a warning and left out of the CSV, so the next `--resume` run retries them.
 
 To inspect the result by hand, add `--dump-dir <dir>` (it must be outside `data/`). It writes `<dir>/<paper>/v<N>/source.tex` (gathered, comments stripped) and `cleaned.tex` (after cleanup):
 
