@@ -9,6 +9,7 @@ dependencies:
   - pip:
       # Giữ đúng phiên bản trong src/requirements.txt (ô kiểm tra ở §1 so sánh đúng từng phiên bản)
       - arxiv==4.0.1
+      - bibtexparser==1.4.3
       - requests==2.34.0
       - psutil==7.2.2
       - pandas==3.1.0

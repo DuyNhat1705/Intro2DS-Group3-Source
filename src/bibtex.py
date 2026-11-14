@@ -17,13 +17,29 @@ import urllib.parse
 import urllib.request
 import json
 import os
+import warnings
+import urllib.error
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
+if __package__:
+    from .m2_types import BibtexEntry
+    from .utils import GatherTex
+else:
     from m2_types import BibtexEntry
-except ImportError:
-    from src.m2_types import BibtexEntry
+    from utils import GatherTex
+
+
+class BibliographyParseError(ValueError):
+    """A selected bibliography source could not be read or parsed."""
+
+
+class BibliographyWarning(UserWarning):
+    """Extraction/enrichment is incomplete or a citation key is ambiguous."""
+
+
+class BibliographyMetadataWarning(BibliographyWarning):
+    """A conflicting bibliography definition was resolved using the last value."""
 
 
 # ---------------------------------------------------------------------------
@@ -31,12 +47,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _BIBITEM_PATTERN = re.compile(
-    r"\\bibitem(?:\[[^\]]*\])?\{([^}]+)\}\s*(.*?)(?=\\bibitem|\\end\{thebibliography\})",
+    r"\\bibitem\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}\s*(.*?)(?=\\bibitem\b|\Z)",
     re.DOTALL,
 )
 
 _BIBLIOGRAPHY_ENV = re.compile(
-    r"\\begin\{thebibliography\}.*?\\end\{thebibliography\}",
+    r"\\begin\s*\{thebibliography\}\s*\{[^{}]*\}(.*?)\\end\s*\{thebibliography\}",
     re.DOTALL,
 )
 
@@ -46,88 +62,172 @@ _BIBLIOGRAPHY_ENV = re.compile(
 # ---------------------------------------------------------------------------
 
 def extract_bibtex(
-    compilation_path: List[Path],
+    compilation_path: GatherTex | List[Path],
     arxiv_id: str,
+    *,
+    enrich: bool = True,
 ) -> List[BibtexEntry]:
+    r"""Extract selected .bib databases and every reachable bibitem environment.
+
+    GatherTex.source and GatherTex.bib_files are authoritative. Legacy lists
+    remain supported: only databases named by bibliography/addbibresource
+    commands in those files are opened. No directory-wide bibliography scan
+    is performed. Set enrich=False to disable both optional network hooks.
+    Read/parse errors raise BibliographyParseError rather than an empty result.
     """
-    Trích xuất và chuẩn hóa toàn bộ tài liệu tham khảo.
+    if isinstance(compilation_path, GatherTex):
+        source = compilation_path.source
+        bib_files = compilation_path.bib_files
+    else:
+        paths = [Path(path) for path in compilation_path]
+        if not paths:
+            return []
+        sources = [(path, _strip_tex_comments(_read_source(path))) for path in paths]
+        source = "\n".join(text for _, text in sources)
+        bib_files = []
+        pattern = re.compile(
+            r"\\(?:bibliography|addbibresource|addglobalbib|nobibliography)"
+            r"(?![A-Za-z@])\*?\s*(?:\[[^\]]*\]\s*)?\{([^{}]*)\}"
+        )
+        for path, text in sources:
+            for match in pattern.finditer(_scan_source(text)):
+                for name in match.group(1).split(","):
+                    name = name.strip()
+                    if not name:
+                        continue
+                    if not name.lower().endswith(".bib"):
+                        name += ".bib"
+                    candidates = [path.parent / name, paths[0].parent / name]
+                    selected = next((p for p in candidates if p.is_file()), None)
+                    if selected is None:
+                        raise BibliographyParseError(f"{path}: bibliography not found: {name}")
+                    bib_files.append(selected)
+    entries = []
+    for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
+        entries.extend(_parse_bib_file(bib_path, arxiv_id))
+    entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
+    return entries
 
-    Nguồn tìm kiếm (theo thứ tự ưu tiên):
-      1. File .bib riêng trong cùng thư mục
-      2. \\bibitem trong \\begin{thebibliography}...\\end{thebibliography}
 
-    Args:
-        compilation_path : Danh sách .tex files theo compilation path
-        arxiv_id         : Mã bài báo (ví dụ: "2310.00001")
+def _read_source(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise BibliographyParseError(f"Cannot read bibliography source {path}: {exc}") from exc
 
-    Returns:
-        List[BibtexEntry]: Danh sách entries đã chuẩn hóa.
-    """
-    if not compilation_path:
-        return []
 
-    version_dir = compilation_path[0].parent
+def _strip_tex_comments(text: str) -> str:
+    # A percent is escaped iff it follows an odd number of backslashes.
+    masked = _mask_literals(text)
+    chars = list(text)
+    for match in re.finditer(r"(\\.)|%[^\n]*", masked):
+        if not match.group(1):
+            chars[match.start():match.end()] = " " * (match.end() - match.start())
+    return "".join(chars)
 
-    # Ưu tiên 1: file .bib riêng
-    bib_files = list(version_dir.rglob("*.bib"))
-    if bib_files:
-        return _parse_bib_file(bib_files[0], arxiv_id)
 
-    # Ưu tiên 2: \bibitem trong .tex
-    return _parse_bibitem_from_tex(compilation_path, arxiv_id)
+def _mask_literals(text: str) -> str:
+    if __package__:
+        from .gather_clean_tex import _mask_literals as mask
+    else:
+        from gather_clean_tex import _mask_literals as mask
+    return mask(text)
+
+
+def _scan_source(text: str) -> str:
+    return _mask_literals(_strip_tex_comments(text))
 
 
 def _parse_bib_file(bib_path: Path, arxiv_id: str) -> List[BibtexEntry]:
     """Parse file .bib bằng thư viện bibtexparser."""
-    entries: List[BibtexEntry] = []
     try:
         import bibtexparser
-        with open(bib_path, encoding="utf-8", errors="ignore") as f:
-            db = bibtexparser.load(f)
+        from bibtexparser.bparser import BibTexParser
+        from bibtexparser.bibdatabase import UndefinedString
+        from pyparsing import ParseBaseException
+    except ImportError as exc:
+        raise BibliographyParseError(
+            f"{bib_path}: install bibtexparser==1.4.3 from src/requirements.txt"
+        ) from exc
+
+    class MetadataParser(BibTexParser):
+        def _add_string(self, string_key, string):
+            # Compare interpolated values, so quoting, concatenation and aliases
+            # follow the library's own semantics. Undefined macros still raise.
+            value = self._clean_val(string)
+            strings = self.bib_database.strings
+            if string_key in strings and strings[string_key] != value:
+                warnings.warn(
+                    f"{bib_path}: conflicting @string definition for key "
+                    f"{string_key!r}; using the last definition",
+                    BibliographyMetadataWarning,
+                    stacklevel=2,
+                )
+            # Do not call the base method: it logs a warning for every duplicate.
+            strings[string_key] = value
+
+    entries: List[BibtexEntry] = []
+    try:
+        source = _read_source(bib_path)
+        parser = MetadataParser(common_strings=True, ignore_nonstandard_types=False)
+        db = bibtexparser.loads(source, parser=parser)
+        # v1 accepts malformed entries as implicit comments; never lose them silently.
+        if any(re.search(r"(?m)^\s*@[A-Za-z]+\s*[{(]", comment)
+               for comment in db.comments):
+            raise BibliographyParseError(f"{bib_path}: malformed BibTeX entry")
         for e in db.entries:
+            key = e.get("ID", "").strip()
+            if not key:
+                raise BibliographyParseError(f"{bib_path}: empty citation key")
             entries.append(BibtexEntry(
                 arxiv_id=arxiv_id,
-                citation_key=e.get("ID", ""),
+                citation_key=key,
                 entry_type=e.get("ENTRYTYPE", "misc"),
                 title=e.get("title"),
                 authors=_split_authors(e.get("author", "")),
                 year=int(e["year"]) if e.get("year", "").isdigit() else None,
-                doi=e.get("doi"),
+                doi=_norm_doi(e.get("doi")) or None,
                 journal=e.get("journal") or e.get("booktitle"),
                 url=e.get("url"),
                 confidence_score=1.0,
                 source_method="bib_file",
             ))
-    except Exception:
-        pass
+    except (ParseBaseException, UndefinedString) as exc:
+        raise BibliographyParseError(f"{bib_path}: invalid BibTeX: {exc}") from exc
     return entries
 
 
 def _parse_bibitem_from_tex(
     compilation_path: List[Path],
     arxiv_id: str,
+    *,
+    enrich: bool = True,
 ) -> List[BibtexEntry]:
     """Tìm \\begin{thebibliography}...\\end{...} trong .tex, extract từng \\bibitem."""
-    combined = ""
-    for tex_path in compilation_path:
-        try:
-            combined += tex_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
+    combined = "\n".join(_read_source(Path(path)) for path in compilation_path)
+    return _parse_bibitems(combined, arxiv_id, enrich=enrich)
 
-    bib_match = _BIBLIOGRAPHY_ENV.search(combined)
-    if not bib_match:
-        return []
 
-    bib_block = bib_match.group(0)
-
+def _parse_bibitems(source: str, arxiv_id: str, *, enrich: bool) -> List[BibtexEntry]:
+    source = _strip_tex_comments(source)
+    scan = _mask_literals(source)
     entries = []
-    for m in _BIBITEM_PATTERN.finditer(bib_block):
-        key = m.group(1).strip()
-        raw = m.group(2).strip()
-        entry = _parse_bibitem_block(key, raw, arxiv_id)
-        entries.append(entry)
-
+    for block in _BIBLIOGRAPHY_ENV.finditer(scan):
+        body = block.group(1)
+        matches = list(_BIBITEM_PATTERN.finditer(body))
+        if len(matches) != len(re.findall(r"\\bibitem\b", body)):
+            raise BibliographyParseError(f"{arxiv_id}: malformed bibitem declaration")
+        for match in matches:
+            key = match.group(1).strip()
+            if not key:
+                raise BibliographyParseError(f"{arxiv_id}: empty bibitem citation key")
+            start, end = match.span(2)
+            raw = source[block.start(1) + start:block.start(1) + end]
+            entries.append(_parse_bibitem_block(key, raw.strip(), arxiv_id,
+                                               enrich=enrich))
+    if len(list(_BIBLIOGRAPHY_ENV.finditer(scan))) != len(re.findall(
+            r"\\begin\s*\{thebibliography\}", scan)):
+        raise BibliographyParseError(f"{arxiv_id}: unterminated/malformed thebibliography")
     return entries
 
 
@@ -135,6 +235,8 @@ def _parse_bibitem_block(
     citation_key: str,
     raw_text: str,
     arxiv_id: str,
+    *,
+    enrich: bool = True,
 ) -> BibtexEntry:
     """Parse một block \\bibitem thô thành BibtexEntry chuẩn."""
     text = re.sub(r"\s+", " ", raw_text).strip()
@@ -145,7 +247,7 @@ def _parse_bibitem_block(
 
     # 2. DOI
     doi_match = re.search(r"\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", text)
-    doi = doi_match.group(1).rstrip(".,;)") if doi_match else None
+    doi = _norm_doi(doi_match.group(1)) or None if doi_match else None
 
     # 3. URL & arXiv ID Hint (Đòn bẩy Milestone 3)
     url_match = re.search(r"https?://[^\s{}]+", text)
@@ -168,16 +270,24 @@ def _parse_bibitem_block(
 
     title_start = -1
     title_end = -1
+    plain_title_span = None
 
     if quote_match and len(quote_match.group(1).strip()) > 5:
         title = quote_match.group(1).strip()
         title_start, title_end = quote_match.span()
     elif style_match and len(style_match.group(1).strip()) > 5:
-        title = style_match.group(1).strip()
-        title_start, title_end = style_match.span()
+        plain_title_span = _plain_title_before_style(text, style_match.start())
+        if plain_title_span:
+            title_start, title_end = plain_title_span
+            title = text[title_start:title_end]
+        else:
+            title = style_match.group(1).strip()
+            title_start, title_end = style_match.span()
 
     if title and title_start != -1:
         author_part = text[:title_start].strip().rstrip(",.")
+        if plain_title_span:
+            author_part = _split_names(author_part, r"\\newblock\b")[0].rstrip(".")
         tail_part = text[title_end:].strip().lstrip(",.")
 
         authors = _parse_authors_from_text(author_part)
@@ -188,7 +298,10 @@ def _parse_bibitem_block(
         if j_match:
             journal = j_match.group(1).strip()
     else:
-        parts = [p.strip() for p in text.split(".") if p.strip()]
+        # Initials (J. A. Smith) are not author/title sentence boundaries.
+        plain = re.sub(r"\\newblock\s*", ". ", text)
+        parts = [p.strip(" .") for p in re.split(r"(?<!\b[A-Z])\.\s+(?=[A-Z{\\])", plain)
+                 if p.strip(" .")]
         if len(parts) >= 2:
             authors = _parse_authors_from_text(parts[0])
             title = parts[1]
@@ -218,20 +331,26 @@ def _parse_bibitem_block(
     source_method = "regex"
 
     # CrossRef API Auto-Enrichment
-    if title and (not authors or year is None or not doi):
+    if enrich and title and (not authors or year is None or not doi):
         enriched = _enrich_with_crossref(title, doi)
         if enriched:
-            title = enriched.get("title") or title
-            authors = enriched.get("authors") or authors
-            year = enriched.get("year") or year
-            doi = enriched.get("doi") or doi
-            journal = enriched.get("journal") or journal
+            # Verified enrichment fills holes; local evidence keeps precedence.
+            authors = authors or enriched.get("authors") or []
+            year = year if year is not None else enriched.get("year")
+            doi = doi or enriched.get("doi")
+            journal = journal or enriched.get("journal")
             source_method = "crossref"
 
     # LLM Fallback (khi regex thiếu trường nghiêm trọng)
-    if not title or not authors:
+    if enrich and (not title or not authors):
         llm_entry = _fallback_parse_with_llm(citation_key, raw_text, arxiv_id)
         if llm_entry:
+            llm_entry.title = title or llm_entry.title
+            llm_entry.authors = authors or llm_entry.authors
+            llm_entry.year = year if year is not None else llm_entry.year
+            llm_entry.doi = doi or llm_entry.doi
+            llm_entry.journal = journal or llm_entry.journal
+            llm_entry.url = url or llm_entry.url
             llm_entry.arxiv_id_hint = arxiv_id_hint
             llm_entry.source_method = "llm"
             llm_entry.confidence_score = _calculate_confidence_score(llm_entry)
@@ -254,26 +373,86 @@ def _parse_bibitem_block(
     return res_entry
 
 
-def _parse_authors_from_text(raw_authors: str) -> List[str]:
-    """Tách danh sách tác giả từ văn bản thô."""
-    clean_str = re.sub(r"\\[a-zA-Z]+|\{|\}|~", " ", raw_authors)
-    clean_str = re.sub(r"\bet\s+al\.?\b", "", clean_str, flags=re.IGNORECASE).strip()
-    clean_str = re.sub(r"\s+and\s+", ", ", clean_str, flags=re.IGNORECASE)
-    tokens = [p.strip() for p in clean_str.split(",") if p.strip()]
+def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int, int]]:
+    """Recognize authors and a complete plain title before later venue styling."""
+    prefix = text[:style_start]
+    # Top-level separators only: braces protect corporate names and title text.
+    # Explicit blocks also keep a multi-sentence title together.
+    if re.search(r"\\newblock\b", prefix):
+        parts = _split_names(prefix, r"\\newblock\b")
+        if len(parts) != 2 or not parts[0].endswith("."):
+            return None
+    else:
+        parts = _split_names(prefix, r"(?<!\b[A-Z])\.\s+(?=[A-Z{\\])")
+        if len(parts) != 2:
+            return None
+    candidate = parts[1]
+    if len(candidate) <= 5 or not candidate.endswith("."):
+        return None
+    start = prefix.rfind(candidate)
+    return start, start + len(candidate)
 
-    author_list = []
-    for token in tokens:
-        name = token.strip().rstrip(".,")
-        if 2 <= len(name) <= 60 and not re.search(r"^(in|pp|vol|no|page)\b", name, re.IGNORECASE):
-            author_list.append(name)
-    return author_list
+
+def _parse_authors_from_text(raw_authors: str) -> List[str]:
+    """Split prose authors conservatively, retaining protected corporate names."""
+    raw = re.sub(r"\bet\s+al\b\.?", "", raw_authors, flags=re.IGNORECASE).strip()
+    names = []
+    for segment in _split_names(raw, r"\band\b|\\?&|;"):
+        # Braces protect both commas and 'and' inside corporate names.
+        chunks = _split_names(segment, r",")
+        if len(chunks) == 2 and len(chunks[0].split()) == 1:
+            chunks = [segment]  # Last, First / Last, J.
+        elif len(chunks) > 2 and len(chunks) % 2 == 0 and all(
+                len(chunks[i].split()) == 1 for i in range(0, len(chunks), 2)):
+            chunks = [", ".join(chunks[i:i + 2]) for i in range(0, len(chunks), 2)]
+        for chunk in chunks:
+            name = _clean_author(chunk)
+            if name and not re.search(r"^(in|pp|vol|no|page)\b", name, re.IGNORECASE):
+                names.append(name)
+    return names
+
+
+def _split_names(text: str, separator: str) -> List[str]:
+    """Split separators only at brace depth zero (BibTeX corporate syntax)."""
+    pattern = re.compile(separator, re.IGNORECASE)
+    depth = 0
+    start = 0
+    i = 0
+    parts = []
+    while i < len(text):
+        if depth == 0:
+            match = pattern.match(text, i)
+            if match:
+                if text[start:i].strip():
+                    parts.append(text[start:i].strip())
+                i = match.end()
+                start = i
+                continue
+        if text[i] == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth = max(0, depth - 1)
+        i += 1
+    if text[start:].strip():
+        parts.append(text[start:].strip())
+    return parts
+
+
+def _clean_author(name: str) -> str:
+    name = re.sub(r"\\(?:textsc|textbf|textit|emph)\b\s*", "", name)
+    name = name.replace(r"\&", "&").replace("~", " ")
+    return " ".join(name.replace("{", "").replace("}", "").split()).strip(" ,;")
 
 
 def _split_authors(author_str: str) -> List[str]:
     """Tách chuỗi authors từ bibtexparser format."""
     if not author_str:
         return []
-    return [a.strip() for a in re.split(r"\s+and\s+", author_str, flags=re.IGNORECASE)]
+    return [_clean_author(name) for name in _split_names(author_str, r"\band\b")
+            if _clean_author(name).lower() != "others"]
 
 
 def _calculate_confidence_score(entry: BibtexEntry) -> float:
@@ -283,7 +462,7 @@ def _calculate_confidence_score(entry: BibtexEntry) -> float:
         score += 0.45
     if entry.authors and len(entry.authors) > 0:
         score += 0.25
-    if entry.year and 1900 <= entry.year <= 2026:
+    if entry.year and 1000 <= entry.year <= 9999:
         score += 0.15
     if entry.doi or entry.arxiv_id_hint:
         score += 0.15
@@ -291,10 +470,10 @@ def _calculate_confidence_score(entry: BibtexEntry) -> float:
 
 
 def _enrich_with_crossref(title: str, doi: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Tự động đối soát và bù đắp thông tin qua CrossRef Open API."""
+    """Fill missing metadata only after DOI identity or conservative title checks."""
     try:
         if doi:
-            url = f"https://api.crossref.org/works/{doi}"
+            url = "https://api.crossref.org/works/" + urllib.parse.quote(_norm_doi(doi), safe="")
         else:
             query = urllib.parse.quote_plus(title)
             url = f"https://api.crossref.org/works?query.title={query}&rows=1"
@@ -313,13 +492,30 @@ def _enrich_with_crossref(title: str, doi: Optional[str] = None) -> Optional[Dic
                     return None
                 item = items[0]
 
-            ext_title = item.get("title", [None])[0]
+            if not isinstance(item, dict):
+                raise ValueError("CrossRef item must be an object")
+            ext_title = (item.get("title") or [None])[0]
             ext_doi = item.get("DOI")
-            ext_journal = item.get("container-title", [None])[0]
+            ext_journal = (item.get("container-title") or [None])[0]
+            if not isinstance(ext_title, str) or not isinstance(ext_doi, str):
+                raise ValueError("CrossRef result lacks title/DOI")
+            if doi:
+                verified = _norm_doi(doi) == _norm_doi(ext_doi)
+            else:
+                left, right = _norm_title(title), _norm_title(ext_title)
+                left_tokens, right_tokens = set(left.split()), set(right.split())
+                verified = (min(len(left), len(right)) >= 12
+                            and _title_similarity(left, right) >= 0.92
+                            and len(left_tokens & right_tokens) /
+                            max(1, len(left_tokens | right_tokens)) >= 0.8)
+            if not verified:
+                warnings.warn(f"CrossRef result rejected for {title!r}: identity mismatch",
+                              BibliographyWarning, stacklevel=2)
+                return None
 
             ext_authors = []
             for a in item.get("author", []):
-                name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+                name = a.get("name") or f"{a.get('given', '')} {a.get('family', '')}".strip()
                 if name:
                     ext_authors.append(name)
 
@@ -332,10 +528,13 @@ def _enrich_with_crossref(title: str, doi: Optional[str] = None) -> Optional[Dic
                 "title": ext_title,
                 "authors": ext_authors,
                 "year": ext_year,
-                "doi": ext_doi,
+                "doi": _norm_doi(ext_doi),
                 "journal": ext_journal,
             }
-    except Exception:
+    except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError, IndexError,
+            AttributeError) as exc:
+        warnings.warn(f"CrossRef enrichment failed ({type(exc).__name__}); keeping local metadata",
+                      BibliographyWarning, stacklevel=2)
         return None
 
 
@@ -368,18 +567,33 @@ def _fallback_parse_with_llm(
             res_data = json.loads(response.read().decode("utf-8"))
             text_out = res_data["candidates"][0]["content"]["parts"][0]["text"]
             meta = json.loads(text_out)
+            if not isinstance(meta, dict):
+                raise ValueError("LLM metadata must be an object")
+            for name in ("title", "doi", "journal", "entry_type"):
+                if meta.get(name) is not None and not isinstance(meta[name], str):
+                    raise ValueError(f"Invalid LLM {name}")
+            if not isinstance(meta.get("authors", []), list) or any(
+                    not isinstance(author, str) for author in meta.get("authors", [])):
+                raise ValueError("Invalid LLM authors")
+            if meta.get("year") is not None and (type(meta["year"]) is not int
+                                                or not 1000 <= meta["year"] <= 9999):
+                raise ValueError("Invalid LLM year")
 
             return BibtexEntry(
                 arxiv_id=arxiv_id,
                 citation_key=citation_key,
-                entry_type=meta.get("entry_type", "misc"),
+                entry_type=meta.get("entry_type") or "misc",
                 title=meta.get("title"),
                 authors=meta.get("authors", []),
                 year=meta.get("year"),
-                doi=meta.get("doi"),
+                doi=_norm_doi(meta.get("doi")) or None,
                 journal=meta.get("journal"),
             )
-    except Exception:
+    except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError, IndexError,
+            AttributeError) as exc:
+        # Do not include the request URL: it contains an API key.
+        warnings.warn(f"LLM fallback failed ({type(exc).__name__}); keeping local metadata",
+                      BibliographyWarning, stacklevel=2)
         return None
 
 
@@ -403,13 +617,6 @@ _SOURCE_PRIORITY = {
     "llm": 2,
     "crossref": 1,
 }
-_CITATION_COMMAND_PATTERN = re.compile(
-    r"\\(?P<command>cite|citep|citet|citealt|citealp|citeauthor|citeyear|"
-    r"citeyearpar|citenum|parencite|textcite|autocite|cites|nocite)"
-    r"(?P<star>\*)?"
-    r"(?P<body>(?:\s*\[[^\]]*\]){0,2}\s*\{[^{}]*\}"
-    r"(?:\s*(?:\[[^\]]*\]){0,2}\s*\{[^{}]*\})*)"
-)
 _LATEX_COMMAND_PATTERN = re.compile(r"\\[a-zA-Z@]+\*?(?:\s*\[[^\]]*\])?")
 _PUNCTUATION_PATTERN = re.compile(r"[^\w\s]", re.UNICODE)
 
@@ -492,7 +699,12 @@ def _norm_doi(value: Optional[str]) -> str:
     doi = value.strip().lower()
     doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi)
     doi = re.sub(r"^dx\.doi\.org/", "", doi)
-    return doi.rstrip(" \t\r\n.,;:)]}")
+    doi = re.sub(r"^doi\s*:\s*", "", doi)
+    doi = doi.rstrip(" \t\r\n.,;:")
+    pairs = {")": "(", "]": "[", "}": "{"}
+    while doi and doi[-1] in pairs and doi.count(doi[-1]) > doi.count(pairs[doi[-1]]):
+        doi = doi[:-1].rstrip(" \t\r\n.,;:")
+    return doi
 
 
 def _norm_arxiv(value: Optional[str]) -> str:
@@ -507,6 +719,9 @@ def _author_surname(author: str) -> str:
     clean = _norm_text(re.sub(r"\bet\s+al\.?\b", "", author, flags=re.IGNORECASE))
     if not clean:
         return ""
+    if re.search(r"\b(?:collaboration|consortium|team|group|committee|organization)\b|\band\b|&",
+                 author, re.IGNORECASE) or author.strip().startswith("{"):
+        return clean
     if "," in author:
         left = _norm_text(author.split(",", 1)[0])
         return left.split()[-1] if left else ""
@@ -956,12 +1171,26 @@ def unify_publication(
 
     unified = [item for item, _ in components]
     key_map: Dict[int, Dict[str, str]] = {}
+    ambiguous_keys = []
     for (version, old_key), targets in sorted(original_key_targets.items()):
         # Key bị tái sử dụng cùng version là mơ hồ; không tạo một ánh xạ sai.
         if len(targets) == 1:
             target = next(iter(targets))
             if old_key != target:
                 key_map.setdefault(version, {})[old_key] = target
+        else:
+            ambiguity = {"version": version, "citation_key": old_key,
+                         "targets": sorted(targets)}
+            ambiguous_keys.append(ambiguity)
+            for item in unified:
+                if item.citation_key in targets:
+                    item.conflicts.append({"field": "ambiguous_citation_key", **ambiguity,
+                                           "selected": None})
+            warnings.warn(
+                f"{arxiv_id} v{version}: ambiguous citation key {old_key!r} refers to "
+                f"{sorted(targets)}; citations with this key cannot be resolved",
+                BibliographyWarning, stacklevel=2,
+            )
     key_map = {version: dict(sorted(mapping.items()))
                for version, mapping in sorted(key_map.items()) if mapping}
 
@@ -977,6 +1206,7 @@ def unify_publication(
         ),
         "merges_by_stage": merge_counts,
         "field_conflicts": all_conflicts,
+        "ambiguous_keys": ambiguous_keys,
         "empty_versions": empty_versions,
         "versions_total": len(versions),
         "keys_changed": sum(
@@ -1006,97 +1236,43 @@ def rewrite_cites(
     Gọi hàm này TRƯỚC bước so khớp full-text dedup của elements để các câu
     giống nhau nhưng khác key cite vẫn được gộp thành một element_id.
     """
-    version_map = key_map.get(version, {})
-
-    def replace(match: re.Match[str]) -> str:
-        body = match.group("body")
-        changed = False
-
-        def replace_group(group_match: re.Match[str]) -> str:
-            nonlocal changed
-            original_keys = group_match.group(1)
-            keys = [key.strip() for key in original_keys.split(",")]
-            rewritten: List[str] = []
-            seen = set()
-            for key in keys:
-                mapped = version_map.get(key, key)
-                if mapped != key:
-                    changed = True
-                if mapped and mapped not in seen:
-                    rewritten.append(mapped)
-                    seen.add(mapped)
-            return "{" + ", ".join(rewritten) + "}"
-
-        updated_body = re.sub(r"\{([^{}]*)\}", replace_group, body)
-        if not changed:
-            return match.group(0)
-        return (
-            "\\" + match.group("command") + (match.group("star") or "")
-            + updated_body
-        )
-
-    return _CITATION_COMMAND_PATTERN.sub(replace, text)
+    if __package__:
+        from .hierarchy import _rewrite_citation_text
+    else:
+        from hierarchy import _rewrite_citation_text
+    return _rewrite_citation_text(text, key_map.get(version, {}))
 
 
 def _fallback_compilation_path(version_dir: Path) -> List[Path]:
-    """Tìm file chính có documentclass, theo input/include và bỏ comment TeX.
+    """Compatibility wrapper; gathering has one implementation."""
+    gathered = _gather_version(version_dir)
+    return gathered.tex_files if gathered is not None else []
 
-    Giả định đơn giản: source dùng \\input{...} hoặc \\include{...}; macro động,
-    đường dẫn phức tạp và file nằm ngoài version_dir không được mở rộng.
-    """
-    tex_files = sorted(version_dir.rglob("*.tex"))
-    if not tex_files:
-        return []
-    document_pattern = re.compile(r"\\documentclass(?:\[[^\]]*\])?\s*\{")
-    main_files = []
-    for path in tex_files:
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        uncommented = re.sub(r"(?<!\\)%.*", "", content)
-        if document_pattern.search(uncommented):
-            main_files.append(path)
-    if not main_files:
-        main_files = tex_files[:1]
-    visited = set()
-    ordered: List[Path] = []
-    include_pattern = re.compile(r"\\(?:input|include)\s*\{([^}]+)\}")
 
-    def visit(path: Path) -> None:
-        resolved = path.resolve()
-        if resolved in visited:
-            return
-        visited.add(resolved)
-        ordered.append(path)
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        content = re.sub(r"(?<!\\)%.*", "", content)
-        for match in include_pattern.finditer(content):
-            target = match.group(1).strip()
-            include_path = (path.parent / target)
-            candidates = [include_path]
-            if include_path.suffix.lower() != ".tex":
-                candidates.append(include_path.with_suffix(".tex"))
-            for candidate in candidates:
-                if candidate.is_file():
-                    visit(candidate)
-                    break
-
-    for main in sorted(main_files):
-        visit(main)
-    return ordered
+def _gather_version(version_dir: Path) -> Optional[GatherTex]:
+    if __package__:
+        from .gather_clean_tex import gather_tex
+    else:
+        from gather_clean_tex import gather_tex
+    return gather_tex(version_dir)
 
 
 def process_publication(
     arxiv_id: str,
-    version_dirs: Dict[int, Path],
-    get_compilation_path: Optional[Callable[[Path], List[Path]]] = None,
+    version_dirs: Dict[int, Optional[Path]],
+    get_compilation_path: Optional[Callable[[Path], GatherTex | List[Path] | None]] = None,
     *,
     fuzzy_threshold: float = 0.92,
 ) -> UnifiedBibliography:
     """Trích xuất BibTeX từng version rồi hợp nhất; version rỗng vẫn được ghi nhận."""
     per_version: Dict[int, List[BibtexEntry]] = {}
-    path_getter = get_compilation_path or _fallback_compilation_path
+    path_getter = get_compilation_path or _gather_version
     for version in sorted(version_dirs):
-        version_dir = Path(version_dirs[version])
-        compilation_path = path_getter(version_dir)
+        directory = version_dirs[version]
+        if directory is None:
+            per_version[version] = []
+            continue
+        compilation_path = path_getter(Path(directory))
         per_version[version] = extract_bibtex(compilation_path, arxiv_id) if compilation_path else []
     return unify_publication(arxiv_id, per_version, fuzzy_threshold=fuzzy_threshold)
 
@@ -1138,20 +1314,22 @@ def _run_publication_job(
 ) -> Tuple[str, UnifiedBibliography, float]:
     """Worker top-level để tương thích ProcessPoolExecutor trên Windows."""
     arxiv_id, versions, path_getter, fuzzy_threshold, no_network = job
+    original_crossref = _enrich_with_crossref
+    original_llm = _fallback_parse_with_llm
     if no_network:
-        def disabled_crossref(title: str, doi: Optional[str] = None) -> None:
-            _ = title, doi
-            return None
-        globals()["_enrich_with_crossref"] = disabled_crossref
-        os.environ.pop("GEMINI_API_KEY", None)
+        # Patch the canonical module, including calls through bibtex_extract.
+        globals()["_enrich_with_crossref"] = lambda *args, **kwargs: None
+        globals()["_fallback_parse_with_llm"] = lambda *args, **kwargs: None
     started = time.perf_counter()
-    result = process_publication(
-        arxiv_id,
-        versions,
-        get_compilation_path=path_getter,
-        fuzzy_threshold=fuzzy_threshold,
-    )
-    return arxiv_id, result, time.perf_counter() - started
+    try:
+        result = process_publication(
+            arxiv_id, versions, get_compilation_path=path_getter,
+            fuzzy_threshold=fuzzy_threshold,
+        )
+        return arxiv_id, result, time.perf_counter() - started
+    finally:
+        globals()["_enrich_with_crossref"] = original_crossref
+        globals()["_fallback_parse_with_llm"] = original_llm
 
 
 def _rss_tree_bytes(psutil_module: Any) -> int:
@@ -1177,7 +1355,7 @@ def run_corpus(
     workers: int = 1,
     no_network: bool = False,
     fuzzy_threshold: float = 0.92,
-    get_compilation_path: Optional[Callable[[Path], List[Path]]] = None,
+    get_compilation_path: Optional[Callable[[Path], GatherTex | List[Path] | None]] = None,
 ) -> Dict[str, Any]:
     """Chạy corpus và xuất Parquet (nếu có pyarrow) hoặc JSONL.
 
@@ -1192,13 +1370,6 @@ def run_corpus(
     out_dir = Path(out_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Không tìm thấy thư mục corpus: {root}")
-    if no_network:
-        def disabled_crossref(title: str, doi: Optional[str] = None) -> None:
-            _ = title, doi
-            return None
-        globals()["_enrich_with_crossref"] = disabled_crossref
-        os.environ.pop("GEMINI_API_KEY", None)
-
     out_dir.mkdir(parents=True, exist_ok=True)
     publications = _find_publications(root)
     jobs = [(arxiv_id, versions) for arxiv_id, versions in sorted(publications.items())]
@@ -1417,7 +1588,7 @@ def _selftest() -> None:
     citation_text = r"\citep[see][p.3]{a, b}; \nocite{x}"
     cite_map = {1: {"a": "c", "b": "c"}}
     rewritten = rewrite_cites(citation_text, cite_map, 1)
-    assert rewritten == r"\citep[see][p.3]{c}; \nocite{x}"
+    assert rewritten == r"\citep[see][p.3]{c, c}; \nocite{x}"
     assert rewrite_cites(rewritten, cite_map, 1) == rewritten
     passed += 1
 

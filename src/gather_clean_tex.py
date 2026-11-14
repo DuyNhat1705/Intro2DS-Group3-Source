@@ -45,7 +45,10 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable
 
-from utils import GatherTex
+if __package__:
+    from .utils import GatherTex
+else:
+    from utils import GatherTex
 
 __all__ = [
     "ABLATION_LEVELS",
@@ -87,6 +90,10 @@ class GatherWarning(UserWarning):
     """A recoverable gathering problem (missing include, include cycle, ...)."""
 
 
+class MissingBibliographyWarning(GatherWarning):
+    """Thiếu bibliography tùy chọn; không làm mất phần nội dung chính."""
+
+
 # ============================================================== T1: patterns
 
 # Root declaration; group 1 is the class name (LaTeX 2.09 used \documentstyle).
@@ -118,11 +125,22 @@ _END_DOCUMENT = re.compile(r"\\end\s*\{document\}")
 _VERBATIM_NAMES = r"verbatim\*?|Verbatim\*?|BVerbatim|lstlisting|minted|alltt"
 _VERBATIM_ENV = re.compile(r"\\begin\{(" + _VERBATIM_NAMES + r")\}.*?\\end\{\1\}", re.S)
 _VERB = re.compile(r"\\verb\*?([^\sA-Za-z*]).*?\1")
+_LITERAL_SCAN = re.compile(
+    r"\\\\|\\begin\{(?P<literal_env>" + _VERBATIM_NAMES + r")\}.*?\\end\{(?P=literal_env)\}"
+    r"|\\verb\*?(?P<literal_delim>[^\sA-Za-z*])[^\n]*?(?P=literal_delim)"
+    r"|(?P<literal_url>\\(?:url|href|path)(?![A-Za-z@]))",
+    re.S,
+)
 
 # Arguments that must survive text rewriting untouched (keys, labels, paths).
 _ARG_PROTECT = re.compile(
-    r"\\(?:url|href|path|cite[A-Za-z]*|nocite|[A-Za-z]*ref|label|includegraphics|bibitem)"
+    r"\\(?:url|href|path|[A-Za-z]*ref|label|includegraphics|bibitem)"
     r"(?![A-Za-z@])\*?\s*(?:\[[^\]]*\]\s*)*\{[^{}]*\}"
+)
+_CITATION = re.compile(
+    r"\\\\|\\(cite[A-Za-z]*|Cite[A-Za-z]*|nocite|[Pp]arencites?|[Tt]extcites?"
+    r"|[Aa]utocites?|footcites?|footcitetexts?|[Ss]martcites?|supercites?"
+    r"|fullcite|footfullcite)(?![A-Za-z@])\*?"
 )
 
 _MAX_INCLUDE_DEPTH = 32
@@ -247,6 +265,61 @@ def _read_args(text: str, pos: int, spec: str) -> tuple[list[str | None] | None,
     return args, pos
 
 
+def _mask_literals(text: str) -> str:
+    """Blank non-executing spans for scans, retaining character and line offsets."""
+    out, pos = [], 0
+    for m in _LITERAL_SCAN.finditer(text):
+        if m.start() < pos:
+            continue
+        end = m.end()
+        if m.group("literal_url"):
+            arg = _read_arg(text, end)
+            if arg is None:
+                continue
+            end = arg[1]  # href's second argument is ordinary, executable text
+        out.append(text[pos : m.start()])
+        out.append(re.sub(r"[^\n]", " ", text[m.start() : end]))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _hide_arguments(text: str, shelf: _Shelf) -> str:
+    """Protect citation groups, including multicites, then other opaque arguments."""
+    out, pos = [], 0
+    for m in _CITATION.finditer(text):
+        if m.start() < pos or m.group(1) is None:
+            continue
+        multiple = m.group(1).endswith("s")
+        end = m.end()
+        while True:
+            p = end
+            # Multicites accept global notes in parentheses, then per-entry notes.
+            while True:
+                at = _ARG_GAP.match(text, p).end()
+                if at >= len(text) or text[at] not in ("[(" if multiple else "["):
+                    break
+                _, after = _read_optional(text, p, text[at], "]" if text[at] == "[" else ")")
+                if after == p:
+                    break
+                p = after
+            at = _ARG_GAP.match(text, p).end()
+            if at >= len(text) or text[at] != "{":
+                break
+            arg = _read_arg(text, at)
+            if arg is None:
+                break
+            end = arg[1]
+            if not multiple:
+                break
+        if end > m.end():
+            out.append(text[pos : m.start()])
+            out.append(shelf.put(text[m.start() : end]))
+            pos = end
+    out.append(text[pos:])
+    return shelf.hide(_ARG_PROTECT, "".join(out))
+
+
 def _braces_balanced(text: str) -> bool:
     depth = 0
     for m in _BRACE_TOKEN.finditer(text):
@@ -262,12 +335,13 @@ def _braces_balanced(text: str) -> bool:
 
 def _document_body(text: str) -> str:
     r"""The part between ``\begin{document}`` and ``\end{document}`` (all if absent)."""
-    m = _BEGIN_DOCUMENT.search(text)
+    masked = _mask_literals(text)
+    m = _BEGIN_DOCUMENT.search(masked)
     if not m:
         return text
     body = text[m.end() :]
-    e = _END_DOCUMENT.search(body)
-    return body[: e.start()] if e else body
+    e = _END_DOCUMENT.search(masked, m.end())
+    return text[m.end() : e.start()] if e else body
 
 
 # ============================================================== T2: comments
@@ -384,8 +458,16 @@ def _find_asset(
         index = _index_files(version_dir)
     for cand in candidates:
         hits = index.get(Path(cand.replace("\\", "/")).name.lower(), [])
-        if len(hits) == 1:
-            return hits[0].resolve()
+        contained = set()
+        for hit in hits:
+            try:
+                resolved = hit.resolve()
+            except (OSError, ValueError):
+                continue
+            if resolved.is_relative_to(version_dir) and resolved.is_file():
+                contained.add(resolved)
+        if len(contained) == 1:
+            return next(iter(contained))
     return None
 
 
@@ -400,6 +482,7 @@ _TOKEN = re.compile(
     r"|(?P<if>if[A-Za-z@]*)"
     r"|(?P<else>else)(?![A-Za-z@])"
     r"|(?P<fi>fi)(?![A-Za-z@])"
+    r"|(?P<enddocument>end\s*\{document\})"
     r"|(?P<endinput>endinput)(?![A-Za-z@])"
     r"|includeonly\s*\{(?P<only>[^{}]*)\}"
     r"|(?P<cmd2>import|subimport|inputfrom|includefrom|subinputfrom|subincludefrom)\*?"
@@ -581,6 +664,7 @@ class _Expander:
         self.used_conditionals = False
         self.undecided = 0  # conditionals kept verbatim because their test is unknown
         self.root_dir: Path | None = None
+        self.ended = False  # end{document} ends the whole compilation, even in an input
         # Everything emitted so far: a test sees only the definitions TeX has read before it.
         self.emitted: list[str] = []
 
@@ -643,6 +727,7 @@ class _Expander:
         out_len = 0
         pos = 0
         files = self.version_dir is not None and path is not None
+        masked = _mask_literals(text)
 
         def put(s: str, src: int | None = None) -> None:
             nonlocal out_len
@@ -656,7 +741,9 @@ class _Expander:
             out_len += len(s)
 
         while True:
-            m = _TOKEN.search(text, pos)
+            if files and self.ended:
+                break
+            m = _TOKEN.search(masked, pos)
             if m is None:
                 if self.emitting():
                     put(text[pos:], pos)
@@ -719,6 +806,11 @@ class _Expander:
                 if files and self.emitting():
                     break
                 emit()
+            elif g("enddocument") is not None:
+                emit()
+                if files and self.emitting():
+                    self.ended = True
+                    break
             elif g("only") is not None:
                 if files:
                     if self.emitting():
@@ -757,9 +849,15 @@ class _Expander:
         target = _find_asset(name, ".tex", new_base, path.parent, self.version_dir, index=self.index)
         at = self.where(path, file_off + m.start())
         if target is None:
+            if name in {"glyphtounicode", "glyphtounicode.tex"}:
+                # Bảng ánh xạ glyph của TeX Live phục vụ PDF, không chứa nội
+                # dung bài. Chỉ bỏ qua tên hệ thống chính xác khi không có file.
+                self.notes.append(f"skipped system font mapping: {name}{at}")
+                return ""
             self.missing.append(name)
             self.notes.append(f"include not found: {name}{at}")
-            warnings.warn(f"{self.version_dir}: include not found: {name}{at}", GatherWarning, stacklevel=2)
+            category = MissingBibliographyWarning if Path(name).suffix.lower() in {".bib", ".bbl"} else GatherWarning
+            warnings.warn(f"{self.version_dir}: include not found: {name}{at}", category, stacklevel=2)
             return ""
         if target in chain:
             self.notes.append(f"include cycle skipped: {name}{at}")
@@ -772,7 +870,7 @@ class _Expander:
             self.tex_files.append(target)
         text = self._text(target)
         body_off = 0
-        if cmd == "subfile" or _DOCUMENT_CLASS.search(text):
+        if cmd == "subfile" or _DOCUMENT_CLASS.search(_mask_literals(text)):
             body = _document_body(text)  # a standalone/subfile document: drop its preamble
             body_off = max(text.find(body), 0) if body else 0
             text = body
@@ -781,8 +879,8 @@ class _Expander:
                             offset=offset + prefix, file_off=body_off)
         if "include" in cmd:
             return "\n\n" + content + "\n\n"  # \include starts and ends with \clearpage
-        # TeX turns the file's final end-of-line into a space; drop one newline.
-        return content[:-1] if content.endswith("\n") else content
+        # The final end-of-line is a word boundary in TeX; retain it when splicing.
+        return content
 
     def run(self, root: Path) -> str:
         source = self._run_once(root, conditionals=True)
@@ -821,7 +919,7 @@ def _resolve_conditionals(text: str) -> str:
 
 def _include_targets(text: str, path: Path, version_dir: Path, index) -> set[Path]:
     targets = set()
-    for m in _INCLUDE.finditer(text):
+    for m in _INCLUDE.finditer(_mask_literals(text)):
         if m.group("cmd1"):
             name = m.group("file1") if m.group("file1") is not None else m.group("bare")
         else:
@@ -841,7 +939,8 @@ def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, 
     conventional name (main, ms, paper, ... or the arXiv id), and size.
     """
     cands = []
-    for p, t in texts.items():
+    scanned = {p: _mask_literals(t) for p, t in texts.items()}
+    for p, t in scanned.items():
         m = _DOCUMENT_CLASS.search(t)
         if m and m.group(1).strip() not in _NON_ROOT_CLASSES:
             cands.append(p)
@@ -858,7 +957,7 @@ def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, 
             pool = keep
             reasons.append(why)
 
-    narrow([p for p in pool if _BEGIN_DOCUMENT.search(texts[p])], "has \\begin{document}")
+    narrow([p for p in pool if _BEGIN_DOCUMENT.search(scanned[p])], "has \\begin{document}")
     if len(pool) > 1:
         included: set[Path] = set()
         for p, t in texts.items():
@@ -919,7 +1018,7 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
         notes.append(f"{expander.undecided} conditional(s) with an undecidable test kept verbatim")
 
     bib_files: list[Path] = []
-    for m in _BIBLIOGRAPHY.finditer(source):
+    for m in _BIBLIOGRAPHY.finditer(_mask_literals(source)):
         for name in m.group(1).split(","):
             name = name.strip()
             if not name:
@@ -929,7 +1028,7 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
                 missing.append(name if name.lower().endswith(".bib") else name + ".bib")
                 f, ln = origins[min(source.count("\n", 0, m.start()), len(origins) - 1)]
                 notes.append(f"bibliography not found: {name} ({f}:{ln})")
-                warnings.warn(f"{version_dir}: bibliography not found: {name} ({f}:{ln})", GatherWarning, stacklevel=2)
+                warnings.warn(f"{version_dir}: bibliography not found: {name} ({f}:{ln})", MissingBibliographyWarning, stacklevel=2)
             elif p not in bib_files:
                 bib_files.append(p)
 
@@ -1442,7 +1541,7 @@ def _clean_math_body(body: str) -> str:
     return body.strip()
 
 
-_ENSUREMATH = re.compile(r"\\ensuremath(?![A-Za-z@])")
+_ENSUREMATH = re.compile(r"\\\\|\\ensuremath(?![A-Za-z@])")
 
 
 def _ensuremath_to_dollars(text: str) -> str:
@@ -1452,6 +1551,10 @@ def _ensuremath_to_dollars(text: str) -> str:
         if m is None:
             out.append(text[pos:])
             return "".join(out)
+        if m.group(0) == "\\\\":
+            out.append(text[pos : m.end()])
+            pos = m.end()
+            continue
         r = _read_arg(text, m.end())
         if r is None:
             out.append(text[pos : m.end()])
@@ -2016,7 +2119,7 @@ def _canonical_step(text: str) -> str:
     """
     text = unicodedata.normalize("NFC", text)
     shelf = _Shelf()
-    text = shelf.hide(_ARG_PROTECT, text)
+    text = _hide_arguments(text, shelf)
     text = _hide_column_specs(text, shelf)
     parts = []
     for kind, opener, body, close in _segments(text):
@@ -2041,7 +2144,7 @@ def _whitespace_step(text: str) -> str:
     blank line, which would split a paragraph in two.
     """
     shelf = _Shelf()
-    text = shelf.hide(_ARG_PROTECT, text)
+    text = _hide_arguments(text, shelf)
     text = re.sub(r"(?<!\\)~", " ", text)
     text = text.replace("\t", " ").replace("\u00a0", " ")
     lines = []
