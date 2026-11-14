@@ -130,9 +130,46 @@ The following interfaces describe the intended processing stages.
 #### B. `src/hierarchy.py`
 
 - `Node`: Represents a node with a local identifier, optional parent identifier, kind, and content.
-- `construct_hierarchy(cleaned_tex)`: Intended to build one version's tree, including a document root with no parent.
+- `construct_hierarchy(cleaned_tex)`: Builds one version's tree, including a document root with no parent. Sentence boundaries combine `wtpsplit` SaT `sat-3l-sm` on ONNX CPU with guarded punctuation rules; original LaTeX is retained in sentence slices.
 - `rewrite_citations(nodes, key_map)`: Intended to replace citation keys with canonical keys while preserving node identifiers and edges.
 - `build_element_tables(arxiv_id, nodes_by_version)`: Intended to deduplicate cleaned content across versions and return shared `elements` rows and version-specific `hierarchy` rows. `ElementRow` and `HierarchyRow` define their schemas.
+
+Install `src/requirements.txt` in the Python environment (on Colab, run
+`%pip install -r src/requirements.txt`). The first nonempty prose passage loads
+`sat-3l-sm`, downloading its weights to the Hugging Face cache if needed;
+later passages reuse it in the same process. Inference runs locally on CPU and
+does not require an inference-service account or API key. If loading fails,
+check the dependencies, network access for the first download, and the cache;
+the original error is available as the exception cause. Windows symlink cache
+warnings need not prevent loading. The verified local environment used Python
+3.13.11, `wtpsplit==2.2.2`, `onnxruntime==1.31.1`, and cached model revision
+`137da054051ad9f1eac42025f758db4ac9f22535`; the revision is recorded for
+reference, not pinned by this code. Colab performance has not been benchmarked.
+
+For a small model smoke check, run this in Python from the repository root:
+
+```python
+from src.hierarchy import construct_hierarchy
+
+nodes = construct_hierarchy("We thank David P. Bunde for his help. The method works.")
+print([node.content for node in nodes if node.kind == "sentence"])
+```
+
+Unknown macros and their arguments are treated as opaque; prose
+inside supported formatting commands is visible to SaT. Sentence fragments
+split inside such commands preserve the original source slices, which may not
+individually be balanced LaTeX.
+
+Guarded rules add missed `. ? !` boundaries before uppercase/digit starts on
+the protected projection. Common abbreviations and contextual initials are
+shielded; no person names are hardcoded. These are English scientific-prose
+heuristics, with remaining ambiguity at initials/abbreviations, ellipses and
+sentences starting in lowercase. SaT still runs and its load errors propagate.
+Common proof/theorem/quote environments are transparent to the hierarchy;
+their labels remain prose, and document structure inside bare TeX groups is
+scanned. Unknown macro arguments remain opaque. Grouping braces may span
+sentence nodes. Cleanup defects must be corrected separately: sentence rules
+do not repair malformed math or rewrite content.
 
 #### C. `src/bibtex.py`
 
