@@ -15,4 +15,5 @@ dependencies:
       - pyarrow==26.0.0
       - tqdm==4.70.1
       - matplotlib==3.11.2
- 
+      - wtpsplit==2.2.2
+      - onnxruntime==1.31.1
