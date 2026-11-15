@@ -164,8 +164,15 @@ def _environment_end(text: str, start: int, name: str) -> int | None:
 def _sentence_model():
     """Load the CPU model once per process, only when prose is present."""
     try:
+        import onnxruntime as ort
         from wtpsplit import SaT
-        return SaT("sat-3l-sm", ort_providers=["CPUExecutionProvider"])
+        # Publication workers already run in parallel. ORT's default per-session
+        # thread pools otherwise compete for the same CPU cores in each worker.
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        return SaT("sat-3l-sm", ort_providers=["CPUExecutionProvider"],
+                   ort_kwargs={"sess_options": options})
     except Exception as exc:
         raise RuntimeError(
             "Could not load SaT sat-3l-sm on ONNX CPU; install the project "
