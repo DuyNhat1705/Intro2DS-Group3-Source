@@ -78,7 +78,8 @@ def _expected(data: dict, label: str, errors: list[str]) -> set[int]:
     return set(range(1, count + 1))
 
 
-def discover_publications(data_dir, target_ids=None, source_state_paths=None) -> list[dict]:
+def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
+                          existing_only=False, limit=None) -> list[dict]:
     """Tìm bài và hợp miền phiên bản từ metadata, trạng thái tải và thư mục.
 
     ``None`` hợp ID hợp lệ từ thư mục bài và trạng thái nguồn, kể cả bài chưa
@@ -88,23 +89,38 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
     tường minh thay thế mặc định; đường dẫn tương đối tính từ data_dir.
     Lỗi trạng thái toàn cục được gắn vào mọi job; khi không có job để chứa lỗi,
     hàm phát sinh ValueError. Không chọn ngầm một trạng thái đang xung đột.
+
+    ``existing_only`` chỉ chọn bài có thư mục trong kho. Khi có ID đích, kiểm
+    tra trực tiếp tên thư mục chuẩn và tên dùng dấu chấm, không liệt kê cả kho.
+    Chế độ này mặc định bỏ qua source_state; vẫn đọc nếu truyền đường dẫn cụ thể.
+    ``limit`` giới hạn số bài trước khi đọc metadata và liệt kê phiên bản.
     """
     root = Path(data_dir)
+    if limit is not None and (type(limit) is not int or limit <= 0):
+        raise ValueError("limit must be a positive integer or None")
+    ids = None if target_ids is None else sorted({_arxiv_id(v) for v in target_ids})
     directories = defaultdict(list)
     global_errors = []
     if root.exists() and not root.is_dir():
         raise ValueError(f"Data path is not a directory: {root}")
     if root.is_dir():
-        for directory in sorted(root.iterdir()):
+        if existing_only and ids is not None:
+            candidates = sorted({root / name for identity in ids for name in
+                                 (get_paper_dir(identity).name, identity.replace("/", "-"))})
+        else:
+            candidates = sorted(root.iterdir())
+        for directory in candidates:
+            try:
+                identity = _arxiv_id(directory.name)
+            except ValueError:
+                continue
             if directory.is_dir():
-                try:
-                    directories[_arxiv_id(directory.name)].append(directory)
-                except ValueError:
-                    pass
+                directories[identity].append(directory)
     elif target_ids is None:
         raise FileNotFoundError(f"Missing data directory: {root}")
 
-    ids = None if target_ids is None else sorted({_arxiv_id(v) for v in target_ids})
+    if existing_only and source_state_paths is None:
+        source_state_paths = []
     if source_state_paths is None:
         paths = ([root / "source_state.json"] if (root / "source_state.json").exists() else [])
         if (root / ".state").is_dir():
@@ -133,6 +149,10 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
 
     if ids is None:
         ids = sorted(set(directories) | set(states))
+    if existing_only:
+        ids = [identity for identity in ids if identity in directories]
+    if limit is not None:
+        ids = ids[:limit]
 
     jobs = []
     for identity in ids:
