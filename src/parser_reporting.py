@@ -120,7 +120,7 @@ class _Monitor:
     def __init__(self, path, run_id, worker, interval):
         self.path, self.run_id, self.worker = Path(path), run_id, worker
         self.interval = max(0.05, interval)
-        self.phase = "khoi_tao"
+        self.phase = "initializing"
         self.stop = threading.Event()
         self.peak, self.total, self.count = 0, 0, 0
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -277,7 +277,7 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
             row[f"mean_{column}"] = float(pd.to_numeric(frame[column], errors="coerce").mean()) if len(frame) else None
         range_rows.append(row)
     _export_csv(reports / "range_stats.csv", range_rows, ["range", "target_ids", "papers_success", "success_rate"])
-    categories = Counter(row.get("category") or "khong_ro" for row in rows
+    categories = Counter(row.get("category") or "unknown" for row in rows
                          if row["status"] not in {"pending", "missing_input"})
     _export_csv(reports / "category_counts.csv", [{"category": k, "paper_count": v} for k, v in sorted(categories.items())],
                 ["category", "paper_count"])
@@ -456,7 +456,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
             _disk_snapshot(root, logs, run_id, worker)
             # Kiểm tra cache trước để số việc còn lại lúc bắt đầu có ý nghĩa.
             prepared = []
-            monitor.phase = "kiem_tra_checkpoint"
+            monitor.phase = "checking_checkpoints"
             for job in jobs:
                 partition = tables / "papers" / _paper_name(job["arxiv_id"])
                 stamp = state / f"{_paper_name(job['arxiv_id'])}.json"
@@ -491,7 +491,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                     else:
                         pending_items.append(item)
                 deadline = started + max_run_hours * 3600 if max_run_hours is not None else None
-                monitor.phase = "parse_song_song"
+                monitor.phase = "parallel_parsing"
                 with closing(iter_parallel_results([item[0] for item in pending_items],
                         num_workers=num_workers, max_workers=max_workers, adaptive_ram=adaptive_ram,
                         reserve_ram_gb=reserve_ram_gb, ram_per_worker_gb=ram_per_worker_gb,
@@ -502,7 +502,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                         del result
                 if len(records) < len(jobs) and deadline is not None and time.perf_counter() >= deadline:
                     stop_reason = "time_limit"
-            monitor.phase = "xuat_bang"
+            monitor.phase = "exporting_tables"
             combine_completed()
     except KeyboardInterrupt:
         stop_reason = "interrupted"
@@ -600,7 +600,7 @@ def combine_worker_reports(output_dir):
                              ("versions_expected", "versions_ok", "versions_empty", "versions_partial", "versions_error",
                               "elements_before", "elements_after", "bibtex_before", "bibtex_after")}})
     _export_csv(target / "range_stats.csv", range_rows, ["range", "target_ids", "papers_success", "success_rate"])
-    categories = paper.loc[~paper.status.isin(["pending", "missing_input"]), "category"].fillna("khong_ro").value_counts()
+    categories = paper.loc[~paper.status.isin(["pending", "missing_input"]), "category"].fillna("unknown").value_counts()
     _export_csv(target / "category_counts.csv", [{"category": k, "paper_count": int(v)} for k, v in categories.items()],
                 ["category", "paper_count"])
     summary = {"exported_at": utc_now(), "workers": [path.parent.name for path in sources],
