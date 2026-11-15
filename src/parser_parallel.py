@@ -204,13 +204,13 @@ def _dispose(workers, *, gentle=False):
 
 def _positive_int(name, value):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} phải là số nguyên dương")
+        raise ValueError(f"{name} must be a positive integer")
     return value
 
 
 def _number(name, value, minimum=0):
     if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < minimum:
-        raise ValueError(f"{name} phải là số hữu hạn >= {minimum}")
+        raise ValueError(f"{name} must be a finite number >= {minimum}")
     return float(value)
 
 
@@ -237,16 +237,16 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
         _positive_int("max_workers", max_workers)
     floor = _number("ram_per_worker_gb", ram_per_worker_gb)
     if floor == 0:
-        raise ValueError("ram_per_worker_gb phải > 0")
+        raise ValueError("ram_per_worker_gb must be > 0")
     reserve = None if reserve_ram_gb is None else _number("reserve_ram_gb", reserve_ram_gb)
     timeout = _number("ram_wait_timeout_sec", ram_wait_timeout_sec)
     threshold = _number("fuzzy_threshold", fuzzy_threshold)
     if threshold > 1:
-        raise ValueError("fuzzy_threshold phải <= 1")
+        raise ValueError("fuzzy_threshold must be <= 1")
     if not isinstance(adaptive_ram, bool) or not isinstance(enrich, bool):
-        raise ValueError("adaptive_ram và enrich phải là bool")
+        raise ValueError("adaptive_ram and enrich must be booleans")
     if on_event is not None and not callable(on_event):
-        raise ValueError("on_event phải gọi được")
+        raise ValueError("on_event must be callable")
     if deadline is not None:
         deadline = _number("deadline", deadline, minimum=-float("inf"))
 
@@ -283,7 +283,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
     def failure(worker, index, job, message, elapsed):
         nonlocal worker_errors
         worker_errors += 1
-        message = "Lỗi worker: " + message
+        message = "Worker error: " + message
         emit("worker_error", index=index, arxiv_id=job.get("arxiv_id") if job else None,
              pid=worker.process.pid if worker else None, message=message)
         return _error_result(job, message, elapsed) if job is not None else None
@@ -383,7 +383,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                     index, job = worker.index, worker.job
                     try:
                         if worker.connection not in ready:
-                            raise ChildProcessError(f"Tiến trình kết thúc, exitcode={worker.process.exitcode}")
+                            raise ChildProcessError(f"Process exited, exitcode={worker.process.exitcode}")
                         kind, result, rss = worker.connection.recv()
                         estimate = max(estimate, rss * _HEADROOM)
                         if kind != "result":
@@ -412,7 +412,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                 last_wait_event = now
             if duration >= timeout:
                 reason = "ram_timeout"
-                raise MemoryError("Không đủ RAM để chạy worker an toàn trong thời gian chờ")
+                raise MemoryError("Insufficient RAM to start a worker safely within the wait timeout")
             time.sleep(min(_POLL_SEC, timeout - duration))
     except GeneratorExit:
         reason = "closed"

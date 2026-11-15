@@ -1025,7 +1025,7 @@ def unify_publication(
     tương thích, sau đó so khớp fuzzy có blocking để giới hạn số cặp cần xét.
     """
     if not 0.0 <= fuzzy_threshold <= 1.0:
-        raise ValueError("fuzzy_threshold phải nằm trong khoảng [0, 1].")
+        raise ValueError("fuzzy_threshold must be in [0, 1].")
     versions = sorted(per_version)
     indexed = [
         (version, entry)
@@ -1288,7 +1288,7 @@ def _find_publications(root: Path) -> Dict[str, Dict[int, Path]]:
                 version_number = int(match.group(1))
                 if version_number in versions:
                     raise ValueError(
-                        f"Có nhiều thư mục cho version {version_number} trong "
+                        f"Có nhiều directory cho version {version_number} trong "
                         f"{publication_dir}: {versions[version_number].name}, "
                         f"{version_dir.name}"
                     )
@@ -1365,11 +1365,11 @@ def run_corpus(
     if workers < 1:
         raise ValueError("workers phải lớn hơn hoặc bằng 1.")
     if not 0.0 <= fuzzy_threshold <= 1.0:
-        raise ValueError("fuzzy_threshold phải nằm trong khoảng [0, 1].")
+        raise ValueError("fuzzy_threshold must be in [0, 1].")
     root = Path(root)
     out_dir = Path(out_dir)
     if not root.is_dir():
-        raise FileNotFoundError(f"Không tìm thấy thư mục corpus: {root}")
+        raise FileNotFoundError(f"Không tìm thấy directory corpus: {root}")
     out_dir.mkdir(parents=True, exist_ok=True)
     publications = _find_publications(root)
     jobs = [(arxiv_id, versions) for arxiv_id, versions in sorted(publications.items())]

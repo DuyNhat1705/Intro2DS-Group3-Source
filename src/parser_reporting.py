@@ -249,7 +249,7 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
          "review_required", "bibliography_status", "versions_missing_bibliography", "message", "reused", "current_run_sec"])
     versions = [row for record in records for row in record["version_status"]]
     versions.extend({"arxiv_id": job["arxiv_id"], "version": version, "status": "pending",
-                     "message": "Chưa xử lý trong phiên này", "missing_count": 0, "warning_count": 0}
+                     "message": "Not processed in this run", "missing_count": 0, "warning_count": 0}
                     for job in pending for version in job["version_dirs"])
     _export_csv(reports / "per_version.csv", versions,
                 ["arxiv_id", "version", "status", "message", "missing_count", "warning_count", "blocking_warning_count", "notice_count", "review_required",
@@ -321,23 +321,23 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
         "bibliography": {"papers_missing_sources": int(paper.bibliography_status.eq("missing_sources").sum()),
                          "versions_missing_sources": total("versions_missing_bibliography")},
         "current_run_average_sec": run["duration_sec"] / run["papers_processed"] if run["papers_processed"] else None,
-        "measurement_note": "RSS là mẫu tiến trình Python và tiến trình con; đĩa là ảnh chụp thư mục output. Thời gian parse lưu từ checkpoint tách khỏi thời gian phiên hiện tại."}
+        "measurement_note": "RSS samples cover the Python process and its children; disk usage is a snapshot of the output directory. Checkpoint parsing times are reported separately from current-run times."}
     _atomic_json(reports / "summary_stats.json", summary)
     (reports / "README.md").write_text(
-        "# Số liệu Milestone 2\n\n"
-        "Phạm vi của báo cáo là đúng danh sách ID cấu hình, kể cả ID thiếu dữ liệu và bài chưa chạy (pending).\n\n"
-        "- per_paper.csv: trạng thái bài, số phiên bản, số element/reference trước và sau khử trùng, dung lượng nguồn, thời gian, cảnh báo.\n"
-        "- per_version.csv: trạng thái từng phiên bản; empty khác missing_dir và lỗi parse.\n"
-        "- issues.csv: phiên bản còn thiếu dữ liệu/lỗi hoặc chưa xử lý; warnings.csv: chẩn đoán đầy đủ, phân biệt notice với cảnh báo làm thiếu kết quả.\n"
-        "- ok có thể có notice/review_required: pipeline đã hoàn tất nhưng metadata/schema cần xem xét. Notice không làm mất quyền dùng checkpoint.\n"
-        "- Thiếu .bib/.bbl không làm paper_success=False nếu nội dung chính đã xử lý được. bibliography_status=missing_sources ghi rõ phần bỏ qua; vẫn trích các reference có nguồn.\n"
-        "- summary_stats.json: phạm vi, cấu hình, tóm tắt và thông tin máy của phiên hiện tại.\n"
-        "- range_stats.csv, ranges.csv: số liệu và định nghĩa các range. category_counts.csv dùng danh mục đầu tiên.\n"
-        "- runs.csv: lịch sử phiên của worker; monitor.csv: RSS trung bình/tối đa mỗi phút; disk.csv: ảnh chụp output và thời gian quét.\n"
-        "- Ba bảng Parquet tổng nằm trong tables/<worker>/; phân mảnh theo bài nằm trong papers/. Không cộng dung lượng bảng tổng và phân mảnh như dữ liệu khoa học khác nhau.\n"
-        "- partial không tính thành công đầy đủ; bảng có thể chứa phần dữ liệu parse được, cần đọc per_version.csv trước khi sử dụng.\n"
-        "- reused=True: dùng checkpoint hợp lệ, elapsed_sec là lần parse đã lưu, current_run_sec là chi phí phiên hiện tại.\n"
-        "- Log runs/timings/events và mẫu monitor/disk gốc nằm trong run_logs/<worker>/.\n",
+        "# Milestone 2 Statistics\n\n"
+        "The report covers exactly the configured IDs, including IDs with missing data and papers not yet processed (pending).\n\n"
+        "- per_paper.csv: paper status, version counts, element/reference counts before and after deduplication, source size, timings, and warnings.\n"
+        "- per_version.csv: status of each version; empty is distinct from missing_dir and parsing errors.\n"
+        "- issues.csv: versions with missing data, errors, or pending processing; warnings.csv: all diagnostics, distinguishing notices from warnings that affect result completeness.\n"
+        "- ok may include notices/review_required: the pipeline completed, but metadata/schema may need review. Notices do not invalidate checkpoints.\n"
+        "- Missing .bib/.bbl files do not set paper_success=False if the main content was processed. bibliography_status=missing_sources identifies skipped sources; references with available sources are still extracted.\n"
+        "- summary_stats.json: scope, configuration, summary, and machine information for the current run.\n"
+        "- range_stats.csv, ranges.csv: statistics and definitions for ID ranges. category_counts.csv uses the first category.\n"
+        "- runs.csv: worker run history; monitor.csv: mean/maximum RSS per minute; disk.csv: output snapshots and scan durations.\n"
+        "- The three combined Parquet tables are in tables/<worker>/; per-paper partitions are in papers/. Combined tables and partitions contain overlapping data and should not be counted as separate scientific datasets.\n"
+        "- partial does not count as full success; tables may contain partially parsed data. Check per_version.csv before use.\n"
+        "- reused=True: a valid checkpoint was reused; elapsed_sec is the saved parsing time, and current_run_sec is the time spent in the current run.\n"
+        "- Raw runs/timings/events logs and monitor/disk samples are in run_logs/<worker>/.\n",
         encoding="utf-8")
     return summary
 
@@ -348,17 +348,17 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                ram_per_worker_gb=1.5, ram_wait_timeout_sec=60):
     """Trả thống kê và đường dẫn; không giữ các bảng element toàn corpus trong RAM."""
     if not re.fullmatch(r"[A-Za-z0-9_+-]+", worker):
-        raise ValueError("Tên worker chỉ gồm chữ, số, _, + và -")
+        raise ValueError("Worker name may contain only letters, digits, _, +, and -")
     if not 0 <= fuzzy_threshold <= 1 or disk_every < 1 or monitor_interval <= 0:
-        raise ValueError("Cấu hình ngưỡng hoặc chu kỳ đo không hợp lệ")
+        raise ValueError("Invalid threshold or measurement interval configuration")
     if max_run_hours is not None and max_run_hours <= 0:
-        raise ValueError("Giới hạn thời gian phải dương")
+        raise ValueError("Time limit must be positive")
     if num_workers != "auto" and (type(num_workers) is not int or num_workers < 1):
-        raise ValueError("num_workers phải là 'auto' hoặc số nguyên dương")
+        raise ValueError("num_workers must be 'auto' or a positive integer")
     if max_workers is not None and (type(max_workers) is not int or max_workers < 1):
-        raise ValueError("max_workers phải là số nguyên dương hoặc None")
+        raise ValueError("max_workers must be a positive integer or None")
     if type(adaptive_ram) is not bool:
-        raise ValueError("adaptive_ram phải là boolean")
+        raise ValueError("adaptive_ram must be a boolean")
     for name, value, allow_zero in (("reserve_ram_gb", reserve_ram_gb, True),
                                     ("ram_per_worker_gb", ram_per_worker_gb, False),
                                     ("ram_wait_timeout_sec", ram_wait_timeout_sec, False)):
@@ -366,10 +366,10 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
             continue
         if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                 not math.isfinite(value) or value < 0 or (not allow_zero and value == 0)):
-            raise ValueError(f"{name} không hợp lệ")
+            raise ValueError(f"Invalid {name}")
     jobs = list(jobs)
     if len({job["arxiv_id"] for job in jobs}) != len(jobs):
-        raise ValueError("Danh sách bài có ID trùng")
+        raise ValueError("Paper list contains duplicate IDs")
     root = Path(output_dir).resolve()
     tables, reports, logs, state = [root / name / worker for name in ("tables", "report_exports", "run_logs", ".state")]
     for directory in (tables, reports, logs, state):
@@ -402,7 +402,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
 
     def parallel_event(event):
         _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id, "worker": worker, **event})
-        logger.info("Điều phối song song: %s", json.dumps(event, ensure_ascii=False))
+        logger.info("Parallel scheduling: %s", json.dumps(event, ensure_ascii=False))
         run["parallel"] = {**run.get("parallel", {}), **event}
 
     def save_result(prepared_item, result=None, paper_started=None):
@@ -437,7 +437,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         record.update(range=job.get("range", "local"), reused=reused, current_run_sec=duration)
         records.append(record)
         completed_ids.add(job["arxiv_id"])
-        logger.info("%s: %s; tái sử dụng=%s; %s", job["arxiv_id"], record["stats"]["status"], reused,
+        logger.info("%s: %s; reused=%s; %s", job["arxiv_id"], record["stats"]["status"], reused,
                     record["stats"].get("message", ""))
         _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
             "arxiv_id": job["arxiv_id"], "status": record["stats"]["status"], "reused": reused,
@@ -465,7 +465,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                 except OSError as exc:
                     # Vẫn để parser ghi lỗi riêng của bài; không dùng checkpoint.
                     signature = uuid.uuid4().hex
-                    logger.warning("Không băm được nguồn %s: %s", job["arxiv_id"], exc)
+                    logger.warning("Could not hash sources for %s: %s", job["arxiv_id"], exc)
                 record = _checkpoint(stamp, partition, signature) if resume else None
                 prepared.append((job, partition, stamp, signature, record))
             run["remaining_at_start"] = sum(record is None for _, _, _, _, record in prepared)
@@ -509,7 +509,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         combine_completed()
     except Exception as exc:
         stop_reason = "error"
-        logger.exception("Phiên dừng do lỗi")
+        logger.exception("Run stopped due to an error")
         _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
                       "status": "error", "message": f"{type(exc).__name__}: {exc}"})
         combine_completed()
@@ -538,7 +538,7 @@ def combine_worker_reports(output_dir):
     base = Path(output_dir) / "report_exports"
     sources = sorted(path for path in base.glob("*/summary_stats.json") if path.parent.name != "_combined")
     if not sources:
-        raise FileNotFoundError("Chưa có báo cáo worker để ghép")
+        raise FileNotFoundError("No worker reports available to combine")
     configurations = set()
     papers, versions, runs, monitors, disks, definitions = [], [], [], [], [], []
     for path in sources:
@@ -558,7 +558,7 @@ def combine_worker_reports(output_dir):
             if candidate.exists():
                 collection.append(pd.read_csv(candidate))
     if len(configurations) > 1:
-        raise ValueError("Các worker dùng mã hoặc cấu hình parse khác nhau; chạy lại cùng cấu hình trước khi ghép")
+        raise ValueError("Workers use different code or parsing configurations; rerun with matching configurations before combining")
     paper = pd.concat(papers, ignore_index=True).sort_values(["exported_at", "source_worker"])
     duplicate_count = int(paper.duplicated("arxiv_id", keep="last").sum())
     paper = paper.drop_duplicates("arxiv_id", keep="last").sort_values("arxiv_id")
@@ -588,7 +588,7 @@ def combine_worker_reports(output_dir):
         if frames:
             merged = pd.concat(frames, ignore_index=True)
             if name == "ranges.csv" and merged.drop_duplicates().duplicated("range").any():
-                raise ValueError("Định nghĩa range giữa các worker không thống nhất")
+                raise ValueError("Range definitions differ between workers")
             merged.drop_duplicates(keys).to_csv(target / name, index=False)
     totals = lambda name: int(pd.to_numeric(paper[name], errors="coerce").sum())
     range_rows = []
@@ -612,10 +612,10 @@ def combine_worker_reports(output_dir):
                                "notices": totals("notice_count"), "papers_for_review": int(paper.review_required.fillna(False).sum())},
                **{name: totals(name) for name in ("versions_expected", "versions_ok", "versions_empty", "versions_partial",
                     "versions_error", "elements_before", "elements_after", "bibtex_before", "bibtex_after", "input_bytes")},
-               "note": "ID trùng lấy bản xuất mới nhất. Chỉ ghép thống kê; không ghép bảng Parquet của các worker."}
+               "note": "For duplicate IDs, the latest export is selected. Only statistics are combined; worker Parquet tables are not merged."}
     for name in ("elements", "bibtex"):
         before, after = summary[f"{name}_before"], summary[f"{name}_after"]
         summary[f"{name}_reduction_ratio"] = (before - after) / before if before else 0.0
     _atomic_json(target / "summary_stats.json", summary)
-    (target / "README.md").write_text(summary["note"] + "\nKhông cộng trực tiếp disk.csv giữa các phiên: mỗi dòng là một ảnh chụp.\n", encoding="utf-8")
+    (target / "README.md").write_text(summary["note"] + "\nDo not sum disk.csv across runs: each row is a snapshot.\n", encoding="utf-8")
     return {"summary": summary, "reports_dir": str(target)}

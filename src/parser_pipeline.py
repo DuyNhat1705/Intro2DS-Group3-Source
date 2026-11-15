@@ -32,7 +32,7 @@ __all__ = ["discover_publications", "parse_publication"]
 def _arxiv_id(value: str) -> str:
     """Đổi tên thư mục do get_paper_dir tạo thành ID chuẩn, không nhận hậu tố vN."""
     if not isinstance(value, str):
-        raise ValueError(f"ID arXiv không hợp lệ: {value!r}")
+        raise ValueError(f"Invalid arXiv ID: {value!r}")
     modern = re.fullmatch(r"(\d{2}(?:0[1-9]|1[0-2]))[.-](\d{4,5})", value)
     if modern:
         return ".".join(modern.groups())
@@ -41,13 +41,13 @@ def _arxiv_id(value: str) -> str:
         archive, number = old.groups()
         archive = re.sub(r"-([A-Z]{2})$", r".\1", archive)
         return f"{archive}/{number}"
-    raise ValueError(f"ID arXiv không hợp lệ: {value!r}")
+    raise ValueError(f"Invalid arXiv ID: {value!r}")
 
 
 def _version(value: str) -> int:
     """Đọc số phiên bản dương ở dạng N hoặc vN."""
     if not isinstance(value, str) or not re.fullmatch(r"v?[1-9]\d*", value):
-        raise ValueError(f"Tên phiên bản không hợp lệ: {value!r}")
+        raise ValueError(f"Invalid version name: {value!r}")
     return int(value.removeprefix("v"))
 
 
@@ -57,13 +57,13 @@ def _read_json(path: Path) -> dict:
         result = {}
         for key, value in items:
             if key in result:
-                raise ValueError(f"Khóa JSON bị trùng: {key}")
+                raise ValueError(f"Duplicate JSON key: {key}")
             result[key] = value
         return result
 
     data = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=pairs)
     if not isinstance(data, dict):
-        raise ValueError("Nội dung JSON phải là đối tượng")
+        raise ValueError("JSON content must be an object")
     return data
 
 
@@ -73,7 +73,7 @@ def _expected(data: dict, label: str, errors: list[str]) -> set[int]:
         return set()
     count = data["num_versions"]
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        errors.append(f"{label}: num_versions phải là số nguyên dương")
+        errors.append(f"{label}: num_versions must be a positive integer")
         return set()
     return set(range(1, count + 1))
 
@@ -93,7 +93,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
     directories = defaultdict(list)
     global_errors = []
     if root.exists() and not root.is_dir():
-        raise ValueError(f"Đường dẫn dữ liệu không phải thư mục: {root}")
+        raise ValueError(f"Data path is not a directory: {root}")
     if root.is_dir():
         for directory in sorted(root.iterdir()):
             if directory.is_dir():
@@ -102,7 +102,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
                 except ValueError:
                     pass
     elif target_ids is None:
-        raise FileNotFoundError(f"Thiếu thư mục dữ liệu: {root}")
+        raise FileNotFoundError(f"Missing data directory: {root}")
 
     ids = None if target_ids is None else sorted({_arxiv_id(v) for v in target_ids})
     if source_state_paths is None:
@@ -120,7 +120,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
             document = _read_json(path)
             papers = document.get("papers")
             if not isinstance(papers, dict):
-                raise ValueError("Trường papers phải là đối tượng")
+                raise ValueError("The papers field must be an object")
             for name, entry in sorted(papers.items()):
                 try:
                     identity = _arxiv_id(name)
@@ -129,7 +129,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
                     continue
                 states[identity].append((path, entry))
         except (OSError, ValueError) as exc:
-            global_errors.append(f"Không đọc được trạng thái {path}: {exc}")
+            global_errors.append(f"Could not read state {path}: {exc}")
 
     if ids is None:
         ids = sorted(set(directories) | set(states))
@@ -141,7 +141,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
                             key=lambda p: (p.name != get_paper_dir(identity).name, p.name))
         paper_dir = candidates[0] if candidates else None
         if len(candidates) > 1:
-            errors.append(f"Trùng thư mục bài {identity}: " + ", ".join(map(str, candidates)))
+            errors.append(f"Duplicate paper directories for {identity}: " + ", ".join(map(str, candidates)))
         metadata = {}
         versions = set()
         counts = set()
@@ -157,12 +157,12 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
                     if type(data.get("num_versions")) is int and data["num_versions"] > 0:
                         counts.add(data["num_versions"])
                     if "arxiv_id" in data and _arxiv_id(data["arxiv_id"]) != identity:
-                        errors.append(f"{meta_path}: arxiv_id xung đột với tên thư mục")
+                        errors.append(f"{meta_path}: arxiv_id conflicts with the directory name")
                     if "categories" in data and (not isinstance(data["categories"], list)
                                                   or any(not isinstance(c, str) for c in data["categories"])):
-                        errors.append(f"{meta_path}: categories phải là danh sách chuỗi")
+                        errors.append(f"{meta_path}: categories must be a list of strings")
                 except (OSError, ValueError) as exc:
-                    errors.append(f"Metadata hỏng {meta_path}: {exc}")
+                    errors.append(f"Invalid metadata {meta_path}: {exc}")
             for folder in sorted(directory.iterdir()):
                 if not folder.is_dir():
                     continue
@@ -176,14 +176,14 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
         status_sets = defaultdict(set)
         for path, entry in states.get(identity, []):
             if not isinstance(entry, dict):
-                errors.append(f"{path}: trạng thái bài {identity} phải là đối tượng")
+                errors.append(f"{path}: state for paper {identity} must be an object")
                 continue
             versions.update(_expected(entry, str(path), errors))
             if type(entry.get("num_versions")) is int and entry["num_versions"] > 0:
                 counts.add(entry["num_versions"])
             records = entry.get("versions", {})
             if not isinstance(records, dict):
-                errors.append(f"{path}: versions của {identity} phải là đối tượng")
+                errors.append(f"{path}: versions for {identity} must be an object")
                 continue
             seen = set()
             for key, record in sorted(records.items()):
@@ -194,28 +194,28 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None) ->
                     continue
                 versions.add(number)
                 if number in seen:
-                    errors.append(f"{path}: trùng phiên bản v{number} trong trạng thái")
+                    errors.append(f"{path}: duplicate version v{number} in state")
                 seen.add(number)
                 status = record.get("status") if isinstance(record, dict) else None
                 if not isinstance(status, str) or status not in {"done", "no_tex", "not_found", "error", "pending", "failed", "downloading"}:
-                    errors.append(f"{path}: trạng thái v{number} không hợp lệ: {status!r}")
+                    errors.append(f"{path}: invalid state for v{number}: {status!r}")
                     status_sets[number].add("invalid")
                 else:
                     status_sets[number].add(status)
         if len(counts) > 1:
-            errors.append(f"Xung đột num_versions của {identity}: {sorted(counts)}")
+            errors.append(f"Conflicting num_versions for {identity}: {sorted(counts)}")
         if counts and versions and max(versions) > max(counts):
-            errors.append(f"Xung đột phiên bản v{max(versions)} vượt num_versions={max(counts)} của {identity}")
+            errors.append(f"Version v{max(versions)} exceeds num_versions={max(counts)} for {identity}")
         version_dirs = {}
         for number in sorted(versions or {1}):
             choices = sorted(folders.get(number, []), key=lambda p: (p.name != f"v{number}", str(p)))
             version_dirs[number] = choices[0] if choices else None
             if len(choices) > 1:
-                errors.append(f"Trùng thư mục phiên bản v{number}: " + ", ".join(map(str, choices)))
+                errors.append(f"Duplicate version directories for v{number}: " + ", ".join(map(str, choices)))
         statuses = {}
         for number, values in sorted(status_sets.items()):
             if len(values) > 1:
-                errors.append(f"Xung đột trạng thái v{number}: {sorted(values)}")
+                errors.append(f"Conflicting state for v{number}: {sorted(values)}")
                 statuses[number] = "conflict"
             else:
                 statuses[number] = next(iter(values))
@@ -259,7 +259,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                                        category=category, affects_status=affects_status,
                                        severity="warning" if affects_status else "notice",
                                        requires_review=requires_review,
-                                       message=f"Cảnh báo: {message}"))
+                                       message=f"Warning: {message}"))
         affected = [rows[version]] if version in rows else [r for r in rows.values() if r["status"] in {"ok", "partial"}]
         for row in affected:
             row["warning_count"] += 1
@@ -280,7 +280,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             try:
                 value = operation()
             except Exception as exc:
-                error = f"Lỗi tại {stage}: {type(exc).__name__}: {exc}"
+                error = f"Error in {stage}: {type(exc).__name__}: {exc}"
             finally:
                 duration = time.perf_counter() - tick
                 end = datetime.now(timezone.utc).isoformat()
@@ -300,7 +300,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         incomplete = any(w["affects_status"] for w in new_warnings)
         timing = dict(arxiv_id=identity, stage=stage, started_at=begin, ended_at=end,
                       duration_sec=duration, status="error" if error else ("partial" if incomplete else "ok"),
-                      message=error or ("Có cảnh báo khi xử lý" if new_warnings else "Đã xử lý"))
+                      message=error or ("Processed with warnings" if new_warnings else "Processed"))
         if version is not None:
             timing["version"] = version
         result["timings"].append(timing)
@@ -326,13 +326,13 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             exists = directory is not None and Path(directory).is_dir()
             if not exists:
                 if status == "not_found":
-                    row.update(status="not_found", message="Trạng thái tải xác nhận không tìm thấy phiên bản")
+                    row.update(status="not_found", message="Download state confirms the version was not found")
                     return False
                 if status == "no_tex":
-                    row.update(status="empty", message="Trạng thái tải xác nhận không có nguồn TeX")
+                    row.update(status="empty", message="Download state confirms no TeX source is available")
                     return False
                 row.update(status="missing_dir", missing_count=1, missing=[f"v{number}"])
-                raise FileNotFoundError(f"Thiếu thư mục phiên bản v{number}")
+                raise FileNotFoundError(f"Missing version directory v{number}")
             for path in sorted(Path(directory).rglob("*")):
                 if path.is_file() and path.suffix.lower() in {".tex", ".bib"}:
                     resolved = path.resolve()
@@ -340,9 +340,9 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                         input_bytes += path.stat().st_size
                         counted.add(resolved)
             if status == "not_found":
-                row.update(status="not_found", message="Trạng thái tải xác nhận không tìm thấy phiên bản")
+                row.update(status="not_found", message="Download state confirms the version was not found")
                 if any(p.is_file() and p.suffix.lower() == ".tex" for p in Path(directory).rglob("*")):
-                    row["errors"].append("Xung đột: phiên bản not_found vẫn chứa nguồn TeX")
+                    row["errors"].append("Conflict: a not_found version still contains TeX sources")
                 return False
             return True
 
@@ -360,9 +360,9 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         if tex is None:
             if row["source_status"] in {"done", "conflict", "invalid", "error", "failed", "pending", "downloading"}:
                 row["status"] = "error"
-                row["errors"].append("Không có nguồn TeX nhưng trạng thái tải chưa xác nhận bản rỗng")
+                row["errors"].append("No TeX source found, but download state does not confirm an empty version")
             else:
-                row.update(status="empty", message="Thư mục phiên bản không có nguồn TeX")
+                row.update(status="empty", message="Version directory contains no TeX sources")
             result["timings"][-1].update(status=row["status"],
                                          message=row["message"] or "; ".join(row["errors"]))
             continue
@@ -374,19 +374,19 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         row["required_missing_count"] = len(required_missing)
         row["bibliography_status"] = "missing_sources" if optional_missing else "ok"
         if required_missing:
-            warning("gather", "Thiếu tệp nội dung: " + ", ".join(required_missing), number)
+            warning("gather", "Missing content files: " + ", ".join(required_missing), number)
         if optional_missing:
-            warning("gather", "Bỏ qua bibliography không có nguồn: " + ", ".join(optional_missing), number,
+            warning("gather", "Skipped bibliography with missing sources: " + ", ".join(optional_missing), number,
                     affects_status=False, requires_review=True)
         for note in tex.notes:
             intentional = note.startswith(("skipped by \\includeonly:", "skipped system font mapping:"))
             decoded = note.startswith("encoding fallback (latin-1):")
             missing_bibliography = note.startswith("bibliography not found:") or any(
                 note.startswith(f"include not found: {name}") for name in optional_missing)
-            warning("gather", f"Ghi chú khi gom nguồn: {note}", number,
+            warning("gather", f"Source gathering note: {note}", number,
                     affects_status=not (intentional or decoded or missing_bibliography), requires_review=not intentional)
         if row["source_status"] and row["source_status"] != "done":
-            warning("input", f"Nguồn TeX hiện có xung đột trạng thái tải {row['source_status']}", number)
+            warning("input", f"Existing TeX sources conflict with download state {row['source_status']}", number)
         clean_ok, cleaned = phase("cleanup", lambda: cleanup_latex(tex.source), number)
         if clean_ok:
             tree_ok, nodes = phase("construct_hierarchy", lambda: construct_hierarchy(cleaned), number)
@@ -413,7 +413,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             if item.conflicts:
                 ambiguous = any(conflict["field"] == "ambiguous_citation_key" for conflict in item.conflicts)
                 for v in item.versions_present:
-                    warning("unify_publication", f"{'Khóa mơ hồ' if ambiguous else 'Đã chọn metadata theo chính sách hợp nhất'}: {item.citation_key}", v,
+                    warning("unify_publication", f"{'Ambiguous citation key' if ambiguous else 'Metadata selected according to the merge policy'}: {item.citation_key}", v,
                             affects_status=ambiguous, requires_review=True)
         return bibliography
 
@@ -432,7 +432,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         messages = ([row["message"]] if row["message"] else []) + row["errors"]
         messages.extend(w["message"] for w in result["warnings"] if w["affects_status"] and w["version"] in {None, number})
         row["message"] = "; ".join(messages) or (
-            f"Đã xử lý phiên bản; {row['notice_count']} ghi chú (xem warnings.csv)" if row["notice_count"] else "Đã xử lý phiên bản")
+            f"Version processed; {row['notice_count']} notices (see warnings.csv)" if row["notice_count"] else "Version processed")
         result["version_status"].append(row)
     counts = Counter(r["status"] for r in rows.values())
     valid = counts["ok"] + counts["empty"]
@@ -469,6 +469,6 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         versions_missing_bibliography=sum(r["bibliography_status"] == "missing_sources" for r in rows.values()),
         blocking_warning_count=blocking_count, notice_count=len(result["warnings"]) - blocking_count,
         review_required=bool(review_count), review_count=review_count,
-        message="; ".join(messages) or ("Mọi phiên bản đều rỗng" if status == "empty" else
-            ("Đã xử lý đầy đủ; có chẩn đoán cần xem trong warnings.csv" if review_count else "Đã xử lý đầy đủ")))
+        message="; ".join(messages) or ("All versions are empty" if status == "empty" else
+            ("Processing complete; review diagnostics in warnings.csv" if review_count else "Processing complete")))
     return result
