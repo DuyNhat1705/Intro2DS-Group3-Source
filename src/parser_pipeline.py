@@ -116,20 +116,22 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                 if directory.is_dir():
                     directories[identity].append(directory)
         else:
-            # scandir lấy loại mục từ readdir, tránh một lần stat cho mỗi mục
-            # (rất chậm trên ổ mạng như Google Drive). Có ID đích thì bỏ qua
-            # ngay các thư mục ngoài phạm vi trước khi kiểm tra loại mục.
+            # Có ID đích thì bỏ qua ngay các tên ngoài phạm vi, không stat chúng.
+            # Mục còn lại được stat thật: Google Drive có thể liệt kê mục không mở
+            # được (thư mục chưa đồng bộ, shortcut tới dữ liệu không có quyền);
+            # is_dir() trả False cho các mục đó nên chúng bị bỏ qua.
             wanted = None if ids is None else set(ids)
             with os.scandir(root) as entries:
-                for entry in sorted(entries, key=lambda e: e.name):
-                    try:
-                        identity = _arxiv_id(entry.name)
-                    except ValueError:
-                        continue
-                    if wanted is not None and identity not in wanted:
-                        continue
-                    if entry.is_dir():
-                        directories[identity].append(root / entry.name)
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                try:
+                    identity = _arxiv_id(name)
+                except ValueError:
+                    continue
+                if wanted is not None and identity not in wanted:
+                    continue
+                if (root / name).is_dir():
+                    directories[identity].append(root / name)
     elif target_ids is None:
         raise FileNotFoundError(f"Missing data directory: {root}")
 
@@ -171,8 +173,18 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     jobs = []
     for identity in ids:
         errors = list(global_errors)
-        candidates = sorted(directories.get(identity, []),
-                            key=lambda p: (p.name != get_paper_dir(identity).name, p.name))
+        listings = {}
+        for directory in directories.get(identity, []):
+            try:
+                with os.scandir(directory) as entries:
+                    listings[directory] = sorted(entry.name for entry in entries)
+            except OSError:
+                # Thư mục biến mất hoặc không đọc được sau khi liệt kê: coi như không có.
+                continue
+        if not listings and target_ids is None and identity not in states:
+            # Tìm theo thư mục mà không còn thư mục nào đọc được: không phải một bài.
+            continue
+        candidates = sorted(listings, key=lambda p: (p.name != get_paper_dir(identity).name, p.name))
         paper_dir = candidates[0] if candidates else None
         if len(candidates) > 1:
             errors.append(f"Duplicate paper directories for {identity}: " + ", ".join(map(str, candidates)))
@@ -197,16 +209,16 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                         errors.append(f"{meta_path}: categories must be a list of strings")
                 except (OSError, ValueError) as exc:
                     errors.append(f"Invalid metadata {meta_path}: {exc}")
-            with os.scandir(directory) as entries:
-                for entry in sorted(entries, key=lambda e: e.name):
-                    try:
-                        number = _version(entry.name)
-                    except ValueError:
-                        continue
-                    if not entry.is_dir():
-                        continue
-                    folders[number].append(directory / entry.name)
-                    versions.add(number)
+            for name in listings[directory]:
+                try:
+                    number = _version(name)
+                except ValueError:
+                    continue
+                folder = directory / name
+                if not folder.is_dir():
+                    continue
+                folders[number].append(folder)
+                versions.add(number)
 
         status_sets = defaultdict(set)
         for path, entry in states.get(identity, []):

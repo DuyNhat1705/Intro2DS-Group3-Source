@@ -38,6 +38,38 @@ def test_discover_targets_keep_missing_ids(tmp_path):
     assert jobs[1]["paper_dir"] is None and jobs[1]["version_dirs"] == {1: None}
 
 
+def test_discover_skips_entries_that_are_listed_but_cannot_be_opened(tmp_path, monkeypatch):
+    """Google Drive có thể liệt kê thư mục không mở được (dữ liệu chỉ có một phần)."""
+    import os
+    from pathlib import Path
+    from types import SimpleNamespace
+    write_paper(tmp_path, "2609.27830", {1: {"main.tex": DOC}})
+    write_paper(tmp_path, "2609.27831", {1: {"main.tex": DOC}})
+    real_scandir = os.scandir
+
+    class Listing(list):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def drive_like_scandir(path):
+        if Path(path) == tmp_path:
+            with real_scandir(path) as entries:
+                # Tên ma: có trong danh sách nhưng không tồn tại trên đĩa.
+                return Listing([*entries, SimpleNamespace(name="2609-17838")])
+        if Path(path).name == "2609-27831":
+            raise FileNotFoundError(path)  # biến mất ngay sau khi được liệt kê
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", drive_like_scandir)
+    assert [job["arxiv_id"] for job in discover_publications(tmp_path)] == ["2609.27830"]
+    ranged = discover_publications(tmp_path, target_ids=["2609.17838", "2609.27830", "2609.27831"])
+    assert [job["arxiv_id"] for job in ranged] == ["2609.17838", "2609.27830", "2609.27831"]
+    assert ranged[0]["paper_dir"] is None and ranged[2]["paper_dir"] is None
+
+
 def test_signature_ignores_location_but_not_content(tmp_path):
     drive = tmp_path / "drive"
     write_paper(drive, "2609.27830", {1: {"main.tex": DOC}})

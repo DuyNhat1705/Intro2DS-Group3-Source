@@ -38,10 +38,11 @@ def get_paper_dir(arxiv_id: str) -> Path:
 def list_files(directory) -> list[Path]:
     """Mọi tệp thường dưới ``directory``, sắp xếp theo đường dẫn.
 
-    Tương đương ``sorted(p for p in directory.rglob("*") if p.is_file())``
-    nhưng chỉ duyệt cây một lần bằng scandir: loại mục lấy sẵn từ lúc liệt kê
-    nên không cần stat từng tệp, tiết kiệm nhiều trên ổ mạng như Google Drive.
-    Không đi theo liên kết tượng trưng tới thư mục; liên kết tới tệp vẫn tính.
+    Tương đương ``sorted(p for p in directory.rglob("*") if p.is_file())``.
+    Mỗi tệp vẫn được stat thật như ``is_file()`` của bản rglob: Google Drive
+    có thể liệt kê mục không mở được, và các mục đó phải bị bỏ qua. Thư mục
+    con không đọc được cũng bị bỏ qua. Không đi theo liên kết tượng trưng tới
+    thư mục; liên kết tới tệp vẫn tính.
     """
     directory = Path(directory)
     files, stack = [], [directory]
@@ -53,7 +54,7 @@ def list_files(directory) -> list[Path]:
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(current / entry.name)
-                        elif entry.is_file():
+                        elif (current / entry.name).is_file():
                             files.append(current / entry.name)
                     except OSError:
                         continue
