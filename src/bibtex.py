@@ -12,10 +12,13 @@ Tích hợp:
 
 from __future__ import annotations
 
+import copy
+import functools
 import re
 import urllib.parse
 import urllib.request
 import json
+from collections import OrderedDict
 import os
 import warnings
 import urllib.error
@@ -106,6 +109,11 @@ def extract_bibtex(
     for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
         entries.extend(_parse_bib_file(bib_path, arxiv_id))
     entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
+    # Chuẩn hóa chung cho mọi nguồn (.bib, \bibitem, CrossRef, LLM); phép này
+    # lũy đẳng nên áp lại lên giá trị đã sạch không đổi gì.
+    for entry in entries:
+        entry.title = _standardize_text(entry.title)
+        entry.journal = _standardize_text(entry.journal)
     return entries
 
 
@@ -183,12 +191,14 @@ def _parse_bib_file(bib_path: Path, arxiv_id: str) -> List[BibtexEntry]:
                 arxiv_id=arxiv_id,
                 citation_key=key,
                 entry_type=e.get("ENTRYTYPE", "misc"),
-                title=e.get("title"),
+                title=_standardize_text(e.get("title")),
                 authors=_split_authors(e.get("author", "")),
-                year=int(e["year"]) if e.get("year", "").isdigit() else None,
+                year=_bib_year(e),
                 doi=_norm_doi(e.get("doi")) or None,
-                journal=e.get("journal") or e.get("booktitle"),
+                # biblatex dùng journaltitle thay cho journal.
+                journal=_standardize_text(e.get("journal") or e.get("journaltitle") or e.get("booktitle")),
                 url=e.get("url"),
+                arxiv_id_hint=_bib_arxiv_id(e),
                 confidence_score=1.0,
                 source_method="bib_file",
             ))
@@ -253,19 +263,15 @@ def _parse_bibitem_block(
     url_match = re.search(r"https?://[^\s{}]+", text)
     url = url_match.group(0).rstrip(".,;)") if url_match else None
 
-    arxiv_hint_match = re.search(
-        r"(?:arxiv(?:\.org)?(?:/(?:abs|pdf))?[:\/\s]+)(\d{4}\.\d{4,5}(?:v\d+)?)",
-        text,
-        re.IGNORECASE,
-    )
-    arxiv_id_hint = arxiv_hint_match.group(1) if arxiv_hint_match else None
+    arxiv_id_hint = _find_arxiv_id(text)
 
     # 4. Title & Authors & Journal/Venue
     title: Optional[str] = None
     authors: List[str] = []
     journal: Optional[str] = None
 
-    quote_match = re.search(r"(?:``|\")([^\"']+?)(?:''|\")", text)
+    # \" là dấu umlaut (Birkh\"auser), không phải dấu ngoặc kép bao tiêu đề.
+    quote_match = re.search(r"(?:``|(?<!\\)\")([^\"']+?)(?:''|(?<!\\)\")", text)
     style_match = re.search(r"\\(?:textit|emph|textbf|em)\{([^}]+)\}", text)
 
     title_start = -1
@@ -311,7 +317,7 @@ def _parse_bibitem_block(
             title = parts[0]
 
     if title:
-        title = re.sub(r"\\[a-zA-Z]+|\{|\}", "", title).strip().rstrip(",.")
+        title = (_standardize_text(title) or "").rstrip(",.")
 
     # 5. Phân loại Entry Type
     text_lower = text.lower()
@@ -395,7 +401,8 @@ def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int
 
 def _parse_authors_from_text(raw_authors: str) -> List[str]:
     """Split prose authors conservatively, retaining protected corporate names."""
-    raw = re.sub(r"\bet\s+al\b\.?", "", raw_authors, flags=re.IGNORECASE).strip()
+    # "~" là dấu cách không ngắt: "T.~Smith" là hai từ, không phải một họ.
+    raw = re.sub(r"\bet\s+al\b\.?", "", raw_authors.replace("~", " "), flags=re.IGNORECASE).strip()
     names = []
     for segment in _split_names(raw, r"\band\b|\\?&|;"):
         # Braces protect both commas and 'and' inside corporate names.
@@ -441,10 +448,149 @@ def _split_names(text: str, separator: str) -> List[str]:
     return parts
 
 
+# ===== arXiv ID VÀ NĂM =====
+
+# ID mới (2007 trở đi) và ID cũ dạng archive/YYMMNNN.
+_ARXIV_ID = r"(\d{4}\.\d{4,5}|[a-z][a-z-]*(?:\.[A-Z]{2})?/\d{7})(v\d+)?"
+_ARXIV_IN_TEXT = re.compile(
+    r"(?:arxiv(?:\.org)?(?:/(?:abs|pdf))?[:/\s]+|10\.48550/arxiv\.)" + _ARXIV_ID, re.IGNORECASE)
+_ARXIV_BARE = re.compile(r"^\s*(?:arxiv:)?" + _ARXIV_ID + r"\s*$", re.IGNORECASE)
+_YEAR = re.compile(r"(?<!\d)(1[5-9]\d{2}|20\d{2})(?!\d)")
+
+
+def _find_arxiv_id(*texts: Optional[str]) -> Optional[str]:
+    """ID arXiv đi sau tiền tố arXiv, URL arxiv.org hoặc DOI 10.48550/arXiv."""
+    for text in texts:
+        if text:
+            match = _ARXIV_IN_TEXT.search(text)
+            if match:
+                return match.group(1) + (match.group(2) or "")
+    return None
+
+
+def _bib_arxiv_id(fields: Dict[str, str]) -> Optional[str]:
+    """Lấy arXiv ID từ eprint (khi archivePrefix là arXiv hoặc trống) rồi các trường khác."""
+    eprint = fields.get("eprint", "")
+    prefix = (fields.get("archiveprefix") or fields.get("eprinttype") or "arxiv").strip().lower()
+    if eprint and prefix == "arxiv":
+        match = _ARXIV_BARE.match(eprint)
+        if match:
+            return match.group(1) + (match.group(2) or "")
+    return _find_arxiv_id(*(fields.get(name) for name in
+                            ("eprint", "doi", "url", "journal", "journaltitle", "note", "howpublished")))
+
+
+def _bib_year(fields: Dict[str, str]) -> Optional[int]:
+    """Năm từ trường year (chấp nhận ``2017a``, ``{2017}``) hoặc date của biblatex."""
+    for name in ("year", "date"):
+        match = _YEAR.search(fields.get(name) or "")
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _year_from_arxiv_id(hint: Optional[str]) -> Optional[int]:
+    """Năm nộp bản đầu tiên, mã hóa trong ID: 2306.11478 là 2023, hep-th/9901001 là 1999."""
+    if not hint:
+        return None
+    if re.match(r"\d{4}\.", hint):
+        return 2000 + int(hint[:2])
+    old = re.search(r"/(\d{2})\d{5}", hint)
+    if old:
+        yy = int(old.group(1))
+        return (1900 if yy >= 91 else 2000) + yy
+    return None
+
+
+# ===== CHUẨN HÓA TRƯỜNG VĂN BẢN =====
+
+# Lệnh định dạng chỉ bọc nội dung: giữ phần trong ngoặc, bỏ lệnh.
+_WRAPPER_COMMAND = re.compile(
+    r"\\(?:textit|textbf|textsc|textrm|textsf|texttt|textup|textmd|textnormal|emph|em|bf|it|sc"
+    r"|mbox|hbox|text|uppercase|MakeUppercase|NoCaseChange|url|href\{[^{}]*\})\s*"
+    r"\{((?:[^{}]|\{[^{}]*\})*)\}")
+# \bibinfo{field}{value} (natbib/REVTeX) chỉ giữ value; \newblock là dấu ngắt khối.
+_BIBINFO = re.compile(r"\\bibinfo\s*\{[^{}]*\}\s*")
+_NEWBLOCK = re.compile(r"\\newblock\b\s*")
+_MATH_SPAN = re.compile(r"(?<!\\)\$[^$]*\$|\\\(.*?\\\)")
+_LEFTOVER_COMMAND = re.compile(r"\\[A-Za-z@]+\*?")
+# Lệnh nhiều chữ cái (\it, \bf, \small, ...) bị bỏ trước khi đổi dấu, nếu không
+# latex_to_unicode đọc "\it" thành "\i" (ı) + "t". Giữ các ký hiệu chữ thật.
+_MULTI_LETTER_COMMAND = re.compile(r"\\([A-Za-z@]{2,})\*?\s*")
+_SYMBOL_COMMANDS = {"ss", "ae", "AE", "oe", "OE", "aa", "AA", "textendash", "textemdash",
+                    "textquoteleft", "textquoteright", "textquotedblleft", "textquotedblright"}
+# latex_to_unicode đổi sai từ dấu không ngoặc thứ hai trở đi ("S\'eminaire de
+# Probabilit\'es"); bọc từng dấu thành {\'e} trước để luôn đổi đúng.
+_UNBRACED_SYMBOL_ACCENT = re.compile(r"(?<!\{)\\([`'^\"~=.])\s*([A-Za-z])")
+_UNBRACED_LETTER_ACCENT = re.compile(r"(?<!\{)\\([uvHcdbtrk])(?:\s+([A-Za-z])|\{([A-Za-z])\})")
+
+
+def _standardize_text(value: Optional[str]) -> Optional[str]:
+    """Đổi văn bản LaTeX của trường BibTeX thành Unicode dễ đọc.
+
+    Bỏ lệnh định dạng và ngoặc bảo vệ chữ hoa (``{BoxE}`` thành ``BoxE``),
+    đổi dấu LaTeX sang Unicode (``{\\"u}`` thành ``ü``) bằng bibtexparser.
+    Công thức ``$...$`` giữ nguyên; lệnh lạ còn lại bị bỏ như trước đây.
+    """
+    if not value:
+        return value
+    try:
+        from bibtexparser.latexenc import latex_to_unicode
+    except ImportError:  # pragma: no cover - requirements luôn có bibtexparser
+        latex_to_unicode = None
+    text = _NEWBLOCK.sub(" ", _BIBINFO.sub("", value))
+    previous = None
+    while previous != text:
+        previous, text = text, _WRAPPER_COMMAND.sub(r"\1", text)
+    parts, start = [], 0
+    for match in _MATH_SPAN.finditer(text):
+        parts.append(("text", text[start:match.start()]))
+        parts.append(("math", match.group()))
+        start = match.end()
+    parts.append(("text", text[start:]))
+    out = []
+    for kind, piece in parts:
+        if kind == "text":
+            piece = re.sub(r"\\\\\*?(?:\[[^\]]*\])?", " ", piece)  # ngắt dòng \\
+            piece = _MULTI_LETTER_COMMAND.sub(
+                lambda m: m.group(0) if m.group(1) in _SYMBOL_COMMANDS else "", piece)
+            piece = _UNBRACED_SYMBOL_ACCENT.sub(lambda m: "{\\" + m.group(1) + m.group(2) + "}", piece)
+            piece = _UNBRACED_LETTER_ACCENT.sub(
+                lambda m: "{\\" + m.group(1) + "{" + (m.group(2) or m.group(3)) + "}}", piece)
+            if latex_to_unicode is not None:
+                piece = latex_to_unicode(piece)
+            piece = _LEFTOVER_COMMAND.sub("", piece).replace("{", "").replace("}", "")
+            piece = re.sub(r"\\([$&%#_])", r"\1", piece).replace("~", " ")  # ký tự thoát \$ \& \% \# \_
+        out.append(piece)
+    cleaned = " ".join("".join(out).split())
+    return cleaned or None
+
+
+_NAME_SUFFIX = re.compile(r"^(?:jr|sr|ii|iii|iv)\.?$", re.IGNORECASE)
+_NOT_GIVEN_NAME = re.compile(r"^(?:inc|ltd|llc|co|corp|gmbh|et al)\.?$", re.IGNORECASE)
+
+
+def _first_last(name: str) -> str:
+    """Đổi ``Last, First`` (và ``Last, Jr., First``) thành ``First Last``.
+
+    Các tên không có dạng đó, hoặc phần sau dấu phẩy không phải tên riêng
+    (``Inc.``, ``Ltd.``), giữ nguyên để không làm hỏng tên tổ chức.
+    """
+    parts = [part.strip() for part in name.split(",")]
+    if len(parts) == 2 and all(parts) and not _NOT_GIVEN_NAME.match(parts[1]) and not _NAME_SUFFIX.match(parts[1]):
+        return f"{parts[1]} {parts[0]}"
+    if len(parts) == 3 and all(parts) and _NAME_SUFFIX.match(parts[1]):
+        return f"{parts[2]} {parts[0]} {parts[1]}"
+    return name
+
+
 def _clean_author(name: str) -> str:
-    name = re.sub(r"\\(?:textsc|textbf|textit|emph)\b\s*", "", name)
-    name = name.replace(r"\&", "&").replace("~", " ")
-    return " ".join(name.replace("{", "").replace("}", "").split()).strip(" ,;")
+    # Tên bọc trọn trong ngoặc là tên tổ chức (BibTeX): không đảo thứ tự.
+    protected = name.strip().startswith("{") and name.strip().endswith("}") and _split_names(name, ",") == [name.strip()]
+    name = name.replace(r"\&", "&")
+    name = _standardize_text(name) or ""
+    name = " ".join(name.split()).strip(" ,;")
+    return name if protected else _first_last(name)
 
 
 def _split_authors(author_str: str) -> List[str]:
@@ -469,6 +615,39 @@ def _calculate_confidence_score(entry: BibtexEntry) -> float:
     return round(min(score, 1.0), 2)
 
 
+def _cached_with_warnings(maxsize: int = 4096):
+    """Cache theo tham số và phát lại cảnh báo của lần gọi đầu khi trúng cache.
+
+    Cùng một reference thường lặp ở mọi phiên bản của bài; không cache thì mỗi
+    phiên bản lại chờ mạng. Phát lại cảnh báo giữ nguyên chẩn đoán từng phiên
+    bản; trả bản sao sâu vì nơi gọi có thể sửa đối tượng trả về.
+    """
+    def decorate(function):
+        store: "OrderedDict[tuple, tuple[Any, list]]" = OrderedDict()
+
+        @functools.wraps(function)
+        def wrapper(*args):
+            if args in store:
+                store.move_to_end(args)
+                value, caught = store[args]
+            else:
+                with warnings.catch_warnings(record=True) as recorded:
+                    warnings.simplefilter("always")
+                    value = function(*args)
+                caught = [(str(item.message), item.category) for item in recorded]
+                store[args] = (value, caught)
+                if len(store) > maxsize:
+                    store.popitem(last=False)
+            for message, category in caught:
+                warnings.warn(message, category, stacklevel=2)
+            return copy.deepcopy(value)
+
+        wrapper.cache_clear = store.clear
+        return wrapper
+    return decorate
+
+
+@_cached_with_warnings()
 def _enrich_with_crossref(title: str, doi: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fill missing metadata only after DOI identity or conservative title checks."""
     try:
@@ -538,6 +717,7 @@ def _enrich_with_crossref(title: str, doi: Optional[str] = None) -> Optional[Dic
         return None
 
 
+@_cached_with_warnings()
 def _fallback_parse_with_llm(
     citation_key: str,
     raw_text: str,
@@ -640,6 +820,8 @@ class UnifiedBibEntry:
     confidence: float = 0.0
     arxiv_id_hint: Optional[str] = None
     conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    # Trường được suy ra thay vì đọc từ nguồn (hiện chỉ có "year" từ arXiv ID).
+    inferred_fields: List[str] = field(default_factory=list)
 
     def to_row(self) -> Dict[str, Any]:
         """Trả về đúng các cột của bảng chuẩn bibtex."""
@@ -663,7 +845,8 @@ class UnifiedBibEntry:
                 "sources": list(self.sources),
                 "confidence": self.confidence,
                 "arxiv_id_hint": self.arxiv_id_hint,
-                "conflicts": list(self.conflicts)}
+                "conflicts": list(self.conflicts),
+                "inferred_fields": list(self.inferred_fields)}
 
 
 @dataclass
@@ -994,6 +1177,13 @@ def _build_unified_entry(
             "values": hints,
             "selected": hints[0],
         })
+    inferred = []
+    if year is None and hints:
+        # Không phiên bản nào ghi năm: dùng năm nộp mã hóa trong arXiv ID và
+        # đánh dấu trong debug để phân biệt với năm có trong nguồn.
+        year = _year_from_arxiv_id(hints[0])
+        if year is not None:
+            inferred.append("year")
     return UnifiedBibEntry(
         arxiv_id=arxiv_id,
         citation_key=key,
@@ -1010,6 +1200,7 @@ def _build_unified_entry(
         confidence=confidence,
         arxiv_id_hint=hints[0] if hints else None,
         conflicts=conflicts,
+        inferred_fields=inferred,
     )
 
 
@@ -1035,6 +1226,16 @@ def unify_publication(
     entries = [entry for _, entry in indexed]
     uf = _UnionFind(len(entries))
     merge_counts = {"doi": 0, "arxiv_hint": 0, "title": 0, "citation_key": 0, "fuzzy": 0}
+    # Chỉ số thành viên của mỗi cụm, luôn tăng dần như khi quét toàn bộ entry,
+    # để mỗi lần nối chỉ tốn theo kích thước hai cụm thay vì cả bài.
+    members = {index: [index] for index in range(len(entries))}
+
+    def union(left_index: int, right_index: int) -> None:
+        left_root, right_root = uf.find(left_index), uf.find(right_index)
+        uf.union(left_index, right_index)
+        root = uf.find(left_index)
+        other = right_root if root == left_root else left_root
+        members[root] = sorted(members[root] + members.pop(other))
 
     def connect_pairs(pairs: Iterable[Tuple[int, int]], stage: str,
                       *, same_key: bool = False, strong: bool = False) -> None:
@@ -1043,10 +1244,8 @@ def unify_publication(
             right_root = uf.find(right_index)
             if left_root == right_root:
                 continue
-            left_members = [entries[i] for i in range(len(entries))
-                            if uf.find(i) == left_root]
-            right_members = [entries[i] for i in range(len(entries))
-                             if uf.find(i) == right_root]
+            left_members = [entries[i] for i in members[left_root]]
+            right_members = [entries[i] for i in members[right_root]]
             if strong:
                 left_dois = {_norm_doi(item.doi) for item in left_members if _norm_doi(item.doi)}
                 right_dois = {_norm_doi(item.doi) for item in right_members if _norm_doi(item.doi)}
@@ -1054,7 +1253,7 @@ def unify_publication(
                     left_dois != right_dois or len(left_dois) != 1
                 ):
                     continue
-                uf.union(left_index, right_index)
+                union(left_index, right_index)
                 merge_counts[stage] += 1
             elif _can_merge(
                 left_members,
@@ -1062,7 +1261,7 @@ def unify_publication(
                 fuzzy=(stage == "fuzzy"),
                 same_key_requires_title=same_key,
             ):
-                uf.union(left_index, right_index)
+                union(left_index, right_index)
                 merge_counts[stage] += 1
 
     # Tầng 1: đồng nhất DOI hoặc arXiv ID hint. Khác DOI luôn veto.

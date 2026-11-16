@@ -1,7 +1,8 @@
 """Chạy parser theo bài, lưu checkpoint và xuất số liệu cho notebook parser."""
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 import csv
@@ -24,6 +25,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .parser_pipeline import parse_publication
+from .utils import list_files
 
 
 def utc_now():
@@ -54,9 +56,16 @@ def _atomic_json(path, value):
     os.replace(temporary, path)
 
 
+# Số kết quả tối đa đang chờ luồng ghi nền, để RAM không phình khi ghi chậm.
+_MAX_PENDING_WRITES = 2
+# Luồng ghi nền và luồng điều phối cùng ghi events.jsonl; khóa giữ từng dòng nguyên vẹn.
+_APPEND_LOCK = threading.Lock()
+
+
 def _append_jsonl(path, value):
-    with Path(path).open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+    line = json.dumps(value, ensure_ascii=False) + "\n"
+    with _APPEND_LOCK, Path(path).open("a", encoding="utf-8") as stream:
+        stream.write(line)
 
 
 def _read_jsonl(path):
@@ -98,16 +107,28 @@ def _code_signature():
 
 
 def input_signature(job, options):
-    """Băm nội dung nguồn; không bỏ sót thay đổi chỉ vì kích thước bằng nhau."""
+    """Băm nội dung nguồn; không bỏ sót thay đổi chỉ vì kích thước bằng nhau.
+
+    Thư mục phiên bản được ghi theo tên tương đối với thư mục bài, nên cùng dữ
+    liệu đọc từ Drive hay từ bản giải nén trên ổ local cho cùng chữ ký.
+    """
+    paper_dir = Path(job["paper_dir"]) if job.get("paper_dir") is not None else None
+
+    def location(path):
+        if path is None:
+            return None
+        path = Path(path)
+        return path.name if paper_dir is not None and path.parent == paper_dir else str(path)
+
     digest = hashlib.sha256(json.dumps({"arxiv_id": job["arxiv_id"], "metadata": job.get("metadata", {}),
-        "versions": {str(v): str(p) for v, p in job["version_dirs"].items()},
+        "versions": {str(v): location(p) for v, p in job["version_dirs"].items()},
         "source_status": job.get("source_status_by_version", {}),
         "errors": job.get("discovery_errors", []), "options": options}, sort_keys=True).encode())
     directory = job.get("paper_dir")
     if directory is not None and Path(directory).is_dir():
         directory = Path(directory)
-        for path in sorted(p for p in directory.rglob("*") if p.is_file() and
-                           (p.suffix.lower() in {".tex", ".bib"} or p.name == "metadata.json")):
+        for path in (p for p in list_files(directory) if
+                     p.suffix.lower() in {".tex", ".bib"} or p.name == "metadata.json"):
             digest.update(path.relative_to(directory).as_posix().encode())
             with path.open("rb") as stream:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -160,12 +181,21 @@ class _Monitor:
 def _disk_snapshot(root, logs, run_id, worker):
     started = time.perf_counter()
     size = 0
-    for path in root.rglob("*"):
+    stack = [root]
+    while stack:
+        # scandir cho biết loại mục từ lúc liệt kê, mỗi tệp chỉ cần một lần stat.
         try:
-            if path.is_file():
-                size += path.stat().st_size
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file():
+                            size += entry.stat().st_size
+                    except FileNotFoundError:
+                        # Worker khác có thể vừa đổi tên tệp tạm khi đo dung lượng chung.
+                        continue
         except FileNotFoundError:
-            # Worker khác có thể vừa đổi tên tệp tạm khi đo dung lượng chung.
             continue
     row = {"timestamp": utc_now(), "run_id": run_id, "worker": worker,
            "output_bytes": size, "scan_sec": time.perf_counter() - started}
@@ -345,8 +375,15 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
 def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, fuzzy_threshold=0.92,
                resume=True, max_run_hours=None, monitor_interval=1.0, disk_every=100, progress=None,
                num_workers=1, max_workers=None, adaptive_ram=True, reserve_ram_gb=None,
-               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60):
-    """Trả thống kê và đường dẫn; không giữ các bảng element toàn corpus trong RAM."""
+               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60, paper_timeout_sec=None):
+    """Trả thống kê và đường dẫn; không giữ các bảng element toàn corpus trong RAM.
+
+    Chế độ song song ghi kết quả trong một luồng nền để tiến trình chính tiếp
+    tục giao bài cho worker trong lúc ghi Parquet/checkpoint (chậm trên Drive).
+    paper_timeout_sec chỉ áp dụng khi chạy song song: bài quá hạn bị dừng và
+    ghi lỗi để thử lại ở phiên sau. Chế độ tuần tự chạy trong chính tiến trình
+    nên không thể ngắt giữa bài.
+    """
     if not re.fullmatch(r"[A-Za-z0-9_+-]+", worker):
         raise ValueError("Worker name may contain only letters, digits, _, +, and -")
     if not 0 <= fuzzy_threshold <= 1 or disk_every < 1 or monitor_interval <= 0:
@@ -357,6 +394,10 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         raise ValueError("num_workers must be 'auto' or a positive integer")
     if max_workers is not None and (type(max_workers) is not int or max_workers < 1):
         raise ValueError("max_workers must be a positive integer or None")
+    if paper_timeout_sec is not None and (isinstance(paper_timeout_sec, bool) or
+            not isinstance(paper_timeout_sec, (int, float)) or not math.isfinite(paper_timeout_sec)
+            or paper_timeout_sec <= 0):
+        raise ValueError("paper_timeout_sec must be a positive number or None")
     if type(adaptive_ram) is not bool:
         raise ValueError("adaptive_ram must be a boolean")
     for name, value, allow_zero in (("reserve_ram_gb", reserve_ram_gb, True),
@@ -387,7 +428,8 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
               "disk_every": disk_every, "target_ids": [job["arxiv_id"] for job in jobs],
               "ranges": ranges or {}, "num_workers": num_workers, "max_workers": max_workers,
               "adaptive_ram": adaptive_ram, "reserve_ram_gb": reserve_ram_gb,
-              "ram_per_worker_gb": ram_per_worker_gb, "ram_wait_timeout_sec": ram_wait_timeout_sec}
+              "ram_per_worker_gb": ram_per_worker_gb, "ram_wait_timeout_sec": ram_wait_timeout_sec,
+              "paper_timeout_sec": paper_timeout_sec}
     run = {"run_id": run_id, "worker": worker, "started_at": utc_now(), "event": "start", "config": config,
            "target_ids": len(jobs), "remaining_at_start": None, "papers_processed": 0, "papers_reused": 0,
            "machine": {"python": platform.python_version(), "platform": platform.platform(),
@@ -492,14 +534,24 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                         pending_items.append(item)
                 deadline = started + max_run_hours * 3600 if max_run_hours is not None else None
                 monitor.phase = "parallel_parsing"
-                with closing(iter_parallel_results([item[0] for item in pending_items],
+                writes = deque()
+                # Thoát with theo thứ tự ngược: dừng worker trước, rồi chờ luồng
+                # ghi xong mọi kết quả đã nhận, kể cả khi Interrupt hoặc lỗi.
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="parser-writer") as writer, \
+                        closing(iter_parallel_results([item[0] for item in pending_items],
                         num_workers=num_workers, max_workers=max_workers, adaptive_ram=adaptive_ram,
                         reserve_ram_gb=reserve_ram_gb, ram_per_worker_gb=ram_per_worker_gb,
                         ram_wait_timeout_sec=ram_wait_timeout_sec, enrich=enrich,
-                        fuzzy_threshold=fuzzy_threshold, deadline=deadline, on_event=parallel_event)) as results:
+                        fuzzy_threshold=fuzzy_threshold, deadline=deadline, on_event=parallel_event,
+                        job_timeout_sec=paper_timeout_sec)) as results:
                     for index, result in results:
-                        save_result(pending_items[index], result)
+                        writes.append(writer.submit(save_result, pending_items[index], result))
                         del result
+                        # Báo lỗi ghi sớm; giới hạn số kết quả chờ ghi để RAM không phình.
+                        while writes and (writes[0].done() or len(writes) > _MAX_PENDING_WRITES):
+                            writes.popleft().result()
+                while writes:
+                    writes.popleft().result()
                 if len(records) < len(jobs) and deadline is not None and time.perf_counter() >= deadline:
                     stop_reason = "time_limit"
             monitor.phase = "exporting_tables"

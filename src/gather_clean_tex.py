@@ -46,9 +46,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 if __package__:
-    from .utils import GatherTex
+    from .utils import GatherTex, list_files
 else:
-    from utils import GatherTex
+    from utils import GatherTex, list_files
 
 __all__ = [
     "ABLATION_LEVELS",
@@ -414,12 +414,11 @@ class _LineTable:
 # ============================================================== T3: assets
 
 
-def _index_files(version_dir: Path) -> dict[str, list[Path]]:
+def _index_files(version_dir: Path, files: list[Path] | None = None) -> dict[str, list[Path]]:
     """Map lower-cased basenames to the files of the version, for fallback lookups."""
     index: dict[str, list[Path]] = {}
-    for p in version_dir.rglob("*"):
-        if p.is_file():
-            index.setdefault(p.name.lower(), []).append(p)
+    for p in list_files(version_dir) if files is None else files:
+        index.setdefault(p.name.lower(), []).append(p)
     return index
 
 
@@ -998,12 +997,14 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
     if not version_dir.is_dir():
         raise FileNotFoundError(f"version directory not found: {version_dir}")
     version_dir = version_dir.resolve()
-    tex_paths = sorted(p for p in version_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".tex")
+    # Một lượt duyệt dùng cho cả danh sách .tex lẫn chỉ mục tìm tệp.
+    files = list_files(version_dir)
+    tex_paths = [p for p in files if p.suffix.lower() == ".tex"]
     if not tex_paths:
         return None
 
     notes: list[str] = []
-    index = _index_files(version_dir)
+    index = _index_files(version_dir, files)
     texts: dict[Path, str] = {}
     anchors: dict[Path, list[tuple[int, int]]] = {}
     for p in tex_paths:
@@ -1690,10 +1691,12 @@ _FORMAT_SWITCHES = (
     "normalfont em bf it rm sf tt sc sl selectfont xspace balance raggedbottom "
     "flushbottom frenchspacing nonfrenchspacing phantomsection strut unskip hrule "
     "endhead endfirsthead endfoot endlastfoot IEEEpeerreviewmaketitle and AND begingroup endgroup "
-    "displaystyle textstyle scriptstyle scriptscriptstyle"
+    "displaystyle textstyle scriptstyle scriptscriptstyle leavevmode"
 ).split()
 _FORMAT_DROP_ARGS = {
-    "vspace": "{", "hspace": "{", "label": "{", "setlength": "{{", "addtolength": "{{",
+    "vspace": "{", "hspace": "{", "label": "{",
+    # elsarticle: tùy chọn natbib và tiêu đề trang chạy, không phải nội dung bài.
+    "biboptions": "{", "verso": "{", "recto": "{", "setlength": "{{", "addtolength": "{{",
     "setcounter": "{{", "addtocounter": "{{", "rule": "[{{", "pagestyle": "{",
     "thispagestyle": "{", "bibliographystyle": "{", "captionsetup": "[{", "graphicspath": "{",
     "hypersetup": "{", "enlargethispage": "{", "linespread": "{", "fontsize": "{{", "color": "[{",

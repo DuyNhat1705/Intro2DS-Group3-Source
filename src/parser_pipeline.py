@@ -8,6 +8,7 @@ cả ``missing_dir`` và ``not_found``; hai bộ đếm riêng là tập con c�
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import warnings
@@ -18,13 +19,13 @@ from pathlib import Path
 if __package__:
     from .bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
     from .gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from .hierarchy import HierarchyDeduplicationWarning, build_element_tables, construct_hierarchy, rewrite_citations
-    from .utils import get_paper_dir
+    from .hierarchy import HierarchyDeduplicationWarning, build_element_tables, citation_keys, construct_hierarchy, rewrite_citations
+    from .utils import get_paper_dir, list_files
 else:
     from bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
     from gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from hierarchy import HierarchyDeduplicationWarning, build_element_tables, construct_hierarchy, rewrite_citations
-    from utils import get_paper_dir
+    from hierarchy import HierarchyDeduplicationWarning, build_element_tables, citation_keys, construct_hierarchy, rewrite_citations
+    from utils import get_paper_dir, list_files
 
 __all__ = ["discover_publications", "parse_publication"]
 
@@ -107,15 +108,28 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
         if existing_only and ids is not None:
             candidates = sorted({root / name for identity in ids for name in
                                  (get_paper_dir(identity).name, identity.replace("/", "-"))})
+            for directory in candidates:
+                try:
+                    identity = _arxiv_id(directory.name)
+                except ValueError:
+                    continue
+                if directory.is_dir():
+                    directories[identity].append(directory)
         else:
-            candidates = sorted(root.iterdir())
-        for directory in candidates:
-            try:
-                identity = _arxiv_id(directory.name)
-            except ValueError:
-                continue
-            if directory.is_dir():
-                directories[identity].append(directory)
+            # scandir lấy loại mục từ readdir, tránh một lần stat cho mỗi mục
+            # (rất chậm trên ổ mạng như Google Drive). Có ID đích thì bỏ qua
+            # ngay các thư mục ngoài phạm vi trước khi kiểm tra loại mục.
+            wanted = None if ids is None else set(ids)
+            with os.scandir(root) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    try:
+                        identity = _arxiv_id(entry.name)
+                    except ValueError:
+                        continue
+                    if wanted is not None and identity not in wanted:
+                        continue
+                    if entry.is_dir():
+                        directories[identity].append(root / entry.name)
     elif target_ids is None:
         raise FileNotFoundError(f"Missing data directory: {root}")
 
@@ -183,15 +197,16 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                         errors.append(f"{meta_path}: categories must be a list of strings")
                 except (OSError, ValueError) as exc:
                     errors.append(f"Invalid metadata {meta_path}: {exc}")
-            for folder in sorted(directory.iterdir()):
-                if not folder.is_dir():
-                    continue
-                try:
-                    number = _version(folder.name)
-                except ValueError:
-                    continue
-                folders[number].append(folder)
-                versions.add(number)
+            with os.scandir(directory) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    try:
+                        number = _version(entry.name)
+                    except ValueError:
+                        continue
+                    if not entry.is_dir():
+                        continue
+                    folders[number].append(directory / entry.name)
+                    versions.add(number)
 
         status_sets = defaultdict(set)
         for path, entry in states.get(identity, []):
@@ -259,7 +274,23 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
     """
     started = time.perf_counter()
     identity = job["arxiv_id"]
-    discovery_errors = list(job.get("discovery_errors", []))
+    paper_dir = job.get("paper_dir")
+    # Thông điệp chỉ ghi đường dẫn tính từ thư mục dữ liệu: báo cáo không chứa
+    # đường dẫn máy chạy và giống nhau dù đọc từ Drive hay từ bản giải nén.
+    prefixes = []
+    if paper_dir is not None:
+        root = Path(paper_dir).parent
+        prefixes = sorted({str(root) + os.sep, str(root.resolve()) + os.sep}, key=len, reverse=True)
+
+    def relative(message):
+        for prefix in prefixes:
+            message = message.replace(prefix, "")
+        return message
+
+    discovery_errors = [relative(message) for message in job.get("discovery_errors", [])]
+    # Cảnh báo lỗi thời của thư viện (DeprecationWarning, ...) không nói gì về
+    # dữ liệu: chỉ đếm theo loại, không ghi từng dòng vào warnings.
+    dependency_warnings = Counter()
     result = dict(elements=[], hierarchy=[], bibtex=[], version_status=[],
                   bibtex_debug=[], key_map={}, stats={}, timings=[], warnings=[])
     rows = {}
@@ -279,7 +310,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                                        category=category, affects_status=affects_status,
                                        severity="warning" if affects_status else "notice",
                                        requires_review=requires_review,
-                                       message=f"Warning: {message}"))
+                                       message=f"Warning: {relative(message)}"))
         affected = [rows[version]] if version in rows else [r for r in rows.values() if r["status"] in {"ok", "partial"}]
         for row in affected:
             row["warning_count"] += 1
@@ -300,22 +331,26 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             try:
                 value = operation()
             except Exception as exc:
-                error = f"Error in {stage}: {type(exc).__name__}: {exc}"
+                error = relative(f"Error in {stage}: {type(exc).__name__}: {exc}")
             finally:
                 duration = time.perf_counter() - tick
                 end = datetime.now(timezone.utc).isoformat()
         for item in caught:
             category = item.category
-            dependency = issubclass(category, (DeprecationWarning, PendingDeprecationWarning, FutureWarning))
+            if issubclass(category, (DeprecationWarning, PendingDeprecationWarning, FutureWarning)):
+                dependency_warnings[category.__name__] += 1
+                continue
             retained = issubclass(category, (HierarchyDeduplicationWarning, BibliographyMetadataWarning))
             optional_enrichment = issubclass(category, BibliographyWarning) and str(item.message).startswith(
                 ("CrossRef result rejected", "CrossRef enrichment failed", "LLM fallback failed"))
             optional_bibliography = issubclass(category, MissingBibliographyWarning)
-            blocking = not (dependency or retained or optional_enrichment or optional_bibliography)
-            safely_separated = issubclass(category, HierarchyDeduplicationWarning) and str(item.message).startswith(
-                "Identical content occurs with different node kinds")
+            blocking = not (retained or optional_enrichment or optional_bibliography)
+            # Hai trường hợp khử trùng đã được xử lý không mất dữ liệu, không cần người xem lại.
+            safely_separated = issubclass(category, HierarchyDeduplicationWarning) and (
+                str(item.message).startswith("Identical content occurs with different node kinds")
+                or "have multiple parents in version" in str(item.message))
             warning(stage, str(item.message), version, item.category.__name__,
-                    affects_status=blocking, requires_review=not (dependency or safely_separated))
+                    affects_status=blocking, requires_review=not safely_separated)
         new_warnings = result["warnings"][warning_start:]
         incomplete = any(w["affects_status"] for w in new_warnings)
         timing = dict(arxiv_id=identity, stage=stage, started_at=begin, ended_at=end,
@@ -353,15 +388,16 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                     return False
                 row.update(status="missing_dir", missing_count=1, missing=[f"v{number}"])
                 raise FileNotFoundError(f"Missing version directory v{number}")
-            for path in sorted(Path(directory).rglob("*")):
-                if path.is_file() and path.suffix.lower() in {".tex", ".bib"}:
+            files = list_files(directory)
+            for path in files:
+                if path.suffix.lower() in {".tex", ".bib"}:
                     resolved = path.resolve()
                     if resolved not in counted:
                         input_bytes += path.stat().st_size
                         counted.add(resolved)
             if status == "not_found":
                 row.update(status="not_found", message="Download state confirms the version was not found")
-                if any(p.is_file() and p.suffix.lower() == ".tex" for p in Path(directory).rglob("*")):
+                if any(p.suffix.lower() == ".tex" for p in files):
                     row["errors"].append("Conflict: a not_found version still contains TeX sources")
                 return False
             return True
@@ -447,6 +483,13 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             tables_ok, tables = phase("build_element_tables", lambda: build_element_tables(identity, rewritten))
             if tables_ok:
                 result["elements"], result["hierarchy"] = tables
+    # Đánh dấu entry có được \cite trong nội dung đã parse (\nocite{*} tính là tất cả).
+    # Bảng bibtex vẫn giữ mọi entry; cờ chỉ nằm trong bản debug và thống kê.
+    cited = set()
+    for row in result["elements"]:
+        cited |= citation_keys(row["content"])
+    for row in result["bibtex_debug"]:
+        row["cited"] = "*" in cited or row["citation_key"] in cited
 
     for number, row in rows.items():
         messages = ([row["message"]] if row["message"] else []) + row["errors"]
@@ -483,6 +526,8 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         bibtex_before=bibtex_before, bibtex_after=len(result["bibtex"]),
         elapsed_sec=time.perf_counter() - started, input_bytes=input_bytes,
         category=category, warnings_count=len(result["warnings"]),
+        bibtex_cited=sum(row["cited"] for row in result["bibtex_debug"]),
+        dependency_warning_count=sum(dependency_warnings.values()),
         bibliography_status=("error" if any(r["bibliography_status"] == "error" for r in rows.values()) else
             "missing_sources" if any(r["bibliography_status"] == "missing_sources" for r in rows.values()) else
             "ok" if any(r["bibliography_status"] == "ok" for r in rows.values()) else "not_run"),

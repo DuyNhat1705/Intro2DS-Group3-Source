@@ -7,6 +7,7 @@ cache; subsequent passages reuse the model in the Python process. Inference
 runs locally on CPU and requires no inference service or API key.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 import re
@@ -303,18 +304,39 @@ def _blocked_sentence_boundary(text: str, end: int) -> bool:
     return not before and word[0].isupper() and word not in {"The", "This", "Next", "We", "It", "See"}
 
 
+# Kết quả SaT theo văn bản đã chiếu. Các phiên bản của cùng bài thường lặp
+# lại phần lớn đoạn văn và đều chạy trong cùng worker, nên cache tránh suy luận
+# lại; giới hạn số mục để RAM mỗi worker không tăng vô hạn qua cả corpus.
+# Không gom nhiều đoạn vào một lần gọi: đo trên sat-3l-sm, batch chậm hơn
+# (padding, ONNX 1 luồng) và đổi ranh giới câu ở một số đoạn.
+_SAT_CACHE: "OrderedDict[str, tuple[str, ...]]" = OrderedDict()
+_SAT_CACHE_MAX = 20000
+
+
+def _sat_parts(projected: str) -> tuple[str, ...]:
+    cached = _SAT_CACHE.get(projected)
+    if cached is not None:
+        _SAT_CACHE.move_to_end(projected)
+        return cached
+    # wtpsplit 2.2.2 emits this informational warning on every call, even
+    # without newlines. Other warnings must remain visible.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="split_on_input_newlines=False will lead to newlines.*", category=UserWarning)
+        parts = tuple(_sentence_model().split(projected, split_on_input_newlines=False, strip_whitespace=False))
+    if not all(isinstance(part, str) for part in parts) or "".join(parts) != projected:
+        raise ValueError("SaT output does not reconstruct the projected input; cannot map sentence boundaries")
+    _SAT_CACHE[projected] = parts
+    while len(_SAT_CACHE) > _SAT_CACHE_MAX:
+        _SAT_CACHE.popitem(last=False)
+    return parts
+
+
 def _sentences(text: str):
     """Combine SaT and guarded punctuation rules; slice original TeX only."""
     if not text.strip():
         return
     projected, offsets = _sentence_projection(text)
-    # wtpsplit 2.2.2 emits this informational warning on every call, even
-    # without newlines. Other warnings must remain visible.
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="split_on_input_newlines=False will lead to newlines.*", category=UserWarning)
-        parts = list(_sentence_model().split(projected, split_on_input_newlines=False, strip_whitespace=False))
-    if not all(isinstance(part, str) for part in parts) or "".join(parts) != projected:
-        raise ValueError("SaT output does not reconstruct the projected input; cannot map sentence boundaries")
+    parts = _sat_parts(projected)
     ends = {len(projected)}
     projected_end = 0
     for part in parts:
@@ -338,6 +360,38 @@ def _sentences(text: str):
         if piece:
             yield piece
         source_start = source_end
+
+
+_TITLE_NOTES = re.compile(r"\\(?:thanks|footnote|tnoteref|fnref|thanksref)\*?\s*(?=\{)")
+
+
+def _title_text(raw: str) -> str:
+    """Tiêu đề không kèm chú thích (\\thanks, \\footnote, ...) và ngắt dòng ``\\\\``."""
+    parts, i = [], 0
+    for match in _TITLE_NOTES.finditer(raw):
+        if match.start() < i:
+            continue
+        end = _group(raw, match.end())
+        if end is None:
+            continue
+        parts.append(raw[i:match.start()])
+        i = end
+    parts.append(raw[i:])
+    text = re.sub(r"\\\\\*?(?:\[[^\]]*\])?", " ", "".join(parts))
+    return " ".join(text.split())
+
+
+def citation_keys(text: str) -> set[str]:
+    """Các khóa trong mọi lệnh cite của ``text``, cùng bộ quét với bước đổi khóa."""
+    found: set[str] = set()
+
+    class _Collect(dict):
+        def get(self, key, default=None):
+            found.add(key)
+            return default
+
+    _rewrite_citation_text(text, _Collect())
+    return found
 
 
 def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None) -> list[Node]:
@@ -510,7 +564,11 @@ def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None)
                             warnings.warn(f"Unmatched list end {env}", UserWarning, stacklevel=2)
                     i = start = end
                     continue
-                if _PROSE_ENV.fullmatch(env):
+                if _PROSE_ENV.fullmatch(env) or env not in _LITERAL_ENVS:
+                    # Môi trường văn xuôi đã biết, và mọi môi trường khác chưa được
+                    # xử lý ở trên (định lý tự định nghĩa như openproblem, khối
+                    # tcolorbox, ...): là ranh giới khối và trong suốt về cấu trúc;
+                    # thẻ \begin/\end không được lọt vào nội dung câu.
                     flush(start, i)
                     i = start = end
                     if base == "begin":
@@ -519,7 +577,21 @@ def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None)
                             q = _group(text, p, "[", "]")
                             if q is not None:
                                 i = q  # keep the optional label as prose, shield its syntax
+                        elif not _PROSE_ENV.fullmatch(env):
+                            # Tham số bắt buộc của môi trường lạ (độ rộng, màu, ...) không phải văn xuôi.
+                            i = start = _arguments(text, end, optional=False)
                     continue
+        if base == "title" and not nodes[0].content:
+            # Tiêu đề bài là nội dung của nút gốc document, không phải một câu.
+            p = _space(text, match.end())
+            if p < n and text[p] == "[":
+                p = _space(text, _group(text, p, "[", "]") or p)
+            end = _group(text, p)
+            if end is not None:
+                flush(start, i)
+                nodes[0].content = _title_text(text[p + 1:end - 1])
+                i = start = end
+                continue
         if base == "item" and lists:
             flush(start, i)
             p = _space(text, match.end())
@@ -633,6 +705,29 @@ def _rewrite_citation_text(text: str, key_map: dict[str, str]) -> str:
     return "".join(parts)
 
 
+# Nội dung nguyên văn giữ nguyên khoảng trắng vì ở đó khoảng trắng có nghĩa.
+_LITERAL_SPAN = re.compile(
+    r"\\begin\{(" + "|".join(re.escape(name) for name in sorted(_LITERAL_ENVS, key=len, reverse=True))
+    + r")\}.*?\\end\{\1\}|\\verb\*?([^\sA-Za-z*]).*?\2", re.S)
+_WHITESPACE = re.compile(r"\s+")
+
+
+def normalize_whitespace(content: str) -> str:
+    """Gộp mọi chuỗi khoảng trắng thành một dấu cách, trừ phần nguyên văn.
+
+    Ngoài verbatim, TeX coi xuống dòng và nhiều dấu cách như một dấu cách, nên
+    phép này không đổi nghĩa nhưng giúp hai phiên bản chỉ khác cách ngắt dòng
+    được khử trùng thành cùng một element, như yêu cầu so khớp sau cleanup.
+    """
+    parts, start = [], 0
+    for match in _LITERAL_SPAN.finditer(content):
+        parts.append(_WHITESPACE.sub(" ", content[start:match.start()]))
+        parts.append(match.group())
+        start = match.end()
+    parts.append(_WHITESPACE.sub(" ", content[start:]))
+    return "".join(parts).strip()
+
+
 def build_element_tables(
     arxiv_id: str, nodes_by_version: dict[int, list[Node]]
 ) -> tuple[list[ElementRow], list[HierarchyRow]]:
@@ -644,6 +739,9 @@ def build_element_table(
     arxiv_id: str, nodes_by_version: dict[int, list[Node]]
 ) -> tuple[list[ElementRow], list[HierarchyRow]]:
     """Build schema rows from canonicalized nodes, comparing exact kind/content.
+
+    Content is whitespace-normalized first (see normalize_whitespace) and the
+    normalized text is what the element row stores.
 
     Every occurrence contributes its edge, including repeated occurrences.
     HierarchyDeduplicationWarning flags lossless ambiguities for review.
@@ -681,9 +779,10 @@ def build_element_table(
     for version in sorted(nodes_by_version):
         for node in nodes_by_version[version]:
             local_key = (version, node.local_id)
-            identity = (node.kind, node.content)
+            content = normalize_whitespace(node.content)
+            identity = (node.kind, content)
             if identity not in shared:
-                kinds = content_kinds.setdefault(node.content, set())
+                kinds = content_kinds.setdefault(content, set())
                 if kinds and node.kind not in kinds:
                     warnings.warn("Identical content occurs with different node kinds; keeping separate elements",
                                   HierarchyDeduplicationWarning, stacklevel=2)
@@ -691,11 +790,14 @@ def build_element_table(
                 element_id = f"{arxiv_id}#e{len(elements) + 1:06d}"
                 shared[identity] = element_id
                 elements.append(ElementRow(element_id=element_id, arxiv_id=arxiv_id,
-                                           kind=node.kind, content=node.content))
+                                           kind=node.kind, content=content))
             local_ids[local_key] = shared[identity]
 
     parents: dict[tuple[int, str], set[str]] = {}
     for version in sorted(nodes_by_version):
+        # Một nội dung lặp lại dưới nhiều cha (ví dụ "Then" trước nhiều công thức)
+        # là hệ quả bình thường của khử trùng: gộp thành một cảnh báo mỗi phiên bản.
+        multi_parent: set[str] = set()
         for node in nodes_by_version[version]:
             if node.parent_local_id is None:
                 continue
@@ -706,12 +808,15 @@ def build_element_table(
             parent_id = local_ids[parent_key]
             previous = parents.setdefault((version, element_id), set())
             if previous and parent_id not in previous:
-                warnings.warn(f"Element {element_id} has multiple parents in version {version}; retaining all edges",
-                              HierarchyDeduplicationWarning, stacklevel=2)
+                multi_parent.add(element_id)
             if element_id == parent_id:
                 warnings.warn(f"Deduplication creates a self-edge for {element_id} in version {version}",
                               HierarchyDeduplicationWarning, stacklevel=2)
             previous.add(parent_id)
             hierarchy.append(HierarchyRow(arxiv_id=arxiv_id, version=version,
                                           element_id=element_id, parent_id=parent_id))
+        if multi_parent:
+            warnings.warn(f"{len(multi_parent)} element(s) have multiple parents in version {version}; "
+                          f"retaining all edges (e.g. {min(multi_parent)})",
+                          HierarchyDeduplicationWarning, stacklevel=2)
     return elements, hierarchy

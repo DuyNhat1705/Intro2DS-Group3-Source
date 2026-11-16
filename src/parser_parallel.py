@@ -217,7 +217,7 @@ def _number(name, value, minimum=0):
 def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                           reserve_ram_gb=None, ram_per_worker_gb=1.5, adaptive_ram=True,
                           enrich=False, fuzzy_threshold=.92, deadline=None, on_event=None,
-                          ram_wait_timeout_sec=60):
+                          ram_wait_timeout_sec=60, job_timeout_sec=None, _worker_target=None):
     """Yield ``(index, parse_publication(job))`` với tối đa một job mỗi worker.
 
     GB dùng GiB (2**30 byte); mặc định chừa max(0.5 GiB, 10% tổng RAM
@@ -230,6 +230,13 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
     peak_workers, peak_in_flight, worker_errors, ram_wait_sec, stopped_reason.
     Summary cũng giữ memory_estimate_gb, reserve_ram_gb, cpu_cap, worker_cap.
     completed bao gồm lỗi worker; pending chỉ đếm job chưa giao.
+
+    job_timeout_sec giới hạn thời gian một bài: quá hạn thì worker bị dừng
+    cưỡng bức, bài nhận kết quả lỗi (thử lại ở phiên sau) và worker mới được
+    tạo khi cần. Summary đếm số lần quá hạn trong job_timeouts. Thời hạn tính
+    từ lúc giao bài, nên với worker mới gồm cả khởi động tiến trình và lần đầu
+    nạp/tải mô hình SaT; đừng đặt quá nhỏ.
+    _worker_target chỉ dành cho test: thay hàm chạy trong tiến trình con.
     """
     if num_workers != "auto":
         _positive_int("num_workers", num_workers)
@@ -240,6 +247,9 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
         raise ValueError("ram_per_worker_gb must be > 0")
     reserve = None if reserve_ram_gb is None else _number("reserve_ram_gb", reserve_ram_gb)
     timeout = _number("ram_wait_timeout_sec", ram_wait_timeout_sec)
+    job_timeout = None if job_timeout_sec is None else _number("job_timeout_sec", job_timeout_sec)
+    if job_timeout == 0:
+        raise ValueError("job_timeout_sec must be > 0")
     threshold = _number("fuzzy_threshold", fuzzy_threshold)
     if threshold > 1:
         raise ValueError("fuzzy_threshold must be <= 1")
@@ -263,7 +273,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
     iterator = iter(enumerate(jobs))
     context = mp.get_context("spawn")
     workers = []
-    submitted = completed = peak_workers = peak_in_flight = worker_errors = 0
+    submitted = completed = peak_workers = peak_in_flight = worker_errors = job_timeouts = 0
     started = time.perf_counter()
     wait_started, waited, last_wait_event = None, 0., -float("inf")
     calibrated, exhausted, pending = False, False, None
@@ -332,7 +342,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                 index, job = pending
                 if worker is None:
                     parent, child = context.Pipe()
-                    process = context.Process(target=_worker_main, args=(child, enrich, threshold))
+                    process = context.Process(target=_worker_target or _worker_main, args=(child, enrich, threshold))
                     worker = _Worker(process, parent)
                     workers.append(worker)
                     try:
@@ -378,10 +388,15 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
             if busy:
                 ready = wait([w.connection for w in busy], timeout=_POLL_SEC)
                 for worker in busy:
-                    if worker.connection not in ready and worker.process.is_alive():
+                    timed_out = (job_timeout is not None and worker.connection not in ready
+                                 and time.perf_counter() - worker.started >= job_timeout)
+                    if worker.connection not in ready and worker.process.is_alive() and not timed_out:
                         continue
                     index, job = worker.index, worker.job
                     try:
+                        if timed_out:
+                            job_timeouts += 1
+                            raise TimeoutError(f"paper exceeded the {job_timeout:g}s time limit; worker stopped")
                         if worker.connection not in ready:
                             raise ChildProcessError(f"Process exited, exitcode={worker.process.exitcode}")
                         kind, result, rss = worker.connection.recv()
@@ -433,7 +448,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
         try:
             emit("parallel_summary", total_jobs=total, pending=None if total is None else total - submitted,
                  peak_workers=peak_workers, peak_in_flight=peak_in_flight,
-                 worker_errors=worker_errors, ram_wait_sec=waited, stopped_reason=reason,
+                 worker_errors=worker_errors, job_timeouts=job_timeouts, ram_wait_sec=waited, stopped_reason=reason,
                  memory_estimate_gb=estimate / _GB, reserve_ram_gb=reserve,
                  cpu_cap=cpu_cap, worker_cap=cap)
         except Exception:
