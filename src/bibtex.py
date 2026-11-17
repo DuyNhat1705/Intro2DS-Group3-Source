@@ -102,10 +102,17 @@ def extract_bibtex(
                     if selected is None:
                         raise BibliographyParseError(f"{path}: bibliography not found: {name}")
                     bib_files.append(selected)
+    # pyparsing may retain exception frames used in normal parser control flow.
+    # Do not let those frames keep the caller's GatherTex/source map alive.
+    compilation_path = None
     entries = []
-    for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
-        entries.extend(_parse_bib_file(bib_path, arxiv_id))
-    entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
+    try:
+        for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
+            entries.extend(_parse_bib_file(bib_path, arxiv_id))
+        entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
+    finally:
+        source = bib_files = None
+        sources = text = match = None
     return entries
 
 

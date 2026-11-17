@@ -1,12 +1,14 @@
 """Chạy parser theo bài, lưu checkpoint và xuất số liệu cho notebook parser."""
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from contextlib import closing
 from datetime import datetime, timezone
 import csv
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import logging
 import math
@@ -24,34 +26,31 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .parser_pipeline import parse_publication
+from .parser_storage import (OUTPUT_FILES as _OUTPUT_FILES, atomic_json as _atomic_json, file_signature as _file_signature,
+    output_manifest as _output_manifest, paper_name as _paper_name, persist_result,
+    table_schemas, validate_receipt, write_tables as _write_tables)
+from .utils import walk_files as _walk_files
+
+_PAPER_REPORT_COLUMNS = [
+    "arxiv_id", "status", "paper_success", "versions_expected", "versions_ok", "versions_empty",
+    "versions_partial", "versions_error", "elements_before", "elements_after", "bibtex_before",
+    "bibtex_after", "elapsed_sec", "reused",
+]
+_VERSION_REPORT_COLUMNS = ["arxiv_id", "version", "status", "message"]
+
+# Checkpoints from the preceding parser release (pinned dependencies, LF/CRLF).
+# Only accept this migration while the parsing code matches the reviewed version.
+_LEGACY_CODE_SIGNATURES = (
+    "54dc4b342ebda0d75900f1174523365513a9c67c0a1bcf7c790a774b644e026a",
+    "e8c7468a29aaf18865e88d25f20e4edf215f830a9af6860ddc207ee0f320325c",
+)
+_LEGACY_COMPATIBLE_PARSER = "968da39ebccc8b694e15763b724b9ece672091cdb058422379790cccb85cb8da"
+# Version-2 checkpoints from the preceding, semantically equivalent parser.
+_COMPATIBLE_CODE_SIGNATURES = ("a6bf50c658e5d2d8470b94125f00d1c8eb147f84ceaad0a3cd8c80097d5e1c58",)
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
-
-
-def table_schemas():
-    """Schema tường minh, kể cả khi bảng không có dòng nào."""
-    text = pa.string()
-    kind = pa.dictionary(pa.int32(), text)
-    return {
-        "elements": pa.schema([pa.field("element_id", text, False), pa.field("arxiv_id", text, False),
-                               pa.field("kind", kind), pa.field("content", text)]),
-        "hierarchy": pa.schema([pa.field("arxiv_id", text, False), pa.field("version", pa.int32()),
-                                pa.field("element_id", text, False), pa.field("parent_id", text, False)]),
-        "bibtex": pa.schema([pa.field("arxiv_id", text, False), pa.field("citation_key", text, False),
-                             pa.field("entry_type", kind), pa.field("title", text),
-                             pa.field("authors", pa.list_(text)), pa.field("year", pa.int32()),
-                             pa.field("doi", text), pa.field("journal", text), pa.field("url", text)]),
-    }
-
-
-def _atomic_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
 
 
 def _append_jsonl(path, value):
@@ -72,23 +71,17 @@ def _read_jsonl(path):
     return rows
 
 
-def _paper_name(arxiv_id):
-    return re.sub(r"[^A-Za-z0-9_-]", "-", arxiv_id) + "-" + hashlib.sha256(arxiv_id.encode()).hexdigest()[:8]
-
-
-def _file_signature(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _code_signature():
+    """Fingerprint parsing semantics; reporting/scheduling edits do not invalidate data."""
     digest = hashlib.sha256()
-    for name in ("parser_pipeline.py", "parser_reporting.py", "parser_parallel.py", "gather_clean_tex.py", "hierarchy.py",
-                 "bibtex.py", "m2_types.py", "utils.py"):
-        digest.update(Path(__file__).with_name(name).read_bytes())
+    for name in ("parser_pipeline.py", "gather_clean_tex.py", "hierarchy.py", "bibtex.py", "m2_types.py", "utils.py"):
+        tree = ast.parse(Path(__file__).with_name(name).read_text(encoding="utf-8-sig"))
+        if name == "parser_pipeline.py":
+            # Discovery is represented in each job's metadata, versions and errors.
+            discovery = {"_arxiv_id", "_version", "_read_json", "_expected", "_state_paths", "discover_publications"}
+            tree.body = [node for node in tree.body if getattr(node, "name", None) not in discovery]
+        digest.update(ast.dump(tree, include_attributes=False).encode())
+    digest.update(ast.dump(ast.parse(inspect.getsource(table_schemas)), include_attributes=False).encode())
     for name in ("bibtexparser", "wtpsplit", "onnxruntime", "pyarrow"):
         try:
             digest.update(f"{name}={importlib.metadata.version(name)}".encode())
@@ -98,7 +91,7 @@ def _code_signature():
 
 
 def input_signature(job, options):
-    """Băm nội dung nguồn; không bỏ sót thay đổi chỉ vì kích thước bằng nhau."""
+    """Chữ ký nội dung theo định dạng cũ, chỉ dùng khi chuyển checkpoint cũ."""
     digest = hashlib.sha256(json.dumps({"arxiv_id": job["arxiv_id"], "metadata": job.get("metadata", {}),
         "versions": {str(v): str(p) for v, p in job["version_dirs"].items()},
         "source_status": job.get("source_status_by_version", {}),
@@ -115,17 +108,114 @@ def input_signature(job, options):
     return digest.hexdigest()
 
 
+def _stat_info(stat):
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _source_manifest(job):
+    """Inventory version files, including .bbl and extensionless TeX inputs."""
+    files = {}
+    if job.get("paper_dir") is not None:
+        metadata = Path(job["paper_dir"]) / "metadata.json"
+        if metadata.is_file():
+            files["paper/metadata.json"] = _stat_info(metadata.stat())
+    for version, directory in sorted(job["version_dirs"].items()):
+        if directory is None or not Path(directory).is_dir():
+            continue
+        directory = Path(directory)
+        for path, stat in _walk_files(directory):
+            files[f"{version}/{path.relative_to(directory).as_posix()}"] = _stat_info(stat)
+    return files
+
+
+def _input_context(job, options):
+    return json.dumps({"arxiv_id": job["arxiv_id"], "metadata": job.get("metadata", {}),
+        "versions": {str(v): str(p) for v, p in job["version_dirs"].items()},
+        "source_status": job.get("source_status_by_version", {}),
+        "errors": job.get("discovery_errors", []), "options": options}, sort_keys=True)
+
+
+def _source_signature(job, context, manifest):
+    digest = hashlib.sha256(context.encode())
+    for name in sorted(manifest):
+        version, relative = name.split("/", 1)
+        directory = job["paper_dir"] if version == "paper" else job["version_dirs"][int(version)]
+        path = Path(directory) / relative
+        digest.update(json.dumps([name, manifest[name]["size"]]).encode())
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def _parquet_rows(path):
+    # Close readers explicitly before a later run replaces a Parquet file on Windows.
+    with pq.ParquetFile(path) as source:
+        return source.metadata.num_rows
+
+
+def _prepare_checkpoint(job, partition, stamp, options, *, resume, validation, retry_partial):
+    context = _input_context(job, options)
+    context_signature = hashlib.sha256(context.encode()).hexdigest()
+    manifest = _source_manifest(job)
+    record = None
+    if resume:
+        try:
+            candidate = json.loads(stamp.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                record = candidate
+        except (OSError, ValueError):
+            pass
+    original = json.dumps(record, sort_keys=True) if record is not None else None
+    migrated = False
+    if (validation == "fast" and record is not None
+            and record.get("input_context") == context_signature
+            and record.get("input_manifest") == manifest
+            and isinstance(record.get("signature"), str)):
+        signature = record["signature"]
+    else:
+        signature = _source_signature(job, context, manifest)
+        compatible = record is not None and options["code_signature"] == _LEGACY_COMPATIBLE_PARSER
+        if compatible and "input_context" in record:
+            for prior_code in _COMPATIBLE_CODE_SIGNATURES:
+                prior_context = _input_context(job, {**options, "code_signature": prior_code})
+                if (hashlib.sha256(prior_context.encode()).hexdigest() == record["input_context"]
+                        and _source_signature(job, prior_context, manifest) == record.get("signature")):
+                    record["signature"] = signature
+                    migrated = True
+                    break
+        if (compatible and "input_context" not in record
+                and all(name == "paper/metadata.json" or Path(name).suffix.lower() in {".tex", ".bib"}
+                        for name in manifest)):
+            # A one-time full source/output validation upgrades old checkpoints.
+            # Never migrate legacy inputs such as .bbl that the old hash ignored.
+            for legacy_code in _LEGACY_CODE_SIGNATURES:
+                if input_signature(job, {**options, "code_signature": legacy_code}) == record.get("signature"):
+                    record["signature"] = signature
+                    migrated = True
+                    break
+    record = _checkpoint(stamp, partition, signature, record=record,
+                         validation="full" if migrated else validation,
+                         retry_partial=retry_partial) if record is not None else None
+    if record is not None:
+        record.update(input_context=context_signature, input_manifest=manifest)
+        if json.dumps(record, sort_keys=True) != original:
+            _atomic_json(stamp, record)
+    return signature, context_signature, manifest, record
+
+
 class _Monitor:
-    """Ghi mẫu RSS xuống đĩa ngay, không giữ chuỗi mẫu trong RAM."""
+    """Keep peak RSS in memory; write individual samples only in debug mode."""
     def __init__(self, path, run_id, worker, interval):
-        self.path, self.run_id, self.worker = Path(path), run_id, worker
+        self.path = Path(path) if path is not None else None
+        self.run_id, self.worker = run_id, worker
         self.interval = max(0.05, interval)
         self.phase = "initializing"
         self.stop = threading.Event()
         self.peak, self.total, self.count = 0, 0, 0
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
-    def _sample(self, writer, stream):
+    def _sample(self, writer=None, stream=None):
         rss = 0
         process = psutil.Process()
         for item in [process, *process.children(recursive=True)]:
@@ -136,11 +226,17 @@ class _Monitor:
         self.peak = max(self.peak, rss)
         self.total += rss
         self.count += 1
-        writer.writerow({"timestamp": utc_now(), "run_id": self.run_id, "worker": self.worker,
-                         "phase": self.phase, "rss_bytes": rss})
-        stream.flush()
+        if writer is not None:
+            writer.writerow({"timestamp": utc_now(), "run_id": self.run_id, "worker": self.worker,
+                             "phase": self.phase, "rss_bytes": rss})
+            stream.flush()
 
     def _loop(self):
+        if self.path is None:
+            self._sample()
+            while not self.stop.wait(self.interval):
+                self._sample()
+            return
         with self.path.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=["timestamp", "run_id", "worker", "phase", "rss_bytes"])
             writer.writeheader()
@@ -155,18 +251,14 @@ class _Monitor:
     def __exit__(self, *args):
         self.stop.set()
         self.thread.join()
+        self._sample()
 
 
 def _disk_snapshot(root, logs, run_id, worker):
     started = time.perf_counter()
     size = 0
-    for path in root.rglob("*"):
-        try:
-            if path.is_file():
-                size += path.stat().st_size
-        except FileNotFoundError:
-            # Worker khác có thể vừa đổi tên tệp tạm khi đo dung lượng chung.
-            continue
+    for path, stat in _walk_files(root, ignore_missing=True):
+        size += stat.st_size
     row = {"timestamp": utc_now(), "run_id": run_id, "worker": worker,
            "output_bytes": size, "scan_sec": time.perf_counter() - started}
     path = logs / f"disk_{run_id}.csv"
@@ -179,43 +271,41 @@ def _disk_snapshot(root, logs, run_id, worker):
     return row
 
 
-def _write_tables(partition, result, schemas):
-    partition.mkdir(parents=True, exist_ok=True)
-    for name, schema in schemas.items():
-        temporary = partition / f"{name}.parquet.tmp"
-        pq.write_table(pa.Table.from_pylist(result[name], schema=schema), temporary, compression="zstd")
-        os.replace(temporary, partition / f"{name}.parquet")
-    _atomic_json(partition / "key_map.json", result.get("key_map", {}))
-    for name, rows in (("bibtex_debug", result.get("bibtex_debug", [])), ("warnings", result.get("warnings", []))):
-        temporary = partition / f"{name}.jsonl.tmp"
-        with temporary.open("w", encoding="utf-8") as stream:
-            for row in rows:
-                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-        os.replace(temporary, partition / f"{name}.jsonl")
-
-
-def _checkpoint(state, partition, signature):
+def _checkpoint(state, partition, signature, *, record=None, validation="full", retry_partial=False):
     try:
-        record = json.loads(state.read_text(encoding="utf-8"))
-        if record["signature"] != signature or record["stats"]["status"] not in {"ok", "empty"}:
+        if record is None:
+            record = json.loads(state.read_text(encoding="utf-8"))
+        accepted = {"ok", "empty"} if retry_partial else {"ok", "empty", "partial"}
+        if record["signature"] != signature or record["stats"]["status"] not in accepted:
             return None
-        for filename in ("elements.parquet", "hierarchy.parquet", "bibtex.parquet", "key_map.json", "bibtex_debug.jsonl", "warnings.jsonl"):
-            if _file_signature(partition / filename) != record["file_signatures"][filename]:
-                return None
-        for name in table_schemas():
-            metadata = pq.read_metadata(partition / f"{name}.parquet")
-            if metadata.num_rows != record["table_counts"][name]:
-                return None
-        if not (partition / "key_map.json").exists() or not (partition / "bibtex_debug.jsonl").exists():
-            return None
+        manifest = _output_manifest(partition)
+        if validation != "fast" or record.get("output_manifest") != manifest:
+            for filename in _OUTPUT_FILES:
+                if _file_signature(partition / filename) != record["file_signatures"][filename]:
+                    return None
+            for name in table_schemas():
+                if _parquet_rows(partition / f"{name}.parquet") != record["table_counts"][name]:
+                    return None
+        record["output_manifest"] = manifest
         record["partition"] = str(partition)
         return record
-    except (OSError, ValueError, KeyError, pa.ArrowException):
+    except (OSError, ValueError, KeyError, TypeError, pa.ArrowException):
         return None
 
 
-def _combine_tables(records, tables, schemas):
+def _combine_tables(records, tables, schemas, *, cache_state=None, validation="full"):
     """Ghép từng batch, không nạp toàn bộ corpus vào RAM."""
+    identity = hashlib.sha256(json.dumps([
+        [record["stats"]["arxiv_id"], {name: record["file_signatures"][f"{name}.parquet"] for name in schemas}]
+        for record in records], sort_keys=True).encode()).hexdigest()
+    if cache_state is not None and validation == "fast":
+        try:
+            cached = json.loads(cache_state.read_text(encoding="utf-8"))
+            if cached["signature"] == identity and cached["files"] == {
+                    name: _stat_info((tables / f"{name}.parquet").stat()) for name in schemas}:
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     for name, schema in schemas.items():
         temporary = tables / f"{name}.parquet.tmp"
         with pq.ParquetWriter(temporary, schema, compression="zstd") as writer:
@@ -224,10 +314,14 @@ def _combine_tables(records, tables, schemas):
                     for batch in source.iter_batches(batch_size=8192):
                         writer.write_table(pa.Table.from_batches([batch]).cast(schema))
         os.replace(temporary, tables / f"{name}.parquet")
+    if cache_state is not None:
+        _atomic_json(cache_state, {"signature": identity, "files": {
+            name: _stat_info((tables / f"{name}.parquet").stat()) for name in schemas}})
+    return False
 
 
-def _export_csv(path, rows, columns):
-    frame = pd.DataFrame(rows)
+def _export_csv(path, rows, columns, *, include_extra=True):
+    frame = pd.DataFrame(rows) if include_extra else pd.DataFrame(rows, columns=columns)
     for column in columns:
         if column not in frame:
             frame[column] = pd.Series(dtype="object")
@@ -235,7 +329,75 @@ def _export_csv(path, rows, columns):
     return frame
 
 
+def _core_stats(paper):
+    total = lambda name: int(pd.to_numeric(paper[name], errors="coerce").sum())
+    times = pd.to_numeric(paper.elapsed_sec, errors="coerce").dropna()
+    summary = {
+        "target_ids": len(paper), "papers_success": int(paper.paper_success.fillna(False).sum()),
+        "success_rate": float(paper.paper_success.fillna(False).mean()) if len(paper) else 0.0,
+        "statuses": dict(Counter(paper.status)),
+        "versions": {name: total(name) for name in
+                     ("versions_expected", "versions_ok", "versions_empty", "versions_partial", "versions_error")},
+        "average_parse_sec": float(times.mean()) if len(times) else None,
+    }
+    for name in ("elements", "bibtex"):
+        before, after = total(f"{name}_before"), total(f"{name}_after")
+        summary.update({f"{name}_before": before, f"{name}_after": after,
+                        f"{name}_reduction_ratio": (before - after) / before if before else 0.0})
+    return summary
+
+
+def _report_run(run, debug_reports):
+    if debug_reports:
+        return run
+    return {key: run[key] for key in (
+        "run_id", "worker", "started_at", "ended_at", "duration_sec", "stop_reason",
+        "papers_processed", "papers_reused", "remaining", "peak_rss_bytes", "machine", "error",
+    ) if key in run}
+
+
 def _exports(reports, logs, records, pending, ranges, run, config, tables):
+    if config.get("debug_reports", False):
+        summary = _debug_exports(reports, logs, records, pending, ranges, run, config, tables)
+        summary["report_mode"] = "debug"
+        times = [record["stats"]["elapsed_sec"] for record in records]
+        summary["average_parse_sec"] = sum(times) / len(times) if times else None
+        return summary
+    rows = [{**record["stats"], "reused": record["reused"], "current_run_sec": record["current_run_sec"]}
+            for record in records]
+    rows.extend({"arxiv_id": job["arxiv_id"], "status": "pending", "paper_success": False,
+                 "versions_expected": len(job["version_dirs"]), "reused": False, "current_run_sec": 0,
+                 "message": "Not processed in this run"} for job in pending)
+    paper = _export_csv(reports / "per_paper.csv", rows, _PAPER_REPORT_COLUMNS, include_extra=False)
+    versions = [row for record in records for row in record["version_status"]]
+    versions.extend({"arxiv_id": job["arxiv_id"], "version": version, "status": "pending",
+                     "message": "Not processed in this run"}
+                    for job in pending for version in job["version_dirs"])
+    _export_csv(reports / "per_version.csv", versions, _VERSION_REPORT_COLUMNS, include_extra=False)
+    summary = {"report_mode": "minimal", "exported_at": utc_now(),
+        "scope": {key: value for key, value in config.items() if key not in {"target_ids", "ranges"}},
+        "run": _report_run(run, False), **_core_stats(paper),
+        "table_bytes": sum((tables / f"{name}.parquet").stat().st_size for name in table_schemas()),
+        "table_rows": {name: sum(record["table_counts"][name] for record in records) for name in table_schemas()},
+        "measurement_note": "duration_sec is current-run wall time; average_parse_sec is the mean saved/performed "
+                            "per-paper parse time, including cached results. Final benchmark: Colab CPU, resume=False. "
+                            "peak_rss_bytes is sampled Python+child RSS. table_bytes counts the three dataset tables."}
+    _atomic_json(reports / "summary_stats.json", summary)
+    (reports / "README.md").write_text(
+        "# Milestone 2 report\n\n"
+        "- per_paper.csv: success, version coverage, element/reference counts before/after deduplication, and parse time.\n"
+        "- per_version.csv: each version's status, including empty, partial, error, and pending.\n"
+        "- summary_stats.json: totals, average parse time, current-run wall time, peak RAM, and final dataset size.\n"
+        "- Reused partial results remain incomplete. Saved parse times are distinct from current resume wall time.\n"
+        "- table_bytes counts only the three dataset tables; checkpoints and logs are working files.\n"
+        "- Detailed diagnostics stay in tables/<worker>/papers/<ID>/warnings.jsonl.\n"
+        "- Set DEBUG_REPORTS=True to export warning/range/category summaries and monitor/timing histories.\n"
+        "- Optional reports left by older runs are not part of this minimal export.\n",
+        encoding="utf-8")
+    return summary
+
+
+def _debug_exports(reports, logs, records, pending, ranges, run, config, tables):
     rows = [{**record["stats"], "range": record["range"], "reused": record["reused"],
              "current_run_sec": record["current_run_sec"]} for record in records]
     for job in pending:
@@ -313,7 +475,7 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
         "bibtex_reduction_ratio": (bib_before - bib_after) / bib_before if bib_before else 0.0,
         "input_bytes": total("input_bytes"),
         "table_bytes": sum((tables / f"{name}.parquet").stat().st_size for name in table_schemas()),
-        "table_rows": {name: pq.read_metadata(tables / f"{name}.parquet").num_rows for name in table_schemas()},
+        "table_rows": {name: _parquet_rows(tables / f"{name}.parquet") for name in table_schemas()},
         "recorded_parse_sec": float(pd.to_numeric(paper.elapsed_sec, errors="coerce").sum()),
         "current_run_processing_sec": float(paper.current_run_sec.sum()),
         "diagnostics": {"total": total("warnings_count"), "blocking": total("blocking_warning_count"),
@@ -335,22 +497,44 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
         "- range_stats.csv, ranges.csv: statistics and definitions for ID ranges. category_counts.csv uses the first category.\n"
         "- runs.csv: worker run history; monitor.csv: mean/maximum RSS per minute; disk.csv: output snapshots and scan durations.\n"
         "- The three combined Parquet tables are in tables/<worker>/; per-paper partitions are in papers/. Combined tables and partitions contain overlapping data and should not be counted as separate scientific datasets.\n"
-        "- partial does not count as full success; tables may contain partially parsed data. Check per_version.csv before use.\n"
+        "- partial does not count as full success; valid partial checkpoints are reused unless retry_partial=True. Check per_version.csv before use.\n"
         "- reused=True: a valid checkpoint was reused; elapsed_sec is the saved parsing time, and current_run_sec is the time spent in the current run.\n"
+        "- checkpoint_validation=fast compares size/mtime before falling back to hashes on changes; full always hashes source/output content.\n"
         "- Raw runs/timings/events logs and monitor/disk samples are in run_logs/<worker>/.\n",
         encoding="utf-8")
     return summary
 
 
 def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, fuzzy_threshold=0.92,
-               resume=True, max_run_hours=None, monitor_interval=1.0, disk_every=100, progress=None,
+               resume=True, max_run_hours=None, monitor_interval=1.0, disk_every=None, progress=None,
                num_workers=1, max_workers=None, adaptive_ram=True, reserve_ram_gb=None,
-               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60):
-    """Trả thống kê và đường dẫn; không giữ các bảng element toàn corpus trong RAM."""
+               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60, retry_partial=False,
+               checkpoint_validation="fast", checkpoint_progress=None, debug_reports=False,
+               sentence_cache_mb=4):
+    """Resume cả partial hợp lệ; mặc định chỉ xuất các thống kê yêu cầu.
+
+    fast kiểm tra size/mtime, chỉ đọc nội dung khi tệp đổi hoặc checkpoint cũ.
+    full luôn kiểm tra hash, phát hiện cả thay đổi giữ nguyên size/mtime.
+    retry_partial=True chạy lại partial dù nguồn không đổi; error vẫn được thử lại.
+    debug_reports=True bật báo cáo chi tiết, lịch sử monitor/timing và quét đĩa.
+    """
     if not re.fullmatch(r"[A-Za-z0-9_+-]+", worker):
         raise ValueError("Worker name may contain only letters, digits, _, +, and -")
-    if not 0 <= fuzzy_threshold <= 1 or disk_every < 1 or monitor_interval <= 0:
+    if (not 0 <= fuzzy_threshold <= 1 or monitor_interval <= 0
+            or (disk_every is not None and (type(disk_every) is not int or disk_every < 1))):
         raise ValueError("Invalid threshold or measurement interval configuration")
+    if type(retry_partial) is not bool or type(resume) is not bool:
+        raise ValueError("resume and retry_partial must be booleans")
+    if type(debug_reports) is not bool:
+        raise ValueError("debug_reports must be a boolean")
+    if (isinstance(sentence_cache_mb, bool) or not isinstance(sentence_cache_mb, (int, float))
+            or not math.isfinite(sentence_cache_mb) or sentence_cache_mb < 0):
+        raise ValueError("sentence_cache_mb must be a finite nonnegative number")
+    sentence_cache_bytes = int(sentence_cache_mb * 1024 ** 2)
+    if checkpoint_validation not in {"fast", "full"}:
+        raise ValueError("checkpoint_validation must be 'fast' or 'full'")
+    if checkpoint_progress is not None and not callable(checkpoint_progress):
+        raise ValueError("checkpoint_progress must be callable")
     if max_run_hours is not None and max_run_hours <= 0:
         raise ValueError("Time limit must be positive")
     if num_workers != "auto" and (type(num_workers) is not int or num_workers < 1):
@@ -375,7 +559,7 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
     for directory in (tables, reports, logs, state):
         directory.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(f"parser.{uuid.uuid4().hex}")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO if debug_reports else logging.WARNING)
     logger.propagate = False
     handler = logging.FileHandler(logs / "parser.log", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -387,101 +571,133 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
               "disk_every": disk_every, "target_ids": [job["arxiv_id"] for job in jobs],
               "ranges": ranges or {}, "num_workers": num_workers, "max_workers": max_workers,
               "adaptive_ram": adaptive_ram, "reserve_ram_gb": reserve_ram_gb,
-              "ram_per_worker_gb": ram_per_worker_gb, "ram_wait_timeout_sec": ram_wait_timeout_sec}
+              "ram_per_worker_gb": ram_per_worker_gb, "ram_wait_timeout_sec": ram_wait_timeout_sec,
+              "retry_partial": retry_partial, "checkpoint_validation": checkpoint_validation,
+              "debug_reports": debug_reports, "sentence_cache_mb": sentence_cache_mb}
+    if not debug_reports:
+        config.pop("target_ids")
+        config.pop("ranges")
     run = {"run_id": run_id, "worker": worker, "started_at": utc_now(), "event": "start", "config": config,
            "target_ids": len(jobs), "remaining_at_start": None, "papers_processed": 0, "papers_reused": 0,
+           "partials_reused": 0,
            "machine": {"python": platform.python_version(), "platform": platform.platform(),
                        "cpu_count": os.cpu_count(), "ram_total_bytes": psutil.virtual_memory().total}}
     _append_jsonl(logs / "runs.jsonl", run)
     records = []
     completed_ids = set()
+    summary = None
     started = time.perf_counter()
     stop_reason = "completed"
     schemas = table_schemas()
-    monitor = _Monitor(logs / f"monitor_{run_id}.csv", run_id, worker, monitor_interval)
+    monitor = _Monitor(logs / f"monitor_{run_id}.csv" if debug_reports else None, run_id, worker, monitor_interval)
 
     def parallel_event(event):
-        _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id, "worker": worker, **event})
-        logger.info("Parallel scheduling: %s", json.dumps(event, ensure_ascii=False))
+        if debug_reports:
+            _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id, "worker": worker, **event})
+            logger.info("Parallel scheduling: %s", json.dumps(event, ensure_ascii=False))
         run["parallel"] = {**run.get("parallel", {}), **event}
 
     def save_result(prepared_item, result=None, paper_started=None):
         """Chỉ tiến trình chính ghi bảng/checkpoint và gọi callback tiến độ."""
-        job, partition, stamp, signature, record = prepared_item
+        job, partition, stamp, signature, context, manifest, record = prepared_item
         reused = record is not None
         write_started = time.perf_counter()
+        remote_write_sec = 0
         if not reused:
-            _write_tables(partition, result, schemas)
-            for stage in ("input", "gather", "cleanup", "construct_hierarchy", "extract_bibtex",
-                          "unify_publication", "rewrite_citations", "build_element_tables"):
-                timings = [row for row in result.get("timings", []) if row["stage"] == stage]
-                result["stats"][f"{stage}_sec"] = sum(row["duration_sec"] for row in timings)
-                statuses = {row["status"] for row in timings}
-                result["stats"][f"{stage}_status"] = next((value for value in
-                    ("error", "missing_dir", "not_found", "partial", "ok", "empty") if value in statuses), "not_run")
-            result["stats"]["output_table_bytes"] = sum((partition / f"{name}.parquet").stat().st_size for name in schemas)
+            if result.get("_partition_receipt") is not True:
+                result = persist_result(partition, result, debug_reports=debug_reports, consume=True)
+            else:
+                remote_write_sec = result.get("write_sec", 0)
+            validate_receipt(result, partition, job["arxiv_id"])
             record = {"signature": signature, "stats": result["stats"],
                       "version_status": result["version_status"], "partition": str(partition),
-                      "table_counts": {name: len(result[name]) for name in schemas},
-                      "file_signatures": {filename: _file_signature(partition / filename) for filename in
-                          ("elements.parquet", "hierarchy.parquet", "bibtex.parquet", "key_map.json", "bibtex_debug.jsonl", "warnings.jsonl")}}
+                      "input_context": context, "input_manifest": manifest,
+                      "output_manifest": result["output_manifest"],
+                      "table_counts": result["table_counts"], "file_signatures": result["file_signatures"]}
             _atomic_json(stamp, record)
-            for timing in result.get("timings", []):
+            for timing in result.get("timings", []) if debug_reports else ():
                 _append_jsonl(logs / "timings.jsonl", {"run_id": run_id, "worker": worker,
                     "arxiv_id": job["arxiv_id"], **timing})
             run["papers_processed"] += 1
         else:
             run["papers_reused"] += 1
+            run["partials_reused"] += int(record["stats"]["status"] == "partial")
         duration = (time.perf_counter() - paper_started if paper_started is not None else
-                    time.perf_counter() - write_started + (0 if reused else record["stats"]["elapsed_sec"]))
-        record.update(range=job.get("range", "local"), reused=reused, current_run_sec=duration)
-        records.append(record)
+                    time.perf_counter() - write_started + (0 if reused else record["stats"]["elapsed_sec"] + remote_write_sec))
+        # Source/output manifests belong on disk, not in every in-memory report row.
+        report_record = {key: record[key] for key in ("stats", "version_status", "partition", "table_counts", "file_signatures")}
+        report_record.update(range=job.get("range", "local"), reused=reused, current_run_sec=duration)
+        records.append(report_record)
         completed_ids.add(job["arxiv_id"])
         logger.info("%s: %s; reused=%s; %s", job["arxiv_id"], record["stats"]["status"], reused,
                     record["stats"].get("message", ""))
-        _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
-            "arxiv_id": job["arxiv_id"], "status": record["stats"]["status"], "reused": reused,
-            "message": record["stats"].get("message", "")})
+        if debug_reports:
+            _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
+                "arxiv_id": job["arxiv_id"], "status": record["stats"]["status"], "reused": reused,
+                "message": record["stats"].get("message", "")})
         if progress:
             progress(len(records), len(jobs), record["stats"])
-        if len(records) % disk_every == 0:
+        if debug_reports and disk_every is not None and len(records) % disk_every == 0:
             _disk_snapshot(root, logs, run_id, worker)
 
     def combine_completed():
         order = {job["arxiv_id"]: index for index, job in enumerate(jobs)}
         records.sort(key=lambda record: order[record["stats"]["arxiv_id"]])
-        _combine_tables(records, tables, schemas)
+        run["combined_tables_reused"] = _combine_tables(records, tables, schemas,
+            cache_state=state / "_combined_tables.json", validation=checkpoint_validation)
+
+    def worker_job(item):
+        job, _, _, _, _, manifest, _ = item
+        return {**job, "_source_manifest": manifest} if manifest is not None else job
     try:
         with monitor:
-            _disk_snapshot(root, logs, run_id, worker)
+            if debug_reports and disk_every is not None:
+                _disk_snapshot(root, logs, run_id, worker)
             # Kiểm tra cache trước để số việc còn lại lúc bắt đầu có ý nghĩa.
             prepared = []
             monitor.phase = "checking_checkpoints"
-            for job in jobs:
+            checking_started = time.perf_counter()
+            reused_count = 0
+            for checked, job in enumerate(jobs, 1):
+                if max_run_hours is not None and time.perf_counter() - started >= max_run_hours * 3600:
+                    stop_reason = "time_limit"
+                    break
                 partition = tables / "papers" / _paper_name(job["arxiv_id"])
                 stamp = state / f"{_paper_name(job['arxiv_id'])}.json"
                 try:
-                    signature = input_signature(job, options)
+                    signature, context, manifest, record = _prepare_checkpoint(job, partition, stamp, options,
+                        resume=resume, validation=checkpoint_validation, retry_partial=retry_partial)
                 except OSError as exc:
                     # Vẫn để parser ghi lỗi riêng của bài; không dùng checkpoint.
                     signature = uuid.uuid4().hex
+                    context, manifest, record = None, None, None
                     logger.warning("Could not hash sources for %s: %s", job["arxiv_id"], exc)
-                record = _checkpoint(stamp, partition, signature) if resume else None
-                prepared.append((job, partition, stamp, signature, record))
-            run["remaining_at_start"] = sum(record is None for _, _, _, _, record in prepared)
-            _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
-                          "status": "checkpoint_checked", "remaining_at_start": run["remaining_at_start"]})
+                prepared.append((job, partition, stamp, signature, context, manifest, record))
+                reused_count += int(record is not None)
+                if checkpoint_progress:
+                    checkpoint_progress(checked, len(jobs), reused_count)
+            run["checkpoint_check_sec"] = time.perf_counter() - checking_started
+            run["checkpoint_checked"] = len(prepared)
+            run["remaining_at_start"] = len(jobs) - reused_count
+            if debug_reports:
+                _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
+                              "status": "checkpoint_checked", "remaining_at_start": run["remaining_at_start"]})
             if num_workers == 1:
-                for item in prepared:
-                    if max_run_hours is not None and time.perf_counter() - started >= max_run_hours * 3600:
+                for index, item in enumerate(prepared):
+                    if (item[-1] is None and max_run_hours is not None
+                            and time.perf_counter() - started >= max_run_hours * 3600):
                         stop_reason = "time_limit"
                         break
                     paper_started = time.perf_counter()
-                    job, _, _, _, record = item
+                    job, record = item[0], item[-1]
                     monitor.phase = job["arxiv_id"]
-                    result = parse_publication(job, enrich=enrich, fuzzy_threshold=fuzzy_threshold) if record is None else None
+                    result = parse_publication(worker_job(item), enrich=enrich, fuzzy_threshold=fuzzy_threshold,
+                        sentence_cache_bytes=sentence_cache_bytes) if record is None else None
                     save_result(item, result, paper_started)
-                    del result
+                    prepared[index] = None
+                    del result, item
+                prepared.clear()
+                item = record = None
             else:
                 from .parser_parallel import iter_parallel_results
                 pending_items = []
@@ -490,20 +706,31 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
                         save_result(item)
                     else:
                         pending_items.append(item)
+                prepared.clear()
+                item = None
                 deadline = started + max_run_hours * 3600 if max_run_hours is not None else None
                 monitor.phase = "parallel_parsing"
-                with closing(iter_parallel_results([item[0] for item in pending_items],
+                with closing(iter_parallel_results((worker_job(item) for item in pending_items),
                         num_workers=num_workers, max_workers=max_workers, adaptive_ram=adaptive_ram,
                         reserve_ram_gb=reserve_ram_gb, ram_per_worker_gb=ram_per_worker_gb,
                         ram_wait_timeout_sec=ram_wait_timeout_sec, enrich=enrich,
-                        fuzzy_threshold=fuzzy_threshold, deadline=deadline, on_event=parallel_event)) as results:
+                        fuzzy_threshold=fuzzy_threshold, deadline=deadline, on_event=parallel_event,
+                        sentence_cache_bytes=sentence_cache_bytes, result_dir=tables / "papers",
+                        debug_reports=debug_reports)) as results:
                     for index, result in results:
                         save_result(pending_items[index], result)
+                        pending_items[index] = None
                         del result
                 if len(records) < len(jobs) and deadline is not None and time.perf_counter() >= deadline:
                     stop_reason = "time_limit"
+                pending_items.clear()
             monitor.phase = "exporting_tables"
             combine_completed()
+            if not debug_reports:
+                run.update(ended_at=utc_now(), duration_sec=time.perf_counter() - started,
+                           stop_reason=stop_reason, peak_rss_bytes=monitor.peak, remaining=len(jobs) - len(records))
+                summary = _exports(reports, logs, records,
+                    [job for job in jobs if job["arxiv_id"] not in completed_ids], ranges or {}, run, config, tables)
     except KeyboardInterrupt:
         stop_reason = "interrupted"
         combine_completed()
@@ -522,18 +749,68 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         _append_jsonl(logs / "runs.jsonl", run)
         handler.close()
         logger.removeHandler(handler)
-    summary = _exports(reports, logs, records, [job for job in jobs if job["arxiv_id"] not in completed_ids],
-                       ranges or {}, run, config, tables)
-    snapshot = _disk_snapshot(root, logs, run_id, worker)
-    summary["output_snapshot"] = snapshot
+    if summary is None:
+        summary = _exports(reports, logs, records, [job for job in jobs if job["arxiv_id"] not in completed_ids],
+                           ranges or {}, run, config, tables)
+    if debug_reports:
+        summary["output_snapshot"] = _disk_snapshot(root, logs, run_id, worker)
+        # Full history export is only requested in debug mode.
+        pd.concat([pd.read_csv(p) for p in sorted(logs.glob("disk_*.csv"))], ignore_index=True).to_csv(reports / "disk.csv", index=False)
+    summary["run"] = _report_run(run, debug_reports)
     _atomic_json(reports / "summary_stats.json", summary)
-    # Đồng bộ ảnh chụp cuối vào CSV báo cáo.
-    pd.concat([pd.read_csv(p) for p in sorted(logs.glob("disk_*.csv"))], ignore_index=True).to_csv(reports / "disk.csv", index=False)
     return {"summary": summary, "reports_dir": str(reports), "tables_dir": str(tables), "logs_dir": str(logs),
             "tables": {name: str(tables / f"{name}.parquet") for name in schemas}}
 
 
-def combine_worker_reports(output_dir):
+def combine_worker_reports(output_dir, *, debug_reports=False):
+    """Combine required statistics only; optional histories require debug_reports=True."""
+    if type(debug_reports) is not bool:
+        raise ValueError("debug_reports must be a boolean")
+    base = Path(output_dir) / "report_exports"
+    sources = sorted(path for path in base.glob("*/summary_stats.json") if path.parent.name != "_combined")
+    if not sources:
+        raise FileNotFoundError("No worker reports available to combine")
+    summaries = [json.loads(path.read_text(encoding="utf-8")) for path in sources]
+    if debug_reports:
+        if any(summary.get("report_mode") == "minimal" for summary in summaries):
+            raise ValueError("Debug combination requires DEBUG_REPORTS=True reports from every worker")
+        result = _combine_debug_worker_reports(output_dir)
+        result["summary"]["report_mode"] = "debug"
+        _atomic_json(Path(result["reports_dir"]) / "summary_stats.json", result["summary"])
+        return result
+    configurations = {json.dumps({name: summary["scope"][name] for name in
+                      ("enrich", "fuzzy_threshold", "code_signature")}, sort_keys=True) for summary in summaries}
+    if len(configurations) > 1:
+        raise ValueError("Workers use different code or parsing configurations; rerun with matching configurations before combining")
+    papers, versions = [], []
+    for path, summary in zip(sources, summaries):
+        paper = pd.read_csv(path.parent / "per_paper.csv", dtype={"arxiv_id": str})
+        paper["source_worker"], paper["exported_at"] = path.parent.name, summary["exported_at"]
+        papers.append(paper)
+        version = pd.read_csv(path.parent / "per_version.csv", dtype={"arxiv_id": str})
+        version["source_worker"] = path.parent.name
+        versions.append(version)
+    paper = pd.concat(papers, ignore_index=True).sort_values(["exported_at", "source_worker"])
+    duplicate_count = int(paper.duplicated("arxiv_id", keep="last").sum())
+    paper = paper.drop_duplicates("arxiv_id", keep="last").sort_values("arxiv_id")
+    version = pd.concat(versions, ignore_index=True).merge(
+        paper[["arxiv_id", "source_worker"]], on=["arxiv_id", "source_worker"], how="inner")
+    target = base / "_combined"
+    target.mkdir(parents=True, exist_ok=True)
+    paper[_PAPER_REPORT_COLUMNS + ["source_worker"]].to_csv(target / "per_paper.csv", index=False, encoding="utf-8-sig")
+    version[_VERSION_REPORT_COLUMNS + ["source_worker"]].to_csv(target / "per_version.csv", index=False, encoding="utf-8-sig")
+    note = "Duplicate IDs use the latest worker export. Only statistics are combined; worker dataset tables are not merged."
+    summary = {"report_mode": "minimal", "exported_at": utc_now(), "workers": [p.parent.name for p in sources],
+        "scope": json.loads(next(iter(configurations))), "duplicate_rows_removed": duplicate_count,
+        **_core_stats(paper), "worker_performance": [
+            {**_report_run(item["run"], False), "table_bytes": item["table_bytes"]} for item in summaries],
+        "note": note}
+    _atomic_json(target / "summary_stats.json", summary)
+    (target / "README.md").write_text(note + "\nPerformance and dataset size are reported separately for each worker.\n", encoding="utf-8")
+    return {"summary": summary, "reports_dir": str(target)}
+
+
+def _combine_debug_worker_reports(output_dir):
     """Ghép số liệu theo ID; không cộng đôi khi các worker có phạm vi chồng nhau."""
     base = Path(output_dir) / "report_exports"
     sources = sorted(path for path in base.glob("*/summary_stats.json") if path.parent.name != "_combined")
@@ -600,7 +877,7 @@ def combine_worker_reports(output_dir):
                              ("versions_expected", "versions_ok", "versions_empty", "versions_partial", "versions_error",
                               "elements_before", "elements_after", "bibtex_before", "bibtex_after")}})
     _export_csv(target / "range_stats.csv", range_rows, ["range", "target_ids", "papers_success", "success_rate"])
-    categories = paper.loc[~paper.status.isin(["pending", "missing_input"]), "category"].fillna("unknown").value_counts()
+    categories = paper.loc[~paper.status.isin(["pending", "missing_input"]), "category"].astype("string").fillna("unknown").value_counts()
     _export_csv(target / "category_counts.csv", [{"category": k, "paper_count": int(v)} for k, v in categories.items()],
                 ["category", "paper_count"])
     summary = {"exported_at": utc_now(), "workers": [path.parent.name for path in sources],

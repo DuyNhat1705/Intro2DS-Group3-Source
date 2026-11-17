@@ -1,7 +1,7 @@
 """Điều phối spawn theo RAM; mỗi tiến trình giữ cache SaT của parser gốc.
 
-Kết quả đến theo thứ tự hoàn thành, chỉ số luôn thuộc đầu vào. Không ghi tệp,
-không sửa thuật toán parser. Iterable chỉ được đọc trước tối đa một job.
+Kết quả đến theo thứ tự hoàn thành, chỉ số luôn thuộc đầu vào. Khi có result_dir,
+worker ghi phân mảnh riêng và chỉ trả metadata. Iterable chỉ đọc trước tối đa một job.
 """
 from __future__ import annotations
 
@@ -111,7 +111,7 @@ def _resource_snapshot(pids=()):
                 available_bytes=max(0, min(total, available)), rss_by_pid=rss)
 
 
-def _worker_main(connection, enrich, fuzzy_threshold):
+def _worker_main(connection, enrich, fuzzy_threshold, sentence_cache_bytes, result_dir, debug_reports):
     """Đích spawn phải import được; chỉ cha nhận Ctrl-C."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -128,11 +128,21 @@ def _worker_main(connection, enrich, fuzzy_threshold):
                     from .parser_pipeline import parse_publication
                 else:
                     from parser_pipeline import parse_publication
-                result = parse_publication(job, enrich=enrich, fuzzy_threshold=fuzzy_threshold)
+                result = parse_publication(job, enrich=enrich, fuzzy_threshold=fuzzy_threshold,
+                                           sentence_cache_bytes=sentence_cache_bytes)
+                rss = psutil.Process().memory_info().rss
+                if result_dir is not None:
+                    if __package__:
+                        from .parser_storage import paper_name, persist_result
+                    else:
+                        from parser_storage import paper_name, persist_result
+                    result = persist_result(Path(result_dir) / paper_name(job["arxiv_id"]), result,
+                                            debug_reports=debug_reports, consume=True)
                 kind = "result"
             except Exception as exc:
                 kind, result = "error", f"{type(exc).__name__}: {exc}"
-            connection.send((kind, result, psutil.Process().memory_info().rss))
+                rss = 0
+            connection.send((kind, result, max(rss, psutil.Process().memory_info().rss)))
             del result, job
     except (EOFError, BrokenPipeError, OSError):
         pass
@@ -217,7 +227,8 @@ def _number(name, value, minimum=0):
 def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                           reserve_ram_gb=None, ram_per_worker_gb=1.5, adaptive_ram=True,
                           enrich=False, fuzzy_threshold=.92, deadline=None, on_event=None,
-                          ram_wait_timeout_sec=60):
+                          ram_wait_timeout_sec=60, sentence_cache_bytes=4 * 1024 ** 2,
+                          result_dir=None, debug_reports=False):
     """Yield ``(index, parse_publication(job))`` với tối đa một job mỗi worker.
 
     GB dùng GiB (2**30 byte); mặc định chừa max(0.5 GiB, 10% tổng RAM
@@ -230,6 +241,8 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
     peak_workers, peak_in_flight, worker_errors, ram_wait_sec, stopped_reason.
     Summary cũng giữ memory_estimate_gb, reserve_ram_gb, cpu_cap, worker_cap.
     completed bao gồm lỗi worker; pending chỉ đếm job chưa giao.
+    result_dir=None giữ API trả đầy đủ kết quả. Khi có thư mục, kết quả là receipt
+    metadata của phân mảnh đã ghi, không truyền các bảng Python qua pipe.
     """
     if num_workers != "auto":
         _positive_int("num_workers", num_workers)
@@ -245,6 +258,11 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
         raise ValueError("fuzzy_threshold must be <= 1")
     if not isinstance(adaptive_ram, bool) or not isinstance(enrich, bool):
         raise ValueError("adaptive_ram and enrich must be booleans")
+    if type(sentence_cache_bytes) is not int or sentence_cache_bytes < 0:
+        raise ValueError("sentence_cache_bytes must be a nonnegative integer")
+    if type(debug_reports) is not bool:
+        raise ValueError("debug_reports must be a boolean")
+    result_dir = None if result_dir is None else str(Path(result_dir).resolve())
     if on_event is not None and not callable(on_event):
         raise ValueError("on_event must be callable")
     if deadline is not None:
@@ -332,7 +350,8 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                 index, job = pending
                 if worker is None:
                     parent, child = context.Pipe()
-                    process = context.Process(target=_worker_main, args=(child, enrich, threshold))
+                    process = context.Process(target=_worker_main,
+                        args=(child, enrich, threshold, sentence_cache_bytes, result_dir, debug_reports))
                     worker = _Worker(process, parent)
                     workers.append(worker)
                     try:

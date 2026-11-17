@@ -46,9 +46,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 if __package__:
-    from .utils import GatherTex
+    from .utils import GatherTex, file_inventory
 else:
-    from utils import GatherTex
+    from utils import GatherTex, file_inventory
 
 __all__ = [
     "ABLATION_LEVELS",
@@ -414,12 +414,11 @@ class _LineTable:
 # ============================================================== T3: assets
 
 
-def _index_files(version_dir: Path) -> dict[str, list[Path]]:
+def _index_files(version_dir: Path, files=None) -> dict[str, list[Path]]:
     """Map lower-cased basenames to the files of the version, for fallback lookups."""
     index: dict[str, list[Path]] = {}
-    for p in version_dir.rglob("*"):
-        if p.is_file():
-            index.setdefault(p.name.lower(), []).append(p)
+    for p in file_inventory(version_dir) if files is None else files:
+        index.setdefault(p.name.lower(), []).append(p)
     return index
 
 
@@ -976,7 +975,7 @@ def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, 
     return pool[0], f"{len(cands)} candidates; " + ", ".join(reasons)
 
 
-def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex | None:
+def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig", files=None) -> GatherTex | None:
     r"""Expand static inputs in compilation order and list referenced .bib files.
 
     Returns ``None`` for an empty version: the directory exists but holds no
@@ -998,12 +997,14 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
     if not version_dir.is_dir():
         raise FileNotFoundError(f"version directory not found: {version_dir}")
     version_dir = version_dir.resolve()
-    tex_paths = sorted(p for p in version_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".tex")
+    # Reuse the current run's absolute-path inventory when provided.
+    files = file_inventory(version_dir) if files is None else files
+    tex_paths = sorted(p for p in files if p.suffix.lower() == ".tex")
     if not tex_paths:
         return None
 
     notes: list[str] = []
-    index = _index_files(version_dir)
+    index = _index_files(version_dir, files)
     texts: dict[Path, str] = {}
     anchors: dict[Path, list[tuple[int, int]]] = {}
     for p in tex_paths:

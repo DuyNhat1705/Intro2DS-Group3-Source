@@ -9,13 +9,65 @@ runs locally on CPU and requires no inference service or API key.
 
 from dataclasses import dataclass
 from functools import lru_cache
+from collections import OrderedDict
 import re
+import sys
 import warnings
 from typing import TypedDict
 
 
 class HierarchyDeduplicationWarning(UserWarning):
     """Review-only schema ambiguity; all elements and occurrence edges are retained."""
+
+
+class SentenceCache:
+    """Publication-scoped LRU of successful, warning-free SaT predictions.
+
+    Keys are the exact projected model input. TeX offset mapping and guarded
+    boundaries still run per occurrence. The byte budget accounts for Python
+    strings/tuples plus entry overhead; it does not include the model itself.
+    """
+    def __init__(self, max_bytes=4 * 1024 ** 2):
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a nonnegative integer")
+        self.max_bytes, self.bytes_used = max_bytes, 0
+        self.hits = self.misses = 0
+        self._entries = OrderedDict()
+        self._model = None
+
+    def clear(self):
+        self._entries.clear()
+        self.bytes_used = 0
+        self._model = None
+
+    def get(self, model, text):
+        if model is not self._model:
+            self.clear()
+            self._model = model
+        entry = self._entries.get(text)
+        if entry is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self._entries.move_to_end(text)
+        return entry[0]
+
+    def put(self, model, text, parts):
+        if model is not self._model:
+            self.clear()
+            self._model = model
+        parts = tuple(parts)
+        size = sys.getsizeof(text) + sys.getsizeof(parts) + sum(map(sys.getsizeof, parts)) + 128
+        if size > self.max_bytes:
+            return
+        previous = self._entries.pop(text, None)
+        if previous is not None:
+            self.bytes_used -= previous[1]
+        while self._entries and self.bytes_used + size > self.max_bytes:
+            _, (_, removed) = self._entries.popitem(last=False)
+            self.bytes_used -= removed
+        self._entries[text] = (parts, size)
+        self.bytes_used += size
 
 
 @dataclass
@@ -303,18 +355,36 @@ def _blocked_sentence_boundary(text: str, end: int) -> bool:
     return not before and word[0].isupper() and word not in {"The", "This", "Next", "We", "It", "See"}
 
 
-def _sentences(text: str):
+def _sentences(text: str, sentence_cache=None):
     """Combine SaT and guarded punctuation rules; slice original TeX only."""
     if not text.strip():
         return
     projected, offsets = _sentence_projection(text)
+    cache_miss = cacheable = False
     # wtpsplit 2.2.2 emits this informational warning on every call, even
     # without newlines. Other warnings must remain visible.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="split_on_input_newlines=False will lead to newlines.*", category=UserWarning)
-        parts = list(_sentence_model().split(projected, split_on_input_newlines=False, strip_whitespace=False))
+        model = _sentence_model()
+        parts = sentence_cache.get(model, projected) if sentence_cache is not None else None
+        if parts is None:
+            cache_miss = True
+            if sentence_cache is None:
+                parts = list(model.split(projected, split_on_input_newlines=False, strip_whitespace=False))
+            else:
+                caught = []
+                try:
+                    with warnings.catch_warnings(record=True) as caught:
+                        parts = list(model.split(projected, split_on_input_newlines=False, strip_whitespace=False))
+                finally:
+                    for item in caught:
+                        warnings.warn(item.message, item.category, stacklevel=2)
+                # Do not cache warnings/errors: every occurrence retains its diagnostics.
+                cacheable = not caught
     if not all(isinstance(part, str) for part in parts) or "".join(parts) != projected:
         raise ValueError("SaT output does not reconstruct the projected input; cannot map sentence boundaries")
+    if sentence_cache is not None and cache_miss and cacheable:
+        sentence_cache.put(model, projected, parts)
     ends = {len(projected)}
     projected_end = 0
     for part in parts:
@@ -340,7 +410,7 @@ def _sentences(text: str):
         source_start = source_end
 
 
-def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None) -> list[Node]:
+def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None, *, sentence_cache=None) -> list[Node]:
     r"""Build a deterministic preorder tree from one cleaned LaTeX version.
 
     Empty or whitespace-only input returns []; otherwise n0 is the document
@@ -355,6 +425,8 @@ def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None)
     in input plus output, excluding pathological deeply nested TeX groups.
     Pass one version's bibliography key_map to canonicalize citations before
     building the tree; omit it to retain the original citation keys.
+    sentence_cache optionally reuses exact, warning-free model predictions;
+    source mapping and protected-boundary checks still run for each passage.
     """
     if not isinstance(cleaned_tex, str):
         raise TypeError("cleaned_tex must be a str")
@@ -381,7 +453,7 @@ def construct_hierarchy(cleaned_tex: str, key_map: dict[str, str] | None = None)
 
     def flush(start: int, end: int) -> None:
         if skipping is None:
-            for sentence in _sentences(text[start:end]):
+            for sentence in _sentences(text[start:end], sentence_cache):
                 add("sentence", sentence, parent())
 
     i = start = 0

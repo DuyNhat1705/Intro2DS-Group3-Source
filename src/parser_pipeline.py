@@ -18,13 +18,13 @@ from pathlib import Path
 if __package__:
     from .bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
     from .gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from .hierarchy import HierarchyDeduplicationWarning, build_element_tables, construct_hierarchy, rewrite_citations
-    from .utils import get_paper_dir
+    from .hierarchy import HierarchyDeduplicationWarning, SentenceCache, build_element_tables, construct_hierarchy, rewrite_citations
+    from .utils import file_inventory, get_paper_dir
 else:
     from bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
     from gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from hierarchy import HierarchyDeduplicationWarning, build_element_tables, construct_hierarchy, rewrite_citations
-    from utils import get_paper_dir
+    from hierarchy import HierarchyDeduplicationWarning, SentenceCache, build_element_tables, construct_hierarchy, rewrite_citations
+    from utils import file_inventory, get_paper_dir
 
 __all__ = ["discover_publications", "parse_publication"]
 
@@ -78,8 +78,30 @@ def _expected(data: dict, label: str, errors: list[str]) -> set[int]:
     return set(range(1, count + 1))
 
 
+def _state_paths(root, state_ranges=None):
+    """Đọc state liên quan; giữ state chung/tên tùy chọn để không mất nguồn cũ."""
+    paths = [root / "source_state.json"] if (root / "source_state.json").is_file() else []
+    state_root = root / ".state"
+    if not state_root.is_dir():
+        return paths
+    if state_ranges is None:
+        return paths + sorted(state_root.rglob("source_state.json"))
+    if (state_root / "source_state.json").is_file():
+        paths.append(state_root / "source_state.json")
+    selected = set(state_ranges)
+    for directory in sorted(state_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        # Đây là quy ước đặt tên của scraper.ipynb; tên khác vẫn được đọc.
+        if (re.fullmatch(r"R[1-9]\d*(?:\+R[1-9]\d*)*", directory.name)
+                and not selected.intersection(directory.name.split("+"))):
+            continue
+        paths.extend(sorted(directory.rglob("source_state.json")))
+    return paths
+
+
 def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
-                          existing_only=False, limit=None) -> list[dict]:
+                          existing_only=False, limit=None, state_ranges=None) -> list[dict]:
     """Tìm bài và hợp miền phiên bản từ metadata, trạng thái tải và thư mục.
 
     ``None`` hợp ID hợp lệ từ thư mục bài và trạng thái nguồn, kể cả bài chưa
@@ -94,17 +116,28 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     tra trực tiếp tên thư mục chuẩn và tên dùng dấu chấm, không liệt kê cả kho.
     Chế độ này mặc định bỏ qua source_state; vẫn đọc nếu truyền đường dẫn cụ thể.
     ``limit`` giới hạn số bài trước khi đọc metadata và liệt kê phiên bản.
+    ``state_ranges`` (ví dụ ["R1"]) lọc các thư mục state đặt tên theo range
+    scraper; state chung/tên tùy chọn vẫn được đọc. Chỉ dùng khi ID đích đã
+    xác định; source_state_paths tường minh luôn được ưu tiên.
     """
     root = Path(data_dir)
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("limit must be a positive integer or None")
     ids = None if target_ids is None else sorted({_arxiv_id(v) for v in target_ids})
+    if state_ranges is not None:
+        if ids is None or isinstance(state_ranges, (str, bytes)):
+            raise ValueError("state_ranges requires target_ids and a list of range labels such as ['R1']")
+        state_ranges = set(state_ranges)
+        if any(not isinstance(r, str) or not re.fullmatch(r"R[1-9]\d*", r) for r in state_ranges):
+            raise ValueError("Invalid state range label")
+    if ids is not None and not existing_only and limit is not None:
+        ids = ids[:limit]
     directories = defaultdict(list)
     global_errors = []
     if root.exists() and not root.is_dir():
         raise ValueError(f"Data path is not a directory: {root}")
     if root.is_dir():
-        if existing_only and ids is not None:
+        if ids is not None:
             candidates = sorted({root / name for identity in ids for name in
                                  (get_paper_dir(identity).name, identity.replace("/", "-"))})
         else:
@@ -122,15 +155,14 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     if existing_only and source_state_paths is None:
         source_state_paths = []
     if source_state_paths is None:
-        paths = ([root / "source_state.json"] if (root / "source_state.json").exists() else [])
-        if (root / ".state").is_dir():
-            paths.extend(sorted((root / ".state").rglob("source_state.json")))
+        paths = _state_paths(root, state_ranges)
     else:
         if isinstance(source_state_paths, (str, Path)):
             source_state_paths = [source_state_paths]
         paths = [Path(p) if Path(p).is_absolute() else root / p for p in source_state_paths]
 
     states = defaultdict(list)
+    target_set = None if ids is None else set(ids)
     for path in sorted(set(paths)):
         try:
             document = _read_json(path)
@@ -142,6 +174,8 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                     identity = _arxiv_id(name)
                 except ValueError as exc:
                     global_errors.append(f"{path}: {exc}")
+                    continue
+                if target_set is not None and identity not in target_set:
                     continue
                 states[identity].append((path, entry))
         except (OSError, ValueError) as exc:
@@ -247,7 +281,7 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     return jobs
 
 
-def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
+def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92, sentence_cache_bytes=4 * 1024 ** 2) -> dict:
     """Parse mọi phiên bản rồi hợp nhất, viết lại trích dẫn và tạo bảng đúng một lần.
 
     Lỗi từng pha được giữ trong timings và errors của phiên bản, cảnh báo giữ
@@ -256,8 +290,13 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
     không có TeX là bản rỗng; nếu trạng thái nói done thì đó là lỗi đầu vào.
     input_bytes đếm tệp .tex/.bib trong các thư mục phiên bản, kể cả tệp dư,
     mỗi đường dẫn thực một lần. elements_before đếm nút trước khử trùng lặp.
+    Cache SaT chỉ tồn tại trong bài hiện tại, giới hạn bởi sentence_cache_bytes;
+    0 tắt cache. _source_manifest là inventory nội bộ của đúng lượt chạy hiện tại.
     """
+    if type(sentence_cache_bytes) is not int or sentence_cache_bytes < 0:
+        raise ValueError("sentence_cache_bytes must be a nonnegative integer")
     started = time.perf_counter()
+    sentence_cache = SentenceCache(sentence_cache_bytes) if sentence_cache_bytes else None
     identity = job["arxiv_id"]
     discovery_errors = list(job.get("discovery_errors", []))
     result = dict(elements=[], hierarchy=[], bibtex=[], version_status=[],
@@ -339,9 +378,10 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         rows[number] = row
         trees[number], entries[number] = [], []
         directory = directories.get(number)
+        files = None
 
         def inspect_input():
-            nonlocal input_bytes
+            nonlocal input_bytes, files
             status = row["source_status"]
             exists = directory is not None and Path(directory).is_dir()
             if not exists:
@@ -353,27 +393,36 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                     return False
                 row.update(status="missing_dir", missing_count=1, missing=[f"v{number}"])
                 raise FileNotFoundError(f"Missing version directory v{number}")
-            for path in sorted(Path(directory).rglob("*")):
-                if path.is_file() and path.suffix.lower() in {".tex", ".bib"}:
+            snapshot = job.get("_source_manifest")
+            if snapshot is None:
+                files = file_inventory(directory)
+            else:
+                prefix = f"{number}/"
+                root = Path(directory).resolve()
+                files = {root / name[len(prefix):]: info for name, info in snapshot.items() if name.startswith(prefix)}
+            for path in sorted(files):
+                if path.suffix.lower() in {".tex", ".bib"}:
                     resolved = path.resolve()
                     if resolved not in counted:
-                        input_bytes += path.stat().st_size
+                        input_bytes += files[path]["size"]
                         counted.add(resolved)
             if status == "not_found":
                 row.update(status="not_found", message="Download state confirms the version was not found")
-                if any(p.is_file() and p.suffix.lower() == ".tex" for p in Path(directory).rglob("*")):
+                if any(p.suffix.lower() == ".tex" for p in files):
                     row["errors"].append("Conflict: a not_found version still contains TeX sources")
                 return False
             return True
 
         ready, has_directory = phase("input", inspect_input, number)
         if not ready or not has_directory:
+            files = None
             if row["status"] == "ok":
                 row["status"] = "error"
             result["timings"][-1].update(status=row["status"],
                                          message="; ".join(filter(None, [row["message"], *row["errors"]])))
             continue
-        ok, tex = phase("gather", lambda: gather_tex(Path(directory)), number)
+        ok, tex = phase("gather", lambda: gather_tex(Path(directory), files=files), number)
+        files = None
         if not ok:
             row["status"] = "error"
             continue
@@ -409,9 +458,11 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             warning("input", f"Existing TeX sources conflict with download state {row['source_status']}", number)
         clean_ok, cleaned = phase("cleanup", lambda: cleanup_latex(tex.source), number)
         if clean_ok:
-            tree_ok, nodes = phase("construct_hierarchy", lambda: construct_hierarchy(cleaned), number)
+            tree_ok, nodes = phase("construct_hierarchy", lambda: construct_hierarchy(cleaned, sentence_cache=sentence_cache), number)
             if tree_ok:
                 trees[number] = nodes
+            del nodes
+        del cleaned
         # Giữ GatherTex gốc: cleanup có thể làm mất cấu trúc bibitem cần trích xuất.
         bib_ok, bibliography = phase("extract_bibtex", lambda: extract_bibtex(tex, identity, enrich=enrich), number)
         if bib_ok:
@@ -420,7 +471,12 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             row["bibliography_status"] = "error"
         if row["errors"]:
             row["status"] = "partial" if trees[number] or entries[number] else "error"
+        del tex, bibliography
 
+    if sentence_cache is not None:
+        sentence_cache.clear()
+    if "_source_manifest" in job:
+        job = {key: value for key, value in job.items() if key != "_source_manifest"}
     elements_before = sum(len(nodes) for nodes in trees.values())
     bibtex_before = sum(len(items) for items in entries.values())
 
@@ -438,15 +494,21 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         return bibliography
 
     unified_ok, bibliography = phase("unify_publication", unify)
+    entries.clear()
     if unified_ok:
         def rewrite():
             return {v: rewrite_citations(nodes, bibliography.key_map.get(v, {})) for v, nodes in trees.items()}
 
         rewritten_ok, rewritten = phase("rewrite_citations", rewrite)
+        trees.clear()
         if rewritten_ok:
             tables_ok, tables = phase("build_element_tables", lambda: build_element_tables(identity, rewritten))
             if tables_ok:
                 result["elements"], result["hierarchy"] = tables
+            rewritten.clear()
+            del tables
+    trees.clear()
+    del bibliography
 
     for number, row in rows.items():
         messages = ([row["message"]] if row["message"] else []) + row["errors"]
