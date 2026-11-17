@@ -4,7 +4,6 @@ Shared Types for BibTeX Extraction
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +23,8 @@ class BibtexEntry:
     arxiv_id_hint: Optional[str] = None     # Bóc được arXiv ID gốc (phục vụ Milestone 3)
     confidence_score: float = 1.0           # Điểm chất lượng bóc tách (0.0 - 1.0)
     source_method: str = "regex"            # "bib_file", "regex", "crossref", "llm"
+    # Văn bản \bibitem đã gộp khoảng trắng (None với entry .bib), cho bước hậu xử lý.
+    raw_text: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -39,4 +40,5 @@ class BibtexEntry:
             "arxiv_id_hint": self.arxiv_id_hint,
             "confidence_score": self.confidence_score,
             "source_method": self.source_method,
+            "raw_text": self.raw_text,
         }

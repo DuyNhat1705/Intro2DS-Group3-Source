@@ -1,4 +1,5 @@
 """Duyệt tệp, tìm bài và chữ ký checkpoint."""
+
 import shutil
 
 from conftest import write_paper
@@ -43,6 +44,7 @@ def test_discover_skips_entries_that_are_listed_but_cannot_be_opened(tmp_path, m
     import os
     from pathlib import Path
     from types import SimpleNamespace
+
     write_paper(tmp_path, "2609.27830", {1: {"main.tex": DOC}})
     write_paper(tmp_path, "2609.27831", {1: {"main.tex": DOC}})
     real_scandir = os.scandir

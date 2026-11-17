@@ -13,6 +13,7 @@
 - [Installation and Setup](#iv-installation-and-setup)
 - [Usage](#v-usage)
 - [Dependencies](#vi-dependencies)
+- [Running the Tests](#vii-running-the-tests)
 
 ---
 
@@ -53,12 +54,18 @@ Intro2DS-Group3-Source/
 |   ├── get_full_source.py           # Milestone 1: versioned .tex/.bib downloads
 |   ├── get_extracting_reference.py  # Milestone 1: citation API references
 |   ├── scraper.ipynb                # Milestone 1: collection and reporting
-|   ├── gather_clean_tex.py          # Milestone 2: gathering/cleanup interfaces
-|   ├── hierarchy.py                 # Milestone 2: tree and element-table interfaces
-|   ├── bibtex.py                    # Milestone 2: bibliography interfaces
-|   ├── parser.ipynb                 # Milestone 2: notebook placeholder
+|   ├── gather_clean_tex.py          # Milestone 2: compilation path and LaTeX cleanup
+|   ├── hierarchy.py                 # Milestone 2: document tree, sentences, element tables
+|   ├── bibtex.py                    # Milestone 2: .bib/\bibitem extraction and unification
+|   ├── m2_types.py                  # Milestone 2: BibtexEntry data class
+|   ├── parser_pipeline.py           # Milestone 2: publication discovery and per-paper parsing
+|   ├── parser_parallel.py           # Milestone 2: RAM-aware parallel workers
+|   ├── parser_reporting.py          # Milestone 2: checkpoints, Parquet tables, statistics
+|   ├── bibtex_refine.py             # Milestone 2: optional AnyStyle post-processing
+|   ├── parser.ipynb                 # Milestone 2: parsing and reporting notebook
 |   ├── intro2ds-env.yml             # Conda environment (Python 3.12)
 |   └── requirements.txt             # Pinned Python dependencies
+├── tests/                           # Milestone 2 automated tests (pytest)
 ├── data/                            # Local generated corpus
 |   └── 2310-12345/                  # Example normalized arXiv ID
 |       ├── metadata.json
@@ -101,30 +108,37 @@ End-to-end orchestration: entry discovery (batched arXiv API) → every version 
 
 ### 2. Milestone 2
 
-The following interfaces describe the intended processing stages.
+Each paper is parsed from its own LaTeX sources only. The crawled reference metadata (`references.json`) is never read by the parser, because Milestone 3 matches the `bibtex` entries against it.
 
 #### A. `src/gather_clean_tex.py`
 
-- `gather_tex(version_dir, encoding="utf-8-sig")`: Intended to find the compilation root, expand reachable inputs in compilation order, and collect referenced bibliography files. Returns a `GatherTex` object; an existing directory without TeX files represents an empty version, distinct from a missing directory, ambiguous root, or unresolved include.
-- `cleanup_latex(source)`: Intended to remove non-semantic formatting and normalize mathematics while preserving structural commands and citations.
+- `gather_tex(version_dir)`: Finds the root file (the one declaring `\documentclass`; copies with the same content outside comments, such as the `main(1).tex` that Google Drive creates when a folder is uploaded twice, count as one candidate), expands active `\input`/`\include` commands transitively in compilation order, and lists the `.bib` files named by `\bibliography`. Returns a `GatherTex` with the expanded source, a source map, missing includes, and notes; returns `None` for a version without TeX files (an empty version).
+- `cleanup_latex(source)`: Removes non-semantic formatting (`\centering`, float placement options, table rules, page headers, front-matter commands), expands simple user macros, and normalizes inline math to `$...$` and block math to `\begin{equation}...\end{equation}`.
 
 #### B. `src/hierarchy.py`
 
-- `Node`: Represents a node with a local identifier, optional parent identifier, kind, and content.
-- `construct_hierarchy(cleaned_tex)`: Intended to build one version's tree, including a document root with no parent.
-- `rewrite_citations(nodes, key_map)`: Intended to replace citation keys with canonical keys while preserving node identifiers and edges.
-- `build_element_tables(arxiv_id, nodes_by_version)`: Intended to deduplicate cleaned content across versions and return shared `elements` rows and version-specific `hierarchy` rows. `ElementRow` and `HierarchyRow` define their schemas.
+- `construct_hierarchy(cleaned_tex)`: Builds one version's tree: the document root (holding the paper title), headings at their detected levels, lists and items, and leaves for sentences, block formulas, and figures/tables. Sentences are split with the SaT model (`sat-3l-sm`, CPU); mathematics, commands, abbreviations, URLs, and decimals are protected. The References section is excluded; acknowledgements and appendices are kept.
+- `rewrite_citations(nodes, key_map)`: Renames `\cite` keys to the canonical keys chosen during bibliography unification.
+- `build_element_tables(arxiv_id, nodes_by_version)`: Returns the `elements` rows (leaves with identical whitespace-normalized content share one ID across versions; containers are additionally matched by occurrence order, so two same-titled headings or two lists of one version never merge) and the per-version `hierarchy` edges.
 
 #### C. `src/bibtex.py`
 
-- `BibEntry`: Holds a citation key, entry type, and bibliography fields.
-- `extract_bibtex(tex)`: Intended to read referenced `.bib` files and convert reachable `\bibitem` entries.
-- `merge_bibtex(entries_by_version)`: Intended to merge duplicate entries and union their fields, returning unified entries and a citation-key mapping for each version.
-- `build_bibtex_rows(arxiv_id, entries)`: Intended to project merged entries into the final schema defined by `BibtexRow`.
+- `extract_bibtex(tex)`: Parses the referenced `.bib` files with `bibtexparser` and converts each `\bibitem` with rules for `\newblock` blocks, quoted/italic titles, and author–year styles. Titles, journals, and authors are converted from LaTeX to Unicode; authors are written as `First Last`; arXiv IDs and years are read from the fields.
+- `unify_publication(arxiv_id, entries_by_version)`: Merges duplicates within and across versions (DOI/arXiv ID, normalized title, citation key, and fuzzy title with a DOI veto), unions their fields, chooses one citation key per entry, and returns the key map used by `rewrite_citations`.
 
-#### D. `src/parser.ipynb`
+#### D. `src/parser_pipeline.py`, `src/parser_parallel.py`, `src/parser_reporting.py`
 
-Reserved for Milestone 2 orchestration. The intended order is gathering and cleanup per version, hierarchy and bibliography extraction, bibliography merging across versions, citation rewriting, then element deduplication and table assembly.
+- `discover_publications(data_dir, target_ids=None)`: Lists papers and versions from the Milestone 1 folders and download state; IDs without data are kept so coverage statistics stay complete.
+- `parse_publication(job)`: Runs gathering, cleanup, hierarchy, bibliography extraction, unification, citation rewriting, and element tables for every version of one paper, recording per-stage timings, warnings, and statistics.
+- `run_parser(jobs, output_dir, ...)`: Parses papers sequentially or with RAM-aware parallel workers (`iter_parallel_results`), skips papers whose checkpoint matches the source/code signature, writes per-paper partitions and the three combined Parquet tables, and exports the statistics (`per_paper.csv`, `per_version.csv`, `summary_stats.json`, ...).
+
+#### E. `src/bibtex_refine.py`
+
+- `refine_bibliography(output_dir, worker=...)`: Optional post-processing after `run_parser`. Sends only the `\bibitem` entries that look mis-split (no title or authors, a venue taken as the title, overly long author names) to AnyStyle in one batch and accepts a title only if it occurs in the original text. Results are cached; the unrefined table is kept as `bibtex_parsed.parquet` and every change is logged in `bibtex_refinement.jsonl`.
+
+#### F. `src/parser.ipynb`
+
+Configures the scope (ranges, sample size, worker name), mounts Drive, optionally extracts a data tarball to the local disk, runs a smoke test, runs the parser and the optional AnyStyle step, and renders the coverage, deduplication, and performance statistics used in the report.
 
 ---
 
@@ -185,6 +199,14 @@ conda env update -f src/intro2ds-env.yml --prune
 
 Outputs include paper metadata, references, versioned `.tex`/`.bib` sources, Parquet tables, checkpoints, run logs, and report statistics under `data/`. Additional settings are documented in the notebook's configuration cell.
 
+**Milestone 2 (`parser.ipynb`) on Colab:**
+
+1. Open `src/parser.ipynb` on Colab with a **CPU** runtime. `BRANCH` selects the branch that the notebook clones.
+2. Set `RUN_RANGES` (or `"local"` to parse whatever is in the data folder) and optionally `SAMPLE_N` for a trial run.
+3. Optional: put `data.tar.gz` (or `.tgz`/`.tar`) in `MyDrive/Intro2DS-Group3`; the notebook extracts it to the local disk and reads from there, which is much faster than reading many small files from Drive. The extraction time is recorded in `summary_stats.json` (`run.data_preparation`).
+4. Choose **Runtime > Run all**. Outputs go to `MyDrive/Intro2DS-Group3/statistics_data/parser`. Running again resumes from checkpoints; `VERIFY_CHECKPOINTS = "full"` re-hashes every output file for a final check.
+5. `REFINE_WITH_ANYSTYLE = True` installs Ruby and `anystyle-cli` on Colab (a few minutes) for the optional post-processing step; set it to `False` to skip.
+
 ### 2. Running locally using VS Code
 In VS Code, open the notebook and use **Select Kernel** to choose the virtual environment has been created.
 
@@ -211,7 +233,6 @@ conda deactivate
 ```
 ---
 
-> Note: You can run the jupyter notebook either by Conda or VS Code. We offer 2 options for you.
 ## VI. Dependencies
 
 The project uses the following libraries specified in `src/requirements.txt`:
@@ -220,4 +241,19 @@ The project uses the following libraries specified in `src/requirements.txt`:
 - [`psutil`](https://pypi.org/project/psutil/) (`==7.2.2`): Process and system resource monitoring.
 - [`pandas`](https://pypi.org/project/pandas/) (`==3.1.0`) and [`pyarrow`](https://pypi.org/project/pyarrow/) (`==26.0.0`): Data tables and Parquet output.
 - [`tqdm`](https://pypi.org/project/tqdm/) (`==4.70.1`): Progress bars.
-- [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Quick sanity-check plots in the notebook.
+- [`bibtexparser`](https://pypi.org/project/bibtexparser/) (`==1.4.3`): `.bib` parsing and LaTeX-to-Unicode conversion.
+- [`wtpsplit`](https://pypi.org/project/wtpsplit/) (`==2.2.2`) and [`onnxruntime`](https://pypi.org/project/onnxruntime/) (`==1.31.1`): SaT sentence segmentation on CPU.
+- [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Report figures and sanity-check plots in the notebooks.
+
+---
+
+## VII. Running the Tests
+
+The Milestone 2 parser has an automated test suite in `tests/` (pytest). `pytest` is not part of `src/requirements.txt`, so install it in the environment created above, then run the suite from the repository root:
+
+```bash
+pip install pytest
+python -m pytest tests -q
+```
+
+The tests replace the SaT sentence model with a stub and disable the optional network lookups, so they run offline and do not download any model.

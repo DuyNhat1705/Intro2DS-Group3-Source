@@ -224,24 +224,65 @@ def _write_tables(partition, result, schemas):
         os.replace(temporary, partition / f"{name}.jsonl")
 
 
-def _checkpoint(state, partition, signature):
+# Tệp của một partition; checkpoint chỉ hợp lệ khi cả sáu tệp còn nguyên.
+_OUTPUT_FILES = ("elements.parquet", "hierarchy.parquet", "bibtex.parquet", "key_map.json", "bibtex_debug.jsonl",
+                 "warnings.jsonl")
+# Bản chụp mọi bản ghi checkpoint của worker, để phiên sau đọc một tệp thay vì một tệp mỗi bài.
+_SNAPSHOT = "_manifest.json"
+# Trường chỉ có nghĩa trong phiên đang chạy, không lưu vào bản chụp.
+_RUN_ONLY_FIELDS = ("partition", "range", "reused", "current_run_sec")
+
+
+def _checkpoint(state, partition, signature, *, verify="size", record=None):
+    """Bản ghi checkpoint dùng lại được, hoặc None.
+
+    ``verify="size"`` so kích thước sáu tệp output với lúc ghi (một lần stat
+    mỗi tệp): phát hiện tệp thiếu hoặc ghi dở, nhanh trên Google Drive.
+    ``verify="full"`` băm lại SHA-256 và đếm dòng Parquet: phát hiện cả tệp bị
+    sửa mà không đổi kích thước, nhưng phải đọc hết từng tệp. Bản ghi cũ chưa
+    có kích thước luôn được kiểm tra đầy đủ, rồi được bổ sung kích thước.
+    ``record`` là bản ghi đã đọc sẵn (từ bản chụp); None thì đọc ``state``.
+    """
     try:
-        record = json.loads(state.read_text(encoding="utf-8"))
+        record = json.loads(state.read_text(encoding="utf-8")) if record is None else dict(record)
         if record["signature"] != signature or record["stats"]["status"] not in {"ok", "empty"}:
             return None
-        for filename in ("elements.parquet", "hierarchy.parquet", "bibtex.parquet", "key_map.json", "bibtex_debug.jsonl", "warnings.jsonl"):
-            if _file_signature(partition / filename) != record["file_signatures"][filename]:
-                return None
-        for name in table_schemas():
-            metadata = pq.read_metadata(partition / f"{name}.parquet")
-            if metadata.num_rows != record["table_counts"][name]:
-                return None
-        if not (partition / "key_map.json").exists() or not (partition / "bibtex_debug.jsonl").exists():
-            return None
+        sizes = record.get("file_sizes")
+        if verify == "size" and sizes:
+            for filename in _OUTPUT_FILES:
+                if (partition / filename).stat().st_size != sizes[filename]:
+                    return None
+        else:
+            for filename in _OUTPUT_FILES:
+                if _file_signature(partition / filename) != record["file_signatures"][filename]:
+                    return None
+            for name in table_schemas():
+                metadata = pq.read_metadata(partition / f"{name}.parquet")
+                if metadata.num_rows != record["table_counts"][name]:
+                    return None
+            if not sizes:
+                record["file_sizes"] = {filename: (partition / filename).stat().st_size for filename in _OUTPUT_FILES}
         record["partition"] = str(partition)
         return record
-    except (OSError, ValueError, KeyError, pa.ArrowException):
+    except (OSError, ValueError, KeyError, TypeError, pa.ArrowException):
         return None
+
+
+def _load_snapshot(path):
+    """Bản ghi theo tên partition; tệp thiếu/hỏng thì rỗng (quay về đọc từng tệp state)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data["records"] if data.get("format") == 1 and isinstance(data.get("records"), dict) else {}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def _write_snapshot(path, records):
+    path = Path(path)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    temporary.write_text(json.dumps({"format": 1, "records": records}, ensure_ascii=False, separators=(",", ":")),
+                         encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _combine_tables(records, tables, schemas):
@@ -276,7 +317,8 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
         ["arxiv_id", "range", "status", "paper_success", "versions_expected", "versions_ok", "versions_empty",
          "versions_partial", "versions_error", "elements_before", "elements_after", "bibtex_before",
          "bibtex_after", "elapsed_sec", "input_bytes", "category", "warnings_count", "blocking_warning_count", "notice_count",
-         "review_required", "bibliography_status", "versions_missing_bibliography", "message", "reused", "current_run_sec"])
+         "review_required", "bibliography_status", "versions_missing_bibliography", "cite_keys", "cite_keys_unresolved",
+         "message", "reused", "current_run_sec"])
     versions = [row for record in records for row in record["version_status"]]
     versions.extend({"arxiv_id": job["arxiv_id"], "version": version, "status": "pending",
                      "message": "Not processed in this run", "missing_count": 0, "warning_count": 0}
@@ -349,7 +391,10 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
         "diagnostics": {"total": total("warnings_count"), "blocking": total("blocking_warning_count"),
                         "notices": total("notice_count"), "papers_for_review": int(paper.review_required.fillna(False).sum())},
         "bibliography": {"papers_missing_sources": int(paper.bibliography_status.eq("missing_sources").sum()),
-                         "versions_missing_sources": total("versions_missing_bibliography")},
+                         "versions_missing_sources": total("versions_missing_bibliography"),
+                         "cite_keys": total("cite_keys"), "cite_keys_unresolved": total("cite_keys_unresolved"),
+                         "papers_with_unresolved_cites": int(pd.to_numeric(paper["cite_keys_unresolved"],
+                                                                           errors="coerce").fillna(0).gt(0).sum())},
         "current_run_average_sec": run["duration_sec"] / run["papers_processed"] if run["papers_processed"] else None,
         "measurement_note": "RSS samples cover the Python process and its children; disk usage is a snapshot of the output directory. Checkpoint parsing times are reported separately from current-run times."}
     _atomic_json(reports / "summary_stats.json", summary)
@@ -375,7 +420,8 @@ def _exports(reports, logs, records, pending, ranges, run, config, tables):
 def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, fuzzy_threshold=0.92,
                resume=True, max_run_hours=None, monitor_interval=1.0, disk_every=100, progress=None,
                num_workers=1, max_workers=None, adaptive_ram=True, reserve_ram_gb=None,
-               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60, paper_timeout_sec=None):
+               ram_per_worker_gb=1.5, ram_wait_timeout_sec=60, paper_timeout_sec=None,
+               verify_checkpoints="size", data_preparation=None):
     """Trả thống kê và đường dẫn; không giữ các bảng element toàn corpus trong RAM.
 
     Chế độ song song ghi kết quả trong một luồng nền để tiến trình chính tiếp
@@ -383,6 +429,13 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
     paper_timeout_sec chỉ áp dụng khi chạy song song: bài quá hạn bị dừng và
     ghi lỗi để thử lại ở phiên sau. Chế độ tuần tự chạy trong chính tiến trình
     nên không thể ngắt giữa bài.
+
+    verify_checkpoints: "size" (so kích thước tệp output) hoặc "full" (băm lại
+    và đếm dòng), xem ``_checkpoint``. Bản chụp ``.state/<worker>/_manifest.json``
+    bị xóa khi phiên bắt đầu và ghi lại khi phiên kết thúc, nên chỉ tồn tại khi
+    phiên trước kết thúc bình thường; phiên bị ngắt đột ngột thì phiên sau đọc
+    từng tệp state như cũ. data_preparation (dict, ví dụ thời gian giải nén dữ
+    liệu) được ghi nguyên vào thông tin phiên để báo cáo thời gian end-to-end.
     """
     if not re.fullmatch(r"[A-Za-z0-9_+-]+", worker):
         raise ValueError("Worker name may contain only letters, digits, _, +, and -")
@@ -400,6 +453,8 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         raise ValueError("paper_timeout_sec must be a positive number or None")
     if type(adaptive_ram) is not bool:
         raise ValueError("adaptive_ram must be a boolean")
+    if verify_checkpoints not in {"size", "full"}:
+        raise ValueError("verify_checkpoints must be 'size' or 'full'")
     for name, value, allow_zero in (("reserve_ram_gb", reserve_ram_gb, True),
                                     ("ram_per_worker_gb", ram_per_worker_gb, False),
                                     ("ram_wait_timeout_sec", ram_wait_timeout_sec, False)):
@@ -429,12 +484,18 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
               "ranges": ranges or {}, "num_workers": num_workers, "max_workers": max_workers,
               "adaptive_ram": adaptive_ram, "reserve_ram_gb": reserve_ram_gb,
               "ram_per_worker_gb": ram_per_worker_gb, "ram_wait_timeout_sec": ram_wait_timeout_sec,
-              "paper_timeout_sec": paper_timeout_sec}
+              "paper_timeout_sec": paper_timeout_sec, "verify_checkpoints": verify_checkpoints}
     run = {"run_id": run_id, "worker": worker, "started_at": utc_now(), "event": "start", "config": config,
            "target_ids": len(jobs), "remaining_at_start": None, "papers_processed": 0, "papers_reused": 0,
            "machine": {"python": platform.python_version(), "platform": platform.platform(),
                        "cpu_count": os.cpu_count(), "ram_total_bytes": psutil.virtual_memory().total}}
+    if data_preparation is not None:
+        run["data_preparation"] = dict(data_preparation)
     _append_jsonl(logs / "runs.jsonl", run)
+    snapshot_path = state / _SNAPSHOT
+    snapshot = _load_snapshot(snapshot_path) if resume else {}
+    # Xóa ngay: nếu phiên này bị ngắt đột ngột, phiên sau không dùng một bản chụp cũ hơn các tệp state.
+    snapshot_path.unlink(missing_ok=True)
     records = []
     completed_ids = set()
     started = time.perf_counter()
@@ -465,8 +526,8 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
             record = {"signature": signature, "stats": result["stats"],
                       "version_status": result["version_status"], "partition": str(partition),
                       "table_counts": {name: len(result[name]) for name in schemas},
-                      "file_signatures": {filename: _file_signature(partition / filename) for filename in
-                          ("elements.parquet", "hierarchy.parquet", "bibtex.parquet", "key_map.json", "bibtex_debug.jsonl", "warnings.jsonl")}}
+                      "file_signatures": {filename: _file_signature(partition / filename) for filename in _OUTPUT_FILES},
+                      "file_sizes": {filename: (partition / filename).stat().st_size for filename in _OUTPUT_FILES}}
             _atomic_json(stamp, record)
             for timing in result.get("timings", []):
                 _append_jsonl(logs / "timings.jsonl", {"run_id": run_id, "worker": worker,
@@ -499,20 +560,35 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
             # Kiểm tra cache trước để số việc còn lại lúc bắt đầu có ý nghĩa.
             prepared = []
             monitor.phase = "checking_checkpoints"
+            check_started = time.perf_counter()
+            sources = Counter()
             for job in jobs:
-                partition = tables / "papers" / _paper_name(job["arxiv_id"])
-                stamp = state / f"{_paper_name(job['arxiv_id'])}.json"
+                name = _paper_name(job["arxiv_id"])
+                partition = tables / "papers" / name
+                stamp = state / f"{name}.json"
                 try:
                     signature = input_signature(job, options)
                 except OSError as exc:
                     # Vẫn để parser ghi lỗi riêng của bài; không dùng checkpoint.
                     signature = uuid.uuid4().hex
                     logger.warning("Could not hash sources for %s: %s", job["arxiv_id"], exc)
-                record = _checkpoint(stamp, partition, signature) if resume else None
+                record = None
+                if resume:
+                    # Bản chụp chỉ còn khi phiên trước kết thúc bình thường, nên trùng với tệp
+                    # state; bài có trong bản chụp không cần mở tệp state nữa.
+                    source = "snapshot" if name in snapshot else "state_file"
+                    record = _checkpoint(stamp, partition, signature, verify=verify_checkpoints,
+                                         record=snapshot.get(name))
+                    sources[source if record is not None else "not_reusable"] += 1
                 prepared.append((job, partition, stamp, signature, record))
             run["remaining_at_start"] = sum(record is None for _, _, _, _, record in prepared)
+            run["checkpoint"] = {"sec": round(time.perf_counter() - check_started, 3), "verify": verify_checkpoints,
+                                 "reused_from_snapshot": sources["snapshot"],
+                                 "reused_from_state_files": sources["state_file"],
+                                 "not_reusable": sources["not_reusable"]}
             _append_jsonl(logs / "events.jsonl", {"timestamp": utc_now(), "run_id": run_id,
-                          "status": "checkpoint_checked", "remaining_at_start": run["remaining_at_start"]})
+                          "status": "checkpoint_checked", "remaining_at_start": run["remaining_at_start"],
+                          **{f"checkpoint_{key}": value for key, value in run["checkpoint"].items()}})
             if num_workers == 1:
                 for item in prepared:
                     if max_run_hours is not None and time.perf_counter() - started >= max_run_hours * 3600:
@@ -567,6 +643,15 @@ def run_parser(jobs, output_dir, *, worker="local", ranges=None, enrich=False, f
         combine_completed()
         run["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        # Bản ghi của phiên này đè lên bản chụp cũ; bài không chạy trong phiên giữ bản ghi cũ.
+        merged = dict(snapshot)
+        for record in records:
+            merged[Path(record["partition"]).name] = {key: value for key, value in record.items()
+                                                      if key not in _RUN_ONLY_FIELDS}
+        try:
+            _write_snapshot(snapshot_path, merged)
+        except OSError as exc:
+            logger.warning("Could not write checkpoint snapshot: %s", exc)
         run.update(event="end", ended_at=utc_now(), duration_sec=time.perf_counter() - started,
                    stop_reason=stop_reason, peak_rss_bytes=monitor.peak,
                    mean_rss_bytes=monitor.total / monitor.count if monitor.count else None,

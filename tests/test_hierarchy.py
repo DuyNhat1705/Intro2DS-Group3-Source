@@ -1,4 +1,5 @@
 """Khử trùng element theo khoảng trắng và cache SaT."""
+
 from unittest.mock import patch
 
 from conftest import fake_split
@@ -23,6 +24,29 @@ def test_sentences_differing_only_in_line_wrapping_share_one_element():
     assert [row["version"] for row in edges] == [1, 2]
 
 
+def test_containers_with_same_content_stay_distinct_within_a_version():
+    r"""Hai list (nội dung rỗng) và hai heading "Proof" trong cùng phiên bản không gộp thành một nút."""
+    tex = (
+        r"\documentclass{article}\begin{document}\section{Proof}First proof."
+        r"\begin{itemize}\item Alpha one.\item Beta two.\end{itemize}"
+        r"\section{Proof}Second proof.\begin{itemize}\item Gamma three.\end{itemize}\end{document}"
+    )
+    v1 = _build(tex)
+    elements, hierarchy = build_element_table("2609.00001", {1: v1, 2: _build(tex)})
+    kinds = {e["element_id"]: e["kind"] for e in elements}
+    content = {e["element_id"]: e["content"] for e in elements}
+    assert sum(k == "list" for k in kinds.values()) == 2
+    assert sum(k == "item" for k in kinds.values()) == 3
+    assert sum(k == "heading" for k in kinds.values()) == 2
+    # Mỗi câu nằm dưới đúng item của nó; mỗi item có đúng một con trong mỗi phiên bản.
+    parent = {(h["version"], content[h["element_id"]]): h["parent_id"] for h in hierarchy}
+    items = {parent[(1, s)] for s in ("Alpha one.", "Beta two.", "Gamma three.")}
+    assert len(items) == 3 and all(kinds[i] == "item" for i in items)
+    # Phiên bản giống hệt nhau vẫn dùng chung toàn bộ ID (khử trùng giữa các phiên bản không đổi).
+    assert all(parent[(1, s)] == parent[(2, s)] for s in ("Alpha one.", "Beta two.", "Gamma three."))
+    assert len(v1) == len(elements)
+
+
 def _build(tex):
     with patch("src.hierarchy._sentence_model") as model:
         model.return_value.split.side_effect = fake_split
@@ -36,8 +60,10 @@ def test_title_becomes_document_root_content():
 
 
 def test_unknown_environment_tags_do_not_leak_into_sentences():
-    nodes = _build("\\begin{openproblem}[Fellows et al.]\nIs it tractable?\n\\end{openproblem}\n\n"
-                   "\\begin{tcolorbox}{red}\nBoxed text.\n\\end{tcolorbox}\n")
+    nodes = _build(
+        "\\begin{openproblem}[Fellows et al.]\nIs it tractable?\n\\end{openproblem}\n\n"
+        "\\begin{tcolorbox}{red}\nBoxed text.\n\\end{tcolorbox}\n"
+    )
     sentences = [node.content for node in nodes if node.kind == "sentence"]
     assert not any("\\begin" in s or "\\end" in s or "{red}" in s for s in sentences)
     assert "Is it tractable?" in " ".join(sentences) and sentences[-1] == "Boxed text."
@@ -45,9 +71,16 @@ def test_unknown_environment_tags_do_not_leak_into_sentences():
 
 def test_repeated_fragments_give_one_warning_per_version():
     import warnings
-    nodes = [Node("n0", None, "document", ""), Node("n1", "n0", "heading", "A"), Node("n2", "n1", "sentence", "Then"),
-             Node("n3", "n0", "heading", "B"), Node("n4", "n3", "sentence", "Then"),
-             Node("n5", "n0", "heading", "C"), Node("n6", "n5", "sentence", "Then")]
+
+    nodes = [
+        Node("n0", None, "document", ""),
+        Node("n1", "n0", "heading", "A"),
+        Node("n2", "n1", "sentence", "Then"),
+        Node("n3", "n0", "heading", "B"),
+        Node("n4", "n3", "sentence", "Then"),
+        Node("n5", "n0", "heading", "C"),
+        Node("n6", "n5", "sentence", "Then"),
+    ]
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         build_element_table("2609.00001", {1: nodes})
@@ -57,6 +90,7 @@ def test_repeated_fragments_give_one_warning_per_version():
 
 def test_citation_keys():
     from src.hierarchy import citation_keys
+
     assert citation_keys("See \\cite{a, b} and \\citep[p.~2]{c}; \\url{x\\cite{no}}.") == {"a", "b", "c"}
 
 
@@ -70,4 +104,4 @@ def test_sat_runs_once_per_distinct_paragraph_across_versions():
     assert calls == 2
     # Phiên bản thứ hai chỉ gọi mô hình cho đoạn mới.
     assert model.return_value.split.call_count == 3
-    assert [n.content for n in second[:len(first)]] == [n.content for n in first]
+    assert [n.content for n in second[: len(first)]] == [n.content for n in first]

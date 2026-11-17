@@ -47,6 +47,8 @@ _HEADINGS = {name: i for i, name in enumerate(
 _LISTS = {"itemize", "enumerate", "description"}
 _MATH = {"equation", "align", "alignat", "flalign", "gather", "multline", "eqnarray", "displaymath", "dmath"}
 _FIGURES = {"figure", "table", "tabular", "tabularx", "longtable"}
+# Node kinds that own children; they are never pooled within one version (see build_element_table).
+_CONTAINER_KINDS = {"document", "heading", "list", "item"}
 _COMMAND = re.compile(r"\\([A-Za-z@]+\*?|[^A-Za-z@])")
 _URL = re.compile(r"(?:https?://|www\.)[^\s{}<>]+", re.I)
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n+")
@@ -743,6 +745,13 @@ def build_element_table(
     Content is whitespace-normalized first (see normalize_whitespace) and the
     normalized text is what the element row stores.
 
+    Leaves (sentences, formulas, figures) are shared whenever kind and content
+    match. Containers (document, heading, list, item) are additionally keyed by
+    their occurrence number among same-kind, same-content containers of the
+    version: the k-th "Proof" heading of version 1 shares its ID with the k-th
+    "Proof" heading of version 2, but two "Proof" headings, or two lists, of the
+    same version stay distinct nodes, so their children are not pooled.
+
     Every occurrence contributes its edge, including repeated occurrences.
     HierarchyDeduplicationWarning flags lossless ambiguities for review.
     Invalid local IDs or missing parents raise ValueError.
@@ -773,14 +782,18 @@ def build_element_table(
             complete.update(path)
     elements: list[ElementRow] = []
     hierarchy: list[HierarchyRow] = []
-    shared: dict[tuple[str, str], str] = {}
+    shared: dict[tuple, str] = {}
     local_ids: dict[tuple[int, str], str] = {}
     content_kinds: dict[str, set[str]] = {}
     for version in sorted(nodes_by_version):
+        occurrences: dict[tuple[str, str], int] = {}
         for node in nodes_by_version[version]:
             local_key = (version, node.local_id)
             content = normalize_whitespace(node.content)
             identity = (node.kind, content)
+            if node.kind in _CONTAINER_KINDS:
+                occurrences[identity] = occurrences.get(identity, 0) + 1
+                identity = (node.kind, content, occurrences[identity])
             if identity not in shared:
                 kinds = content_kinds.setdefault(content, set())
                 if kinds and node.kind not in kinds:

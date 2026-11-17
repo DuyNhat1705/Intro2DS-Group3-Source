@@ -929,11 +929,33 @@ def _include_targets(text: str, path: Path, version_dir: Path, index) -> set[Pat
     return targets
 
 
+_COPY_SUFFIX = re.compile(r"\s*\(\d+\)$")
+
+
+def _collapse_copies(cands: list[Path], texts: dict[Path, str]) -> list[Path]:
+    r"""Keep one file per distinct content among the root candidates.
+
+    Re-uploading a folder to Google Drive adds byte-identical copies such as
+    ``main(1).tex`` next to ``main.tex``. They compile to the same document, so
+    they are not a real ambiguity. The kept copy is the one without a ``(N)``
+    suffix, then the shallowest and shortest path.
+    """
+    def preference(p: Path) -> tuple:
+        return (bool(_COPY_SUFFIX.search(p.stem)), len(p.parts), len(p.name), str(p))
+
+    kept: dict[str, Path] = {}
+    for p in sorted(cands, key=preference):
+        kept.setdefault(texts[p], p)
+    chosen = set(kept.values())
+    return [p for p in cands if p in chosen]
+
+
 def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, str]:
     r"""Choose the root file and say why.
 
     Candidates declare ``\documentclass`` outside comments and are not
-    ``standalone`` / ``subfiles`` fragments. Ties are broken, in order, by
+    ``standalone`` / ``subfiles`` fragments. Identical copies collapse to one
+    candidate first (see :func:`_collapse_copies`). Ties are broken, in order, by
     having ``\begin{document}``, not being included by another file, a
     conventional name (main, ms, paper, ... or the arXiv id), and size.
     """
@@ -948,7 +970,12 @@ def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, 
     if len(cands) == 1:
         return cands[0], "single \\documentclass"
 
-    pool, reasons = list(cands), []
+    pool, reasons = _collapse_copies(cands, texts), []
+    if len(pool) < len(cands):
+        dropped = len(cands) - len(pool)
+        reasons.append(f"{dropped} identical {'copy' if dropped == 1 else 'copies'} ignored")
+    if len(pool) == 1:
+        return pool[0], f"{len(cands)} candidates; " + ", ".join(reasons)
 
     def narrow(keep: list[Path], why: str) -> None:
         nonlocal pool
@@ -1691,14 +1718,17 @@ _FORMAT_SWITCHES = (
     "normalfont em bf it rm sf tt sc sl selectfont xspace balance raggedbottom "
     "flushbottom frenchspacing nonfrenchspacing phantomsection strut unskip hrule "
     "endhead endfirsthead endfoot endlastfoot IEEEpeerreviewmaketitle and AND begingroup endgroup "
-    "displaystyle textstyle scriptstyle scriptscriptstyle leavevmode"
+    "displaystyle textstyle scriptstyle scriptscriptstyle leavevmode justifying"
 ).split()
 _FORMAT_DROP_ARGS = {
     "vspace": "{", "hspace": "{", "label": "{",
     # elsarticle: tùy chọn natbib và tiêu đề trang chạy, không phải nội dung bài.
     "biboptions": "{", "verso": "{", "recto": "{", "setlength": "{{", "addtolength": "{{",
     "setcounter": "{{", "addtocounter": "{{", "rule": "[{{", "pagestyle": "{",
-    "thispagestyle": "{", "bibliographystyle": "{", "captionsetup": "[{", "graphicspath": "{",
+    "thispagestyle": "{", "bibliographystyle": "{",
+    # fancyhdr: đầu/chân trang chạy, không phải nội dung bài.
+    "fancyhead": "[{", "fancyfoot": "[{", "lhead": "[{", "chead": "[{", "rhead": "[{",
+    "lfoot": "[{", "cfoot": "[{", "rfoot": "[{", "articletype": "{", "captionsetup": "[{", "graphicspath": "{",
     "hypersetup": "{", "enlargethispage": "{", "linespread": "{", "fontsize": "{{", "color": "[{",
     "definecolor": "{{{", "needspace": "{", "addcontentsline": "{{{", "pdfbookmark": "[{{",
     "specialrule": "{{{", "cline": "{", "addlinespace": "[", "arrayrulecolor": "[{",
@@ -1733,7 +1763,8 @@ _LAYOUT_ENVS = {
     "small": "", "footnotesize": "", "scriptsize": "", "raggedright": "", "spacing": "{",
     "singlespace": "", "onehalfspace": "", "doublespace": "", "sloppypar": "",
 }
-_DROP_ENVS = re.compile(r"\\begin\{(CCSXML)\}.*?\\end\{\1\}", re.S)
+# keywords (elsarticle, IOP, ...) là front matter như lệnh \keywords{...} đã bị bỏ ở trên.
+_DROP_ENVS = re.compile(r"\\begin\{(CCSXML|keywords)\}.*?\\end\{\1\}", re.S)
 _FLOAT_OPTION = re.compile(
     r"(\\begin\{(?:figure|table|algorithm|sidewaysfigure|sidewaystable|SCfigure|wrapfigure|wraptable"
     r"|tabular|tabularx|tabular\*|longtable|subfigure|subtable)\*?\})[ \t]*\[[^\]\n]*\]"
@@ -1899,6 +1930,8 @@ _FORMAT_TABLE: dict[str, tuple[str, object]] = {
     "qtylist": ("[{{", lambda a: f"{_si_list(a[1])} {_si_unit(a[2])}"),
     "numlist": ("[{", lambda a: _si_list(a[1])),
     "detokenize": ("{", lambda a: _escape_detokenized(a[0])),
+    # IEEEtran: chữ hoa trang trí đầu bài, \IEEEPARstart{W}{ith} là "With".
+    "IEEEPARstart": ("{{", lambda a: _s(a[0]) + _s(a[1])),
 }
 _LAYOUT_ENV_RX = re.compile(r"\\(begin|end)\{(" + "|".join(map(re.escape, _LAYOUT_ENVS)) + r")\}")
 

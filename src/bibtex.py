@@ -20,6 +20,7 @@ import urllib.request
 import json
 from collections import OrderedDict
 import os
+import unicodedata
 import warnings
 import urllib.error
 from pathlib import Path
@@ -77,6 +78,10 @@ def extract_bibtex(
     commands in those files are opened. No directory-wide bibliography scan
     is performed. Set enrich=False to disable both optional network hooks.
     Read/parse errors raise BibliographyParseError rather than an empty result.
+
+    Only the paper's own sources are read. The crawled reference metadata
+    (references.json) is deliberately not used: Milestone 3 matches these
+    entries against it, so deriving fields from it would leak the labels.
     """
     if isinstance(compilation_path, GatherTex):
         source = compilation_path.source
@@ -241,6 +246,10 @@ def _parse_bibitems(source: str, arxiv_id: str, *, enrich: bool) -> List[BibtexE
     return entries
 
 
+# {\it Tiêu đề}, {\em ...}, {\sl ...}: nhóm in nghiêng kiểu cũ, cho phép một tầng ngoặc bên trong.
+_GROUP_ITALIC = re.compile(r"\{\\(?:it|em|sl|itshape|slshape)(?![A-Za-z])\s*((?:[^{}]|\{[^{}]*\})*)\}")
+
+
 def _parse_bibitem_block(
     citation_key: str,
     raw_text: str,
@@ -249,7 +258,10 @@ def _parse_bibitem_block(
     enrich: bool = True,
 ) -> BibtexEntry:
     """Parse một block \\bibitem thô thành BibtexEntry chuẩn."""
-    text = re.sub(r"\s+", " ", raw_text).strip()
+    source = re.sub(r"\s+", " ", raw_text).strip()
+    # Style cũ in nghiêng bằng nhóm {\it ...}/{\em ...}: viết lại thành \textit{...}
+    # để cùng được nhận như chữ in nghiêng (tiêu đề hoặc tên tạp chí).
+    text = _GROUP_ITALIC.sub(lambda m: "\\textit{" + m.group(1).strip() + "}", source)
 
     # 1. Year
     year_match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
@@ -277,8 +289,13 @@ def _parse_bibitem_block(
     title_start = -1
     title_end = -1
     plain_title_span = None
+    blocks = None if quote_match and len(quote_match.group(1).strip()) > 5 else _newblock_fields(text)
 
-    if quote_match and len(quote_match.group(1).strip()) > 5:
+    if blocks:
+        author_part, title, tail_part = blocks
+        authors = _parse_authors_from_text(author_part)
+        journal = _venue_from_blocks(tail_part)
+    elif quote_match and len(quote_match.group(1).strip()) > 5:
         title = quote_match.group(1).strip()
         title_start, title_end = quote_match.span()
     elif style_match and len(style_match.group(1).strip()) > 5:
@@ -297,13 +314,8 @@ def _parse_bibitem_block(
         tail_part = text[title_end:].strip().lstrip(",.")
 
         authors = _parse_authors_from_text(author_part)
-
-        j_match = re.search(r"(?:in\s+)?\\(?:textit|emph|em)\{([^}]+)\}", tail_part, re.IGNORECASE)
-        if not j_match:
-            j_match = re.search(r"\bin\s+([A-Z][A-Za-z0-9\s,\.:&-]+?)(?:,|\.|\b\d{4}\b|$)", tail_part, re.IGNORECASE)
-        if j_match:
-            journal = j_match.group(1).strip()
-    else:
+        journal = _venue_from_tail(tail_part)
+    elif not blocks:
         # Initials (J. A. Smith) are not author/title sentence boundaries.
         plain = re.sub(r"\\newblock\s*", ". ", text)
         parts = [p.strip(" .") for p in re.split(r"(?<!\b[A-Z])\.\s+(?=[A-Z{\\])", plain)
@@ -359,6 +371,7 @@ def _parse_bibitem_block(
             llm_entry.url = url or llm_entry.url
             llm_entry.arxiv_id_hint = arxiv_id_hint
             llm_entry.source_method = "llm"
+            llm_entry.raw_text = source
             llm_entry.confidence_score = _calculate_confidence_score(llm_entry)
             return llm_entry
 
@@ -374,6 +387,7 @@ def _parse_bibitem_block(
         url=url,
         arxiv_id_hint=arxiv_id_hint,
         source_method=source_method,
+        raw_text=source,
     )
     res_entry.confidence_score = _calculate_confidence_score(res_entry)
     return res_entry
@@ -381,7 +395,8 @@ def _parse_bibitem_block(
 
 def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int, int]]:
     """Recognize authors and a complete plain title before later venue styling."""
-    prefix = text[:style_start]
+    # "Tác giả. Tiêu đề. In \emph{Hội nghị}": chữ "In" dẫn tới nơi đăng, không phải một khối riêng.
+    prefix = re.sub(r"(?:(?<=\s)|^)[Ii]n:?\s*$", "", text[:style_start])
     # Top-level separators only: braces protect corporate names and title text.
     # Explicit blocks also keep a multi-sentence title together.
     if re.search(r"\\newblock\b", prefix):
@@ -393,16 +408,83 @@ def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int
         if len(parts) != 2:
             return None
     candidate = parts[1]
-    if len(candidate) <= 5 or not candidate.endswith("."):
+    # Tiêu đề có thể là câu hỏi/câu cảm thán ("Are ... useful for forecasting?").
+    if len(candidate) <= 5 or not candidate.endswith((".", "?", "!")):
         return None
     start = prefix.rfind(candidate)
     return start, start + len(candidate)
+
+
+# Khối thứ hai không phải tiêu đề khi nó mở đầu như phần nơi đăng hoặc định danh.
+_NOT_A_TITLE_BLOCK = re.compile(
+    r"(?:in\b|arxiv\b|preprint\b|available\b|https?:|doi\b|vol\b|volume\b|pp\b|pages?\b"
+    r"|\\(?:url|href|doi)\b|\(?\d{4}\)?[.,]?$)", re.IGNORECASE)
+
+
+def _newblock_fields(text: str) -> Optional[tuple[str, str, str]]:
+    r"""(tác giả, tiêu đề, phần còn lại) theo khối ``\newblock`` của BibTeX.
+
+    Các style chuẩn (plain, abbrv, alpha, unsrt, amsplain, ...) xuất mỗi
+    ``\bibitem`` thành các khối: tác giả, tiêu đề, rồi nơi đăng. Trả về
+    ``None`` khi cấu trúc không rõ để các heuristic khác xử lý: ít hơn hai
+    khối, khối tác giả rỗng, hoặc khối thứ hai trông như nơi đăng (``In ...``,
+    ``arXiv:...``, URL, năm). Khi chỉ có hai khối và khối thứ hai được in
+    nghiêng toàn bộ, đó thường là tên tạp chí đi sau "tác giả, tiêu đề", nên
+    cũng trả về ``None``.
+    """
+    if not re.search(r"\\newblock\b", text):
+        return None
+    blocks = [block.strip() for block in _split_names(text, r"\\newblock\b")]
+    if len(blocks) < 2 or not blocks[0].strip(" ,.;:"):
+        return None
+    title = blocks[1].strip().rstrip(",;:").strip()
+    plain = (_standardize_text(title) or "").strip(" .,")
+    if len(plain) <= 5 or _NOT_A_TITLE_BLOCK.match(plain) or _NOT_A_TITLE_BLOCK.match(title):
+        return None
+    if len(blocks) == 2 and re.fullmatch(r"\\(?:emph|textit|em|it)\b\s*\{.*\}[\s\d(),.:;-]*", title):
+        return None
+    return blocks[0].strip().rstrip(",.;:").strip(), title, " \\newblock ".join(blocks[2:])
+
+
+def _venue_from_tail(tail: str) -> Optional[str]:
+    """Tên tạp chí/hội nghị trong phần sau tiêu đề: chữ in nghiêng, hoặc sau ``In``."""
+    match = re.search(r"(?:in\s+)?\\(?:textit|emph|em)\{([^}]+)\}", tail, re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bin\s+([A-Z][A-Za-z0-9\s,\.:&-]+?)(?:,|\.|\b\d{4}\b|$)", tail, re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+
+# Khối nơi đăng bắt đầu như vầy thì không chứa tên tạp chí/nhà xuất bản.
+_NOT_A_VENUE = re.compile(r"(?:url|https?:|arxiv|preprint|doi|available|accessed)\b", re.IGNORECASE)
+
+
+def _venue_from_blocks(tail: str) -> Optional[str]:
+    r"""Nơi đăng sau tiêu đề ở dạng ``\newblock``.
+
+    Ưu tiên chữ in nghiêng hoặc cụm sau ``In`` như ``_venue_from_tail``. Nếu
+    không có, lấy khối đầu tiên (``Annals of Probability, 48(2):963--1001,
+    2020``) và cắt trước số tập, trang hoặc năm.
+    """
+    venue = _venue_from_tail(tail)
+    if venue or not tail.strip():
+        return venue
+    first = _split_names(tail, r"\\newblock\b")[0]
+    plain = re.sub(r"^in:?\s+", "", (_standardize_text(first) or "").strip(), flags=re.IGNORECASE)
+    if _NOT_A_VENUE.match(plain):
+        return None
+    plain = re.split(r";|,\s*(?=\(?\d)|\s\(?\d{4}\)?|,\s*(?:vol|volume|no|pp|pages)\b", plain, maxsplit=1)[0]
+    plain = plain.strip(" ,.;:")
+    return plain if len(plain) > 2 and not plain[0].isdigit() else None
 
 
 def _parse_authors_from_text(raw_authors: str) -> List[str]:
     """Split prose authors conservatively, retaining protected corporate names."""
     # "~" là dấu cách không ngắt: "T.~Smith" là hai từ, không phải một họ.
     raw = re.sub(r"\bet\s+al\b\.?", "", raw_authors.replace("~", " "), flags=re.IGNORECASE).strip()
+    # Style tác giả–năm ("..., and D. Sahoo. 2024."): năm không thuộc tên tác giả cuối.
+    raw = re.sub(r"[\s,]*\(?\b(?:1[5-9]\d{2}|20\d{2})[a-z]?\)?[\s.,]*$", "", raw)
+    # Dấu chấm kết khối sau họ đầy đủ ("D. Sahoo.") không thuộc tên; "J." thì giữ.
+    raw = re.sub(r"(?<=\w\w)(?<!\bJr)(?<!\bSr)(?<!\bInc)(?<!\bLtd)(?<!\bCo)\.$", "", raw)
     names = []
     for segment in _split_names(raw, r"\band\b|\\?&|;"):
         # Braces protect both commas and 'and' inside corporate names.
@@ -412,6 +494,19 @@ def _parse_authors_from_text(raw_authors: str) -> List[str]:
         elif len(chunks) > 2 and len(chunks) % 2 == 0 and all(
                 len(chunks[i].split()) == 1 for i in range(0, len(chunks), 2)):
             chunks = [", ".join(chunks[i:i + 2]) for i in range(0, len(chunks), 2)]
+        elif len(chunks) > 2:
+            # Kiểu trộn "Petropoulos, F., S. Makridakis": họ đứng riêng rồi tới
+            # cụm chỉ gồm chữ viết tắt là một tên "Họ, Tên viết tắt".
+            merged, i = [], 0
+            while i < len(chunks):
+                if (i + 1 < len(chunks) and len(chunks[i].split()) == 1
+                        and re.fullmatch(r"(?:[A-Z]\.(?:-[A-Z]\.)?\s*)+", chunks[i + 1].strip())):
+                    merged.append(f"{chunks[i]}, {chunks[i + 1]}")
+                    i += 2
+                else:
+                    merged.append(chunks[i])
+                    i += 1
+            chunks = merged
         for chunk in chunks:
             name = _clean_author(chunk)
             if name and not re.search(r"^(in|pp|vol|no|page)\b", name, re.IGNORECASE):
@@ -502,12 +597,25 @@ def _year_from_arxiv_id(hint: Optional[str]) -> Optional[int]:
     return None
 
 
+# ===== SO KHỚP CHUỖI KHÔNG DẤU =====
+
+def _folded(text: Optional[str]) -> str:
+    """Chữ thường không dấu, chỉ giữ chữ và số, mỗi cụm còn lại thành một dấu cách.
+
+    Dùng ở bước hậu xử lý AnyStyle (``bibtex_refine``) để so tiêu đề với văn
+    bản ``\\bibitem`` gốc mà không phụ thuộc dấu câu, hoa thường hay dấu thanh.
+    """
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    return " ".join("".join(c if c.isalnum() else " " for c in text).split())
+
+
 # ===== CHUẨN HÓA TRƯỜNG VĂN BẢN =====
 
 # Lệnh định dạng chỉ bọc nội dung: giữ phần trong ngoặc, bỏ lệnh.
 _WRAPPER_COMMAND = re.compile(
     r"\\(?:textit|textbf|textsc|textrm|textsf|texttt|textup|textmd|textnormal|emph|em|bf|it|sc"
-    r"|mbox|hbox|text|uppercase|MakeUppercase|NoCaseChange|url|href\{[^{}]*\})\s*"
+    r"|mbox|hbox|text|uppercase|MakeUppercase|NoCaseChange|url|href\s*\{[^{}]*\})\s*"
     r"\{((?:[^{}]|\{[^{}]*\})*)\}")
 # \bibinfo{field}{value} (natbib/REVTeX) chỉ giữ value; \newblock là dấu ngắt khối.
 _BIBINFO = re.compile(r"\\bibinfo\s*\{[^{}]*\}\s*")
@@ -787,7 +895,6 @@ import argparse
 import itertools
 import threading
 import time
-import unicodedata
 from typing import Callable, Iterable, Sequence, Tuple
 
 
@@ -822,6 +929,8 @@ class UnifiedBibEntry:
     conflicts: List[Dict[str, Any]] = field(default_factory=list)
     # Trường được suy ra thay vì đọc từ nguồn (hiện chỉ có "year" từ arXiv ID).
     inferred_fields: List[str] = field(default_factory=list)
+    # Văn bản \bibitem của phiên bản mới nhất có mục này dưới dạng \bibitem.
+    raw_text: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         """Trả về đúng các cột của bảng chuẩn bibtex."""
@@ -846,7 +955,8 @@ class UnifiedBibEntry:
                 "confidence": self.confidence,
                 "arxiv_id_hint": self.arxiv_id_hint,
                 "conflicts": list(self.conflicts),
-                "inferred_fields": list(self.inferred_fields)}
+                "inferred_fields": list(self.inferred_fields),
+                "raw_text": self.raw_text}
 
 
 @dataclass
@@ -1201,6 +1311,8 @@ def _build_unified_entry(
         arxiv_id_hint=hints[0] if hints else None,
         conflicts=conflicts,
         inferred_fields=inferred,
+        raw_text=max(((version, entry.raw_text) for version, entry in members if entry.raw_text),
+                     default=(None, None))[1],
     )
 
 
@@ -1516,7 +1628,7 @@ def _run_publication_job(
     original_crossref = _enrich_with_crossref
     original_llm = _fallback_parse_with_llm
     if no_network:
-        # Patch the canonical module, including calls through bibtex_extract.
+        # Patch the module globals so every network hook in this process is disabled.
         globals()["_enrich_with_crossref"] = lambda *args, **kwargs: None
         globals()["_fallback_parse_with_llm"] = lambda *args, **kwargs: None
     started = time.perf_counter()

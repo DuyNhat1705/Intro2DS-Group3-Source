@@ -1,4 +1,5 @@
 """Hợp nhất reference giữa các phiên bản và cache enrichment."""
+
 import io
 import json
 import warnings
@@ -9,8 +10,15 @@ from src.m2_types import BibtexEntry
 
 
 def entry(key, title=None, year=None, doi=None, authors=("Vaswani, Ashish",)):
-    return BibtexEntry(arxiv_id="2609.00001", citation_key=key, entry_type="article", title=title,
-                       authors=list(authors), year=year, doi=doi)
+    return BibtexEntry(
+        arxiv_id="2609.00001",
+        citation_key=key,
+        entry_type="article",
+        title=title,
+        authors=list(authors),
+        year=year,
+        doi=doi,
+    )
 
 
 def final_key(result, version, key):
@@ -20,27 +28,36 @@ def final_key(result, version, key):
 
 def test_spec_example_unions_fields_and_renames_keys():
     title = "Attention Is All You Need"
-    result = bibtex.unify_publication("2609.00001", {
-        1: [entry("vaswani2017", title, year=2017)],
-        2: [entry("vit_transformer", title, year=2017, doi="10.1000/attention")],
-        3: [entry("vit_transformer", title, doi="10.1000/attention")],
-    })
+    result = bibtex.unify_publication(
+        "2609.00001",
+        {
+            1: [entry("vaswani2017", title, year=2017)],
+            2: [entry("vit_transformer", title, year=2017, doi="10.1000/attention")],
+            3: [entry("vit_transformer", title, doi="10.1000/attention")],
+        },
+    )
     assert len(result.entries) == 1
     row = result.entries[0].to_row()
     assert row["year"] == 2017 and row["doi"] == "10.1000/attention"
     chosen = row["citation_key"]
-    assert {final_key(result, 1, "vaswani2017"), final_key(result, 2, "vit_transformer"),
-            final_key(result, 3, "vit_transformer")} == {chosen}
+    assert {
+        final_key(result, 1, "vaswani2017"),
+        final_key(result, 2, "vit_transformer"),
+        final_key(result, 3, "vit_transformer"),
+    } == {chosen}
 
 
 def test_transitive_merges_across_stages_form_one_cluster():
     # a-b nối qua DOI, b-c qua tiêu đề, c-d qua key: cần đúng một cụm, các bài khác giữ riêng.
     title = "Deep Residual Learning for Image Recognition"
-    result = bibtex.unify_publication("2609.00001", {
-        1: [entry("a", "Some Other Paper Title Here", doi="10.1/x"), entry("other", "Completely Unrelated Study")],
-        2: [entry("b", title, doi="10.1/x"), entry("c", title, year=2016)],
-        3: [entry("c", title, year=2016), entry("solo", "Yet Another Distinct Work")],
-    })
+    result = bibtex.unify_publication(
+        "2609.00001",
+        {
+            1: [entry("a", "Some Other Paper Title Here", doi="10.1/x"), entry("other", "Completely Unrelated Study")],
+            2: [entry("b", title, doi="10.1/x"), entry("c", title, year=2016)],
+            3: [entry("c", title, year=2016), entry("solo", "Yet Another Distinct Work")],
+        },
+    )
     assert len(result.entries) == 3
     merged = next(item for item in result.entries if item.citation_key == final_key(result, 1, "a"))
     assert sorted(merged.versions_present) == [1, 2, 3]

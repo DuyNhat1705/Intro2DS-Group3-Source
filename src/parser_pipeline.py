@@ -502,6 +502,9 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         cited |= citation_keys(row["content"])
     for row in result["bibtex_debug"]:
         row["cited"] = "*" in cited or row["citation_key"] in cited
+    # Khóa được \cite nhưng không có entry nào: thường do bibliography chỉ có ở dạng .bbl
+    # (Milestone 1 chỉ giữ .tex/.bib) hoặc tác giả trích khóa không tồn tại.
+    unresolved = sorted(cited - {"*"} - {row["citation_key"] for row in result["bibtex"]})
 
     for number, row in rows.items():
         messages = ([row["message"]] if row["message"] else []) + row["errors"]
@@ -539,6 +542,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         elapsed_sec=time.perf_counter() - started, input_bytes=input_bytes,
         category=category, warnings_count=len(result["warnings"]),
         bibtex_cited=sum(row["cited"] for row in result["bibtex_debug"]),
+        cite_keys=len(cited - {"*"}), cite_keys_unresolved=len(unresolved),
         dependency_warning_count=sum(dependency_warnings.values()),
         bibliography_status=("error" if any(r["bibliography_status"] == "error" for r in rows.values()) else
             "missing_sources" if any(r["bibliography_status"] == "missing_sources" for r in rows.values()) else
