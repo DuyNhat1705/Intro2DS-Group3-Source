@@ -45,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--workers", default="auto", help="'auto', N >= 1, or 0 for in-process")
     ap.add_argument("--limit", type=int, default=None, help="first K papers (sorted by key)")
     ap.add_argument("--papers", nargs="*", default=None, help="arXiv IDs or paper keys")
+    ap.add_argument("--ranges", nargs="*", default=None,
+                    help="restrict to arXiv ID ranges, e.g. 2608:4007-9006 (the M1 scraper ranges)")
+    ap.add_argument("--log-dir", default=None, help="where run summaries go (default <work-dir>/runs)")
     ap.add_argument("--sample", choices=["dev"], default=None,
                     help="restrict to the 200-paper stratified dev sample (tests/samples.py)")
     ap.add_argument("--resume", action="store_true", help="skip papers with unchanged signature")
@@ -76,6 +79,22 @@ def main(argv=None) -> int:
     if a.sample == "dev":
         from .tests.samples import DEV_SAMPLE
         papers = list(DEV_SAMPLE) + list(papers or [])
+    if a.ranges:
+        wanted = []
+        for spec in a.ranges:
+            month, span = spec.split(":")
+            lo, hi = (int(x) for x in span.split("-"))
+            wanted.append((month, lo, hi))
+
+        def in_ranges(key: str) -> bool:
+            m, _, num = key.partition("-")
+            return num.isdigit() and any(m == mo and lo <= int(num) <= hi for mo, lo, hi in wanted)
+        from .discover import list_paper_dirs
+        keys = [d.name for d in list_paper_dirs(data) if in_ranges(d.name)]
+        papers = (papers or []) + keys
+        if not papers:
+            print("[m2] no paper folder in the requested ranges")
+            return 1
     jobs = discover(data, papers=papers, limit=a.limit)
     t_disc = time.perf_counter() - t0
     prev = {}
@@ -130,7 +149,7 @@ def main(argv=None) -> int:
         "work_bytes_total": dir_size(work),
         "failed_papers": st.failed_papers[:50], "compaction": comp,
     }
-    rd = work / "runs"
+    rd = Path(a.log_dir) if a.log_dir else work / "runs"
     rd.mkdir(parents=True, exist_ok=True)
     with open(rd / f"{run_id}.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=1)

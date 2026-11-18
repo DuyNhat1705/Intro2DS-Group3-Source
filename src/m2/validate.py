@@ -57,7 +57,8 @@ def _files(d: Path) -> list[Path]:
     return sorted(d.glob("*.parquet")) if d.is_dir() else []
 
 
-def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=print) -> dict:
+def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=print,
+             exports_dir: Path | None = None) -> dict:
     out_dir, work_dir = Path(out_dir), Path(work_dir)
     R = Counter()
     depth_hist = Counter()
@@ -236,7 +237,7 @@ def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=pr
         "kinds": {k[5:]: v for k, v in R.items() if k.startswith("kind:")},
         "examples": dict(examples),
     }
-    ed = work_dir / "report_exports"
+    ed = Path(exports_dir) if exports_dir else work_dir / "report_exports"
     ed.mkdir(parents=True, exist_ok=True)
     with open(ed / "validation.json", "w", encoding="utf-8") as fh:
         json.dump(rep, fh, indent=1, ensure_ascii=False)
@@ -258,8 +259,9 @@ def main(argv=None):
     ap.add_argument("--out", default="data/tables")
     ap.add_argument("--work-dir", default="data/m2")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--exports-dir", default=None, help="default <work-dir>/report_exports")
     a = ap.parse_args(argv)
-    rep = validate(Path(a.out), Path(a.work_dir), Path(a.data_dir))
+    rep = validate(Path(a.out), Path(a.work_dir), Path(a.data_dir), exports_dir=a.exports_dir)
     return 1 if rep["violations_total"] else 0
 
 

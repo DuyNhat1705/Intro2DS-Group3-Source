@@ -274,6 +274,8 @@ python -m src.m2.run --data-dir data --out data/tables --work-dir data/m2 --work
 | `--work-dir DIR` | internal working data, default `data/m2` |
 | `--workers auto\|N\|0` | `auto` = min(CPUs, free RAM / per-worker estimate, cgroup aware); `0` = in-process (debug) |
 | `--limit K` / `--papers ID ...` / `--sample dev` | first K papers / given arXiv IDs or keys / the 200-paper dev sample |
+| `--ranges 2608:4007-9006 ...` | restrict to arXiv ID ranges (the M1 scraper ranges) |
+| `--log-dir DIR` | where run summaries go (default `<work-dir>/runs`); `validate`/`stats` take `--exports-dir` |
 | `--resume` | skip papers whose checkpoint signature (paths + sizes + contents + parser version) is unchanged |
 | `--compact`, `--compact-only`, `--n-shards N` | merge shards into N deterministic files sorted by `arxiv_id` |
 | `--timeout S` | per-paper deadline of the watchdog (default 60 s); a timed-out paper is retried once in safe mode |
@@ -289,21 +291,31 @@ python -m src.m2.inspect_tree 2608.04009 --version 1 --depth 3                  
 
 ### 4. Running on Google Colab (benchmark testbed)
 
-1. Open `src/parser.ipynb` in Colab with a **CPU** runtime; set `REPO_URL`, `BRANCH` and the Drive
-   paths in the first cell.
+1. Open `src/parser.ipynb` in Colab with a **CPU** runtime. In the first cell choose the range(s) with
+   `RUN_RANGES` (same definition as `scraper.ipynb`), optionally `SAMPLE_N`, and check `DRIVE_PROJECT_DIR`.
 2. *Runtime → Run all*. The notebook installs the requirements, mounts Drive, packs `data/` once into a tar
-   on Drive (without `references.json`) and extracts it to `/content` — this step is timed separately —
-   then runs a 20-paper smoke test, the full run (`--resume`, so a new session continues where the previous
-   one stopped), compaction, validation, statistics and prints the measurements (wall time, time per
-   publication/version, peak RAM of parent + workers, output size, cache and reuse rates).
-3. With `OUTPUT_ON_DRIVE = True` (default) the tables and the resume checkpoints are written directly to
-   `DRIVE_OUT` (`tables/`, `m2/manifest/`). If the session disconnects, reconnect and *Run all* again: finished
-   papers are skipped, at most the last unflushed batch (≤ 200 papers per worker) is redone, and an interrupted
-   tar creation or extraction is never reused.
-4. Locally the results are in `data/tables/{elements,hierarchy,bibtex}/` and `data/m2/` (run summaries in
-   `data/m2/runs/`, report exports in `data/m2/report_exports/`).
+   on Drive (without `references.json`) and extracts it to `/content` — timed separately — then runs the unit
+   tests and the gold-set evaluation, the full run, compaction, validation and
+   statistics, and shows the report: parsing success, version coverage of every publication, counts before /
+   after deduplication, element kinds and depth, bibliography sources, accuracy proxies, running time and memory.
+3. Outputs are written directly to `<project>/statistics_data/parser/` (on Drive in Colab, in the repository
+   locally):
 
-Locally the same notebook skips the Drive/clone steps and runs on a small sample of `data/`.
+   ```text
+   statistics_data/parser/
+   ├── tables/<WORKER>/{elements,hierarchy,bibtex}/   # the three tables (Parquet shards)
+   ├── report_exports/<WORKER>/                      # summary/validation/benchmark/gold JSON, CSVs, figures/
+   ├── run_logs/<WORKER>/                            # one summary per run
+   └── .state/<WORKER>/                              # checkpoints (manifest/) and internal working data
+   ```
+
+   `<WORKER>` is `R4`, `R1-R2`, … after the selected ranges (or `WORKER`). If a Colab session disconnects,
+   reconnect and *Run all* again: finished papers are skipped (`RESUME = True`), at most the last unflushed batch
+   (≤ 200 papers per worker) is redone, and an interrupted tar creation or extraction is never reused. For the
+   final benchmark set `RESUME = False`.
+
+The same notebook runs locally (Python 3.12, `src/requirements.txt`): it skips the Drive/clone steps and reads
+`<repo>/data`.
 
 ### 5. Optional AnyStyle refinement
 

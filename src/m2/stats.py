@@ -42,9 +42,10 @@ def _write_csv(path: Path, header: list[str], rows) -> None:
         w.writerows(rows)
 
 
-def export(out_dir: Path, work_dir: Path, log=print) -> dict:
+def export(out_dir: Path, work_dir: Path, log=print, exports_dir: Path | None = None,
+           log_dir: Path | None = None) -> dict:
     out_dir, work_dir = Path(out_dir), Path(work_dir)
-    ed = work_dir / "report_exports"
+    ed = Path(exports_dir) if exports_dir else work_dir / "report_exports"
     ed.mkdir(parents=True, exist_ok=True)
     res: dict = {}
     st = _read(work_dir / "parse_status")
@@ -132,7 +133,8 @@ def export(out_dir: Path, work_dir: Path, log=print) -> dict:
         v = json.load(open(vj, encoding="utf-8"))
         _write_csv(ed / "kind_counts.csv", ["kind", "elements"], sorted(v.get("kinds", {}).items()))
     runs = []
-    for f in sorted((work_dir / "runs").glob("*.json")) if (work_dir / "runs").is_dir() else []:
+    rdir = Path(log_dir) if log_dir else work_dir / "runs"
+    for f in sorted(rdir.glob("*.json")) if rdir.is_dir() else []:
         try:
             r = json.load(open(f, encoding="utf-8"))
             r.pop("failed_papers", None)
@@ -151,8 +153,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="data/tables")
     ap.add_argument("--work-dir", default="data/m2")
+    ap.add_argument("--exports-dir", default=None, help="default <work-dir>/report_exports")
+    ap.add_argument("--log-dir", default=None, help="run summaries, default <work-dir>/runs")
     a = ap.parse_args(argv)
-    export(Path(a.out), Path(a.work_dir))
+    export(Path(a.out), Path(a.work_dir), exports_dir=a.exports_dir, log_dir=a.log_dir)
 
 
 if __name__ == "__main__":
