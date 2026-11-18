@@ -296,7 +296,12 @@ python -m src.m2.inspect_tree 2608.04009 --version 1 --depth 3                  
    then runs a 20-paper smoke test, the full run (`--resume`, so a new session continues where the previous
    one stopped), compaction, validation, statistics and prints the measurements (wall time, time per
    publication/version, peak RAM of parent + workers, output size, cache and reuse rates).
-3. Results are copied back to `DRIVE_OUT`.
+3. With `OUTPUT_ON_DRIVE = True` (default) the tables and the resume checkpoints are written directly to
+   `DRIVE_OUT` (`tables/`, `m2/manifest/`). If the session disconnects, reconnect and *Run all* again: finished
+   papers are skipped, at most the last unflushed batch (≤ 200 papers per worker) is redone, and an interrupted
+   tar creation or extraction is never reused.
+4. Locally the results are in `data/tables/{elements,hierarchy,bibtex}/` and `data/m2/` (run summaries in
+   `data/m2/runs/`, report exports in `data/m2/report_exports/`).
 
 Locally the same notebook skips the Drive/clone steps and runs on a small sample of `data/`.
 
