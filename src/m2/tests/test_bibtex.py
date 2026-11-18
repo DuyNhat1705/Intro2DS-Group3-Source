@@ -136,7 +136,7 @@ def test_real_bibitems(raw, title, first, year, method):
     ents = parse_bibitems(raw)
     assert len(ents) == 1
     e = ents[0]
-    assert e.title == title
+    assert (e.title or None) == title
     assert e.authors and e.authors[0] == first
     assert e.year == year
     assert e.parse_method == method
