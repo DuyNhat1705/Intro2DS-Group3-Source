@@ -18,3 +18,9 @@ dependencies:
       - matplotlib==3.11.2
       - wtpsplit==2.2.2
       - onnxruntime==1.31.1
+      # Milestone 2 parser (src/m2)
+      - rapidfuzz==3.14.6
+      - plotly==7.1.0
+      # Milestone 2 development only (tests and profiling)
+      - pytest==9.2.0
+      - pyinstrument==5.1.3
