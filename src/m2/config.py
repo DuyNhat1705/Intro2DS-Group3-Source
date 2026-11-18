@@ -8,7 +8,7 @@ the output must bump :data:`PARSER_VERSION`, which invalidates the resume checkp
 from __future__ import annotations
 
 # Bump on any change that alters parser output (part of the checkpoint signature).
-PARSER_VERSION = "m2-1.0.0"
+PARSER_VERSION = "m2-1.1.0"
 
 # ---------------------------------------------------------------------------------------
 # Limits
