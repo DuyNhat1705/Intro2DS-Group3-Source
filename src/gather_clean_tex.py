@@ -46,22 +46,25 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 if __package__:
-    from .utils import GatherTex, list_files
+    from .utils import GatherTex, file_inventory
 else:
-    from utils import GatherTex, list_files
+    from utils import GatherTex, file_inventory
 
 __all__ = [
     "ABLATION_LEVELS",
     "AmbiguousRootError",
     "CLEANUP_STEPS",
+    "ExcludedFileWarning",
     "GatherError",
     "GatherWarning",
+    "MissingBibliographyWarning",
     "NoRootError",
     "before_after_html",
     "chars_by_file",
     "clean_blocks",
     "cleanup_latex",
     "dedup_ablation",
+    "excluded_by_corpus",
     "gather_report",
     "gather_tex",
     "locate",
@@ -91,7 +94,17 @@ class GatherWarning(UserWarning):
 
 
 class MissingBibliographyWarning(GatherWarning):
-    """Thiếu bibliography tùy chọn; không làm mất phần nội dung chính."""
+    """An optional bibliography is missing; the main content is not lost."""
+
+
+class ExcludedFileWarning(GatherWarning):
+    """An included non-TeX file (TikZ/PGF figure, style, data) is absent because the
+    Milestone 1 corpus keeps only .tex/.bib files; no TeX source is lost."""
+
+
+def excluded_by_corpus(name: str) -> bool:
+    """Whether an include target is a file type the .tex/.bib-only corpus never keeps."""
+    return Path(name).suffix.lower() not in {"", ".tex", ".bib", ".bbl"}
 
 
 # ============================================================== T1: patterns
@@ -414,10 +427,11 @@ class _LineTable:
 # ============================================================== T3: assets
 
 
-def _index_files(version_dir: Path, files: list[Path] | None = None) -> dict[str, list[Path]]:
+def _index_files(version_dir: Path, files=None) -> dict[str, list[Path]]:
     """Map lower-cased basenames to the files of the version, for fallback lookups."""
     index: dict[str, list[Path]] = {}
-    for p in list_files(version_dir) if files is None else files:
+    # Sorted so fallback lookups do not depend on directory listing order.
+    for p in sorted(file_inventory(version_dir) if files is None else files):
         index.setdefault(p.name.lower(), []).append(p)
     return index
 
@@ -509,7 +523,16 @@ _NOT_CONDITIONALS = frozenset(
 )
 
 # arXiv compiles with (pdf)LaTeX from TeX Live: these engine tests are decidable.
-_ENGINE_IFS = {"ifxetex": False, "ifXeTeX": False, "ifluatex": False, "ifLuaTeX": False}
+_ENGINE_IFS = {"ifxetex": False, "ifXeTeX": False, "ifluatex": False, "ifLuaTeX": False,
+               # iftex: latex and pdflatex both run the pdfTeX engine on arXiv.
+               "ifPDFTeX": True}
+# IEEEtran sets \ifCLASSOPTION<name> true only when <name> is a class option; these
+# default to false, so the \documentclass options decide them.
+_IEEE_CLASS = re.compile(r"\\documentclass\s*(?:\[([^\]]*)\])?\s*\{IEEEtran\}")
+_IEEE_EXPLICIT_OPTIONS = frozenset(
+    "captionsoff peerreview peerreviewca compsoc comsoc transmag conference technote "
+    "draftcls draftclsnofoot onecolumn romanappendices twoside".split()
+)
 _KNOWN_DEFINED = frozenset(
     "pdfoutput pdftexversion pdfstrcmp pdfpagewidth pdfpageheight pdfminorversion pdfcompresslevel "
     "pdfobjcompresslevel pdfinfo pdfsuppresswarningpagegroup pdfgentounicode pdfglyphtounicode".split()
@@ -523,6 +546,15 @@ _RELAX_AFTER = re.compile(r"\s*\\relax(?![A-Za-z@])")
 _IFX_PAIR = re.compile(r"\s*\\([A-Za-z@]+)\s*\\([A-Za-z@]+)(?![A-Za-z@])")
 _IF_ONE_CS = re.compile(r"\s*\\([A-Za-z@]+)(?![A-Za-z@])")
 _IFCSNAME = re.compile(r"\s*([A-Za-z@]+)\s*\\endcsname(?![A-Za-z@])")
+# Operands: one character token for \if; an integer (or a macro defined as one) for \ifnum/\ifodd.
+_IF_CHAR = re.compile(r"\\([A-Za-z@]+)(?![A-Za-z@])[ \t]*|([^\\{}%#$\s])")
+_INT_OPERAND = re.compile(r"\s*(?:(-?\d+)|\\([A-Za-z@]+)(?![A-Za-z@]))")
+_RELATION = re.compile(r"\s*([<=>])")
+# Text right before a control sequence that makes it the argument of a definition.
+_DEFINING_BEFORE = re.compile(
+    r"(?:\\(?:(?:re)?newcommand|providecommand|DeclareRobustCommand|[gex]?def|let|newif)\*?\s*\{?\s*"
+    r"|\\let\s*\\[A-Za-z@]+\s*=?\s*)\Z"
+)
 
 
 def _find_definition(name: str, texts: Iterable[str]) -> str | None:
@@ -554,20 +586,71 @@ def _defined(name: str, texts: Iterable[str]) -> bool | None:
     return None  # a package might define it: unknown
 
 
+def _char_operand(text: str, pos: int, texts: list[str]) -> tuple[str, int] | None:
+    r"""A token compared by ``\if``: a character, or a macro whose definition is one character."""
+    m = _IF_CHAR.match(text, pos)
+    if m is None:
+        return None
+    if m.group(2) is not None:
+        return m.group(2), m.end()
+    body = _find_definition(m.group(1), texts)
+    if body is None or len(body.strip()) != 1 or body.strip() in "\\{}%#$":
+        return None
+    return body.strip(), m.end()
+
+
+def _int_operand(text: str, pos: int, texts: list[str]) -> tuple[int, int] | None:
+    r"""An integer literal, or a macro the author defined as one (``\def\ANON{0}``)."""
+    m = _INT_OPERAND.match(text, pos)
+    if m is None:
+        return None
+    if m.group(1) is not None:
+        return int(m.group(1)), m.end()
+    body = _find_definition(m.group(2), texts)
+    if body is None or not re.fullmatch(r"\s*-?\d+\s*", body):
+        return None
+    return int(body), m.end()
+
+
 def _evaluate_if(name: str, text: str, pos: int, texts: list[str]) -> tuple[bool, int] | None:
     r"""Decide the common "is this macro empty / defined?" tests; returns (value, end) or None.
 
     ``\if\relax\detokenize{..}\relax`` (emptiness test), ``\ifx\M\empty``,
     ``\ifx\M\undefined``, ``\ifdefined\M``, ``\ifcsname M\endcsname`` and the
-    engine tests ``\ifxetex`` / ``\ifluatex``. A test on a macro argument
-    (``#1``) is never decided: it runs at each use, not here.
+    engine tests ``\ifxetex`` / ``\ifluatex``. Also decided: ``\if`` on two
+    character tokens (``\if false`` compares f with a, ``\if1\anon`` uses the
+    author's ``\def\anon{1}``), ``\ifnum`` / ``\ifodd`` on integers or macros
+    defined as integers, and IEEEtran's ``\ifCLASSOPTION...`` flags from the
+    class options. A test on a macro argument (``#1``) or on a register is never
+    decided: it runs at each use, not here.
     """
     if name in _ENGINE_IFS:
         return _ENGINE_IFS[name], pos
+    if name.startswith("ifCLASSOPTION") and name[len("ifCLASSOPTION"):] in _IEEE_EXPLICIT_OPTIONS:
+        for t in texts:
+            m = _IEEE_CLASS.search(t)
+            if m is not None:
+                options = {o.strip() for o in (m.group(1) or "").split(",")}
+                return name[len("ifCLASSOPTION"):] in options, pos
+        return None
+    if name == "ifodd":
+        r = _int_operand(text, pos, texts)
+        return None if r is None else (r[0] % 2 == 1, r[1])
+    if name == "ifnum":
+        left = _int_operand(text, pos, texts)
+        rel = left and _RELATION.match(text, left[1])
+        right = rel and _int_operand(text, rel.end(), texts)
+        if not right:
+            return None
+        a, op, b = left[0], rel.group(1), right[0]
+        return (a < b if op == "<" else a == b if op == "=" else a > b), right[1]
     if name == "if":
         m = _IF_DETOKENIZE.match(text, pos)
         if m is None:
-            return None
+            start = _AFTER_CS.match(text, pos).end()
+            first = _char_operand(text, start, texts)
+            second = first and _char_operand(text, first[1], texts)
+            return None if not second else (first[0] == second[0], second[1])
         r = _read_arg(text, m.end())
         if r is None:
             return None
@@ -662,16 +745,18 @@ class _Expander:
         self.includeonly: set[str] | None = None
         self.used_conditionals = False
         self.undecided = 0  # conditionals kept verbatim because their test is unknown
+        self.undecided_body = 0  # ... of which at the top level of the document body
+        self.in_document = False  # \begin{document} has been emitted
         self.root_dir: Path | None = None
         self.ended = False  # end{document} ends the whole compilation, even in an input
         # Everything emitted so far: a test sees only the definitions TeX has read before it.
         self.emitted: list[str] = []
 
     def snapshot(self) -> tuple:
-        return (self.tex_files, self.missing, list(self.notes), self.spans, self.undecided)
+        return (self.tex_files, self.missing, list(self.notes), self.spans, self.undecided, self.undecided_body)
 
     def restore(self, state: tuple) -> None:
-        self.tex_files, self.missing, self.notes[:], self.spans, self.undecided = state
+        self.tex_files, self.missing, self.notes[:], self.spans, self.undecided, self.undecided_body = state
 
     # ------------------------------------------------------------ helpers
     def emitting(self) -> bool:
@@ -699,6 +784,11 @@ class _Expander:
 
     def _classify_if(self, name: str, text: str, pos: int):
         """``None``: not a conditional; ``("known", value[, end])``; ``("unknown", True)``."""
+        # The name being defined or let (\newcommand{\iffdef}, \let\ifdraft\iftrue) is an
+        # argument, not a test: it opens no conditional and needs no \fi.
+        start = pos - len(name) - 1
+        if _DEFINING_BEFORE.search(text[max(0, start - 80):start]):
+            return None
         if name == "iftrue":
             return ("known", True)
         if name == "iffalse":
@@ -708,7 +798,14 @@ class _Expander:
         if name in _NOT_CONDITIONALS:
             return None
         # "\ifx\foo\undefined \newcommand\foo..\fi": the definition after the test does not count.
-        decided = _evaluate_if(name, text, pos, ["".join(self.emitted)])
+        seen = ["".join(self.emitted)]
+        if name not in _PRIMITIVE_IFS and name not in _ENGINE_IFS:
+            body = _find_definition(name, seen)
+            if body in ("\\iftrue", "\\iffalse"):  # \let\ifdraft\iftrue
+                return ("known", body == "\\iftrue")
+            if body is not None:
+                return None  # the author's own macro whose name merely starts with "if" (\iffdef)
+        decided = _evaluate_if(name, text, pos, seen)
         if decided is not None:
             return ("known", decided[0], decided[1])
         if name not in _PRIMITIVE_IFS:
@@ -716,6 +813,25 @@ class _Expander:
             if nxt < len(text) and text[nxt] == "{":
                 return None  # an \ifsomething{..}{..} command, not a conditional
         return ("unknown", True)
+
+    def _in_body_text(self, masked: str, pos: int) -> bool:
+        """Whether an undecided conditional can change the text a reader sees.
+
+        Conditionals in the preamble, inside a braced group (a macro definition,
+        a command argument) or inside thebibliography (not part of the
+        hierarchy) only choose definitions or formatting; keeping them verbatim
+        loses nothing. One at the top level of the document body may decide
+        which prose appears in the PDF.
+        """
+        if not self.in_document:
+            self.in_document = bool(_BEGIN_DOCUMENT.search("".join(self.emitted)))
+            if not self.in_document:
+                return False
+        opened = masked.count("{", 0, pos) - masked.count("\\{", 0, pos)
+        closed = masked.count("}", 0, pos) - masked.count("\\}", 0, pos)
+        if opened > closed:
+            return False
+        return masked.rfind("\\begin{thebibliography}", 0, pos) <= masked.rfind("\\end{thebibliography}", 0, pos)
 
     # ------------------------------------------------------------ walking
     def walk(self, text: str, *, path: Path | None = None, base_dir: Path | None = None,
@@ -768,6 +884,7 @@ class _Expander:
                     self.stack.append(["unknown", True])
                     if self.emitting():
                         self.undecided += 1
+                        self.undecided_body += self._in_body_text(masked, m.start())
                 else:
                     self.stack.append(["known", kind[1]])
                     self.used_conditionals = True
@@ -849,13 +966,14 @@ class _Expander:
         at = self.where(path, file_off + m.start())
         if target is None:
             if name in {"glyphtounicode", "glyphtounicode.tex"}:
-                # Bảng ánh xạ glyph của TeX Live phục vụ PDF, không chứa nội
-                # dung bài. Chỉ bỏ qua tên hệ thống chính xác khi không có file.
+                # TeX Live glyph mapping tables used for PDF output, with no
+                # paper content. Only exact system names are skipped when the file is absent.
                 self.notes.append(f"skipped system font mapping: {name}{at}")
                 return ""
             self.missing.append(name)
             self.notes.append(f"include not found: {name}{at}")
-            category = MissingBibliographyWarning if Path(name).suffix.lower() in {".bib", ".bbl"} else GatherWarning
+            category = (MissingBibliographyWarning if Path(name).suffix.lower() in {".bib", ".bbl"} else
+                        ExcludedFileWarning if excluded_by_corpus(name) else GatherWarning)
             warnings.warn(f"{self.version_dir}: include not found: {name}{at}", category, stacklevel=2)
             return ""
         if target in chain:
@@ -1002,7 +1120,7 @@ def _pick_root(texts: dict[Path, str], version_dir: Path, index) -> tuple[Path, 
     return pool[0], f"{len(cands)} candidates; " + ", ".join(reasons)
 
 
-def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex | None:
+def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig", files=None) -> GatherTex | None:
     r"""Expand static inputs in compilation order and list referenced .bib files.
 
     Returns ``None`` for an empty version: the directory exists but holds no
@@ -1024,9 +1142,9 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
     if not version_dir.is_dir():
         raise FileNotFoundError(f"version directory not found: {version_dir}")
     version_dir = version_dir.resolve()
-    # Một lượt duyệt dùng cho cả danh sách .tex lẫn chỉ mục tìm tệp.
-    files = list_files(version_dir)
-    tex_paths = [p for p in files if p.suffix.lower() == ".tex"]
+    # Reuse the current run's absolute-path inventory when provided.
+    files = file_inventory(version_dir) if files is None else files
+    tex_paths = sorted(p for p in files if p.suffix.lower() == ".tex")
     if not tex_paths:
         return None
 
@@ -1042,8 +1160,12 @@ def gather_tex(version_dir: Path, *, encoding: str = "utf-8-sig") -> GatherTex |
     source = expander.run(root)
     missing = list(expander.missing)
     origins = _line_origins(source, expander, root)
-    if expander.undecided:
-        notes.append(f"{expander.undecided} conditional(s) with an undecidable test kept verbatim")
+    if expander.undecided > expander.undecided_body:
+        notes.append(f"{expander.undecided - expander.undecided_body} conditional(s) with an undecidable test "
+                     "kept verbatim in the preamble, a macro definition or the bibliography")
+    if expander.undecided_body:
+        notes.append(f"{expander.undecided_body} conditional(s) with an undecidable test kept verbatim "
+                     "in the document body")
 
     bib_files: list[Path] = []
     for m in _BIBLIOGRAPHY.finditer(_mask_literals(source)):
@@ -1722,11 +1844,11 @@ _FORMAT_SWITCHES = (
 ).split()
 _FORMAT_DROP_ARGS = {
     "vspace": "{", "hspace": "{", "label": "{",
-    # elsarticle: tùy chọn natbib và tiêu đề trang chạy, không phải nội dung bài.
+    # elsarticle: natbib option and running title, not paper content.
     "biboptions": "{", "verso": "{", "recto": "{", "setlength": "{{", "addtolength": "{{",
     "setcounter": "{{", "addtocounter": "{{", "rule": "[{{", "pagestyle": "{",
     "thispagestyle": "{", "bibliographystyle": "{",
-    # fancyhdr: đầu/chân trang chạy, không phải nội dung bài.
+    # fancyhdr: running headers/footers, not paper content.
     "fancyhead": "[{", "fancyfoot": "[{", "lhead": "[{", "chead": "[{", "rhead": "[{",
     "lfoot": "[{", "cfoot": "[{", "rfoot": "[{", "articletype": "{", "captionsetup": "[{", "graphicspath": "{",
     "hypersetup": "{", "enlargethispage": "{", "linespread": "{", "fontsize": "{{", "color": "[{",
@@ -1763,7 +1885,7 @@ _LAYOUT_ENVS = {
     "small": "", "footnotesize": "", "scriptsize": "", "raggedright": "", "spacing": "{",
     "singlespace": "", "onehalfspace": "", "doublespace": "", "sloppypar": "",
 }
-# keywords (elsarticle, IOP, ...) là front matter như lệnh \keywords{...} đã bị bỏ ở trên.
+# keywords (elsarticle, IOP, ...) are front matter, like the \keywords{...} command dropped above.
 _DROP_ENVS = re.compile(r"\\begin\{(CCSXML|keywords)\}.*?\\end\{\1\}", re.S)
 _FLOAT_OPTION = re.compile(
     r"(\\begin\{(?:figure|table|algorithm|sidewaysfigure|sidewaystable|SCfigure|wrapfigure|wraptable"
@@ -1930,7 +2052,7 @@ _FORMAT_TABLE: dict[str, tuple[str, object]] = {
     "qtylist": ("[{{", lambda a: f"{_si_list(a[1])} {_si_unit(a[2])}"),
     "numlist": ("[{", lambda a: _si_list(a[1])),
     "detokenize": ("{", lambda a: _escape_detokenized(a[0])),
-    # IEEEtran: chữ hoa trang trí đầu bài, \IEEEPARstart{W}{ith} là "With".
+    # IEEEtran: decorative capital at the start of the paper; \IEEEPARstart{W}{ith} is "With".
     "IEEEPARstart": ("{{", lambda a: _s(a[0]) + _s(a[1])),
 }
 _LAYOUT_ENV_RX = re.compile(r"\\(begin|end)\{(" + "|".join(map(re.escape, _LAYOUT_ENVS)) + r")\}")

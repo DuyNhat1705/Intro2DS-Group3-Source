@@ -1,8 +1,11 @@
-"""Điều phối parser theo bài báo, giữ riêng dữ liệu bảng và chẩn đoán.
+"""Per-publication parser orchestration, keeping table data and diagnostics separate.
 
-Không chạy corpus, ghi tệp hay nhập pandas. Khóa phiên bản trong ``key_map``
-là chuỗi để kết quả giữ nguyên sau vòng ghi/đọc JSON. ``versions_error`` gồm
-cả ``missing_dir`` và ``not_found``; hai bộ đếm riêng là tập con của nó.
+Does not run the corpus, write files or import pandas. Version keys in
+``key_map`` are strings so results survive a JSON write/read round trip.
+``versions_error`` includes ``missing_dir`` (its separate counter is a subset of
+it). A ``not_found`` version, confirmed absent from arXiv by the download state,
+is counted apart in ``versions_not_found``: like an empty version it has no
+source, so it lowers coverage without making the paper partial.
 """
 
 from __future__ import annotations
@@ -18,20 +21,24 @@ from pathlib import Path
 
 if __package__:
     from .bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
-    from .gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from .hierarchy import HierarchyDeduplicationWarning, build_element_tables, citation_keys, construct_hierarchy, rewrite_citations
-    from .utils import get_paper_dir, list_files
+    from .gather_clean_tex import (ExcludedFileWarning, MissingBibliographyWarning, cleanup_latex,
+                                   excluded_by_corpus, gather_tex)
+    from .hierarchy import (HierarchyDeduplicationWarning, SentenceCache, build_element_tables, citation_keys,
+                            construct_hierarchy, rewrite_citations)
+    from .utils import file_inventory, get_paper_dir
 else:
     from bibtex import BibliographyMetadataWarning, BibliographyWarning, extract_bibtex, unify_publication
-    from gather_clean_tex import MissingBibliographyWarning, cleanup_latex, gather_tex
-    from hierarchy import HierarchyDeduplicationWarning, build_element_tables, citation_keys, construct_hierarchy, rewrite_citations
-    from utils import get_paper_dir, list_files
+    from gather_clean_tex import (ExcludedFileWarning, MissingBibliographyWarning, cleanup_latex,
+                                  excluded_by_corpus, gather_tex)
+    from hierarchy import (HierarchyDeduplicationWarning, SentenceCache, build_element_tables, citation_keys,
+                           construct_hierarchy, rewrite_citations)
+    from utils import file_inventory, get_paper_dir
 
 __all__ = ["discover_publications", "parse_publication"]
 
 
 def _arxiv_id(value: str) -> str:
-    """Đổi tên thư mục do get_paper_dir tạo thành ID chuẩn, không nhận hậu tố vN."""
+    """Turn a directory name created by get_paper_dir into a canonical ID; vN suffixes are rejected."""
     if not isinstance(value, str):
         raise ValueError(f"Invalid arXiv ID: {value!r}")
     modern = re.fullmatch(r"(\d{2}(?:0[1-9]|1[0-2]))[.-](\d{4,5})", value)
@@ -46,14 +53,14 @@ def _arxiv_id(value: str) -> str:
 
 
 def _version(value: str) -> int:
-    """Đọc số phiên bản dương ở dạng N hoặc vN."""
+    """Read a positive version number in N or vN form."""
     if not isinstance(value, str) or not re.fullmatch(r"v?[1-9]\d*", value):
         raise ValueError(f"Invalid version name: {value!r}")
     return int(value.removeprefix("v"))
 
 
 def _read_json(path: Path) -> dict:
-    """Đọc đối tượng JSON và từ chối khóa trùng thay vì âm thầm ghi đè."""
+    """Read a JSON object, rejecting duplicate keys instead of silently overwriting them."""
     def pairs(items):
         result = {}
         for key, value in items:
@@ -69,7 +76,7 @@ def _read_json(path: Path) -> dict:
 
 
 def _expected(data: dict, label: str, errors: list[str]) -> set[int]:
-    """Lấy miền phiên bản đã khai báo; phân biệt thiếu trường với trường hỏng."""
+    """Get the declared version range; distinguish a missing field from a broken one."""
     if "num_versions" not in data:
         return set()
     count = data["num_versions"]
@@ -79,33 +86,68 @@ def _expected(data: dict, label: str, errors: list[str]) -> set[int]:
     return set(range(1, count + 1))
 
 
+def _state_paths(root, state_ranges=None):
+    """Read the relevant state files; shared/custom-named state is kept so no source is lost."""
+    paths = [root / "source_state.json"] if (root / "source_state.json").is_file() else []
+    state_root = root / ".state"
+    if not state_root.is_dir():
+        return paths
+    if state_ranges is None:
+        return paths + sorted(state_root.rglob("source_state.json"))
+    if (state_root / "source_state.json").is_file():
+        paths.append(state_root / "source_state.json")
+    selected = set(state_ranges)
+    for directory in sorted(state_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        # This is the naming convention of scraper.ipynb; other names are still read.
+        if (re.fullmatch(r"R[1-9]\d*(?:\+R[1-9]\d*)*", directory.name)
+                and not selected.intersection(directory.name.split("+"))):
+            continue
+        paths.extend(sorted(directory.rglob("source_state.json")))
+    return paths
+
+
 def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
-                          existing_only=False, limit=None) -> list[dict]:
-    """Tìm bài và hợp miền phiên bản từ metadata, trạng thái tải và thư mục.
+                          existing_only=False, limit=None, state_ranges=None) -> list[dict]:
+    """Find papers and merge their version ranges from metadata, download state and directories.
 
-    ``None`` hợp ID hợp lệ từ thư mục bài và trạng thái nguồn, kể cả bài chưa
-    có thư mục. Danh sách đích tường minh chỉ giữ các ID được yêu cầu, kể cả
-    bài vắng mặt; chưa biết phiên bản nào thì dùng v1 để ghi nhận thiếu đầu vào.
-    Mặc định đọc source_state.json ở gốc và dưới .state. Danh sách đường dẫn
-    tường minh thay thế mặc định; đường dẫn tương đối tính từ data_dir.
-    Lỗi trạng thái toàn cục được gắn vào mọi job; khi không có job để chứa lỗi,
-    hàm phát sinh ValueError. Không chọn ngầm một trạng thái đang xung đột.
+    ``None`` takes the union of valid IDs from paper directories and source
+    state, including papers without a directory. An explicit target list keeps
+    only the requested IDs, including absent papers; when no version is known,
+    v1 is used to record the missing input. By default source_state.json is
+    read at the root and under .state. An explicit list of paths replaces the
+    default; relative paths are resolved against data_dir. Global state errors
+    are attached to every job; when there is no job to hold them, ValueError is
+    raised. A conflicting state is never chosen silently.
 
-    ``existing_only`` chỉ chọn bài có thư mục trong kho. Khi có ID đích, kiểm
-    tra trực tiếp tên thư mục chuẩn và tên dùng dấu chấm, không liệt kê cả kho.
-    Chế độ này mặc định bỏ qua source_state; vẫn đọc nếu truyền đường dẫn cụ thể.
-    ``limit`` giới hạn số bài trước khi đọc metadata và liệt kê phiên bản.
+    ``existing_only`` selects only papers with a directory in the store. With
+    target IDs, the canonical and the dotted directory names are checked
+    directly, without listing the whole store. This mode skips source_state by
+    default; it is still read when explicit paths are given.
+    ``limit`` caps the number of papers before metadata is read and versions
+    are listed. ``state_ranges`` (e.g. ["R1"]) filters state directories named
+    after scraper ranges; shared/custom-named state is still read. Use it only
+    with known target IDs; explicit source_state_paths always take precedence.
     """
     root = Path(data_dir)
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("limit must be a positive integer or None")
     ids = None if target_ids is None else sorted({_arxiv_id(v) for v in target_ids})
+    if state_ranges is not None:
+        if ids is None or isinstance(state_ranges, (str, bytes)):
+            raise ValueError("state_ranges requires target_ids and a list of range labels such as ['R1']")
+        state_ranges = set(state_ranges)
+        if any(not isinstance(r, str) or not re.fullmatch(r"R[1-9]\d*", r) for r in state_ranges):
+            raise ValueError("Invalid state range label")
+    if ids is not None and not existing_only and limit is not None:
+        ids = ids[:limit]
     directories = defaultdict(list)
     global_errors = []
     if root.exists() and not root.is_dir():
         raise ValueError(f"Data path is not a directory: {root}")
     if root.is_dir():
-        if existing_only and ids is not None:
+        if ids is not None:
             candidates = sorted({root / name for identity in ids for name in
                                  (get_paper_dir(identity).name, identity.replace("/", "-"))})
             for directory in candidates:
@@ -116,19 +158,15 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                 if directory.is_dir():
                     directories[identity].append(directory)
         else:
-            # Có ID đích thì bỏ qua ngay các tên ngoài phạm vi, không stat chúng.
-            # Mục còn lại được stat thật: Google Drive có thể liệt kê mục không mở
-            # được (thư mục chưa đồng bộ, shortcut tới dữ liệu không có quyền);
-            # is_dir() trả False cho các mục đó nên chúng bị bỏ qua.
-            wanted = None if ids is None else set(ids)
+            # Every entry is really stat'ed: Google Drive may list entries that cannot
+            # be opened (folders not yet synced, shortcuts to data without access);
+            # is_dir() returns False for them, so they are skipped.
             with os.scandir(root) as entries:
                 names = sorted(entry.name for entry in entries)
             for name in names:
                 try:
                     identity = _arxiv_id(name)
                 except ValueError:
-                    continue
-                if wanted is not None and identity not in wanted:
                     continue
                 if (root / name).is_dir():
                     directories[identity].append(root / name)
@@ -138,15 +176,14 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     if existing_only and source_state_paths is None:
         source_state_paths = []
     if source_state_paths is None:
-        paths = ([root / "source_state.json"] if (root / "source_state.json").exists() else [])
-        if (root / ".state").is_dir():
-            paths.extend(sorted((root / ".state").rglob("source_state.json")))
+        paths = _state_paths(root, state_ranges)
     else:
         if isinstance(source_state_paths, (str, Path)):
             source_state_paths = [source_state_paths]
         paths = [Path(p) if Path(p).is_absolute() else root / p for p in source_state_paths]
 
     states = defaultdict(list)
+    target_set = None if ids is None else set(ids)
     for path in sorted(set(paths)):
         try:
             document = _read_json(path)
@@ -158,6 +195,8 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                     identity = _arxiv_id(name)
                 except ValueError as exc:
                     global_errors.append(f"{path}: {exc}")
+                    continue
+                if target_set is not None and identity not in target_set:
                     continue
                 states[identity].append((path, entry))
         except (OSError, ValueError) as exc:
@@ -179,10 +218,10 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
                 with os.scandir(directory) as entries:
                     listings[directory] = sorted(entry.name for entry in entries)
             except OSError:
-                # Thư mục biến mất hoặc không đọc được sau khi liệt kê: coi như không có.
+                # The directory vanished or became unreadable after listing: treat it as absent.
                 continue
         if not listings and target_ids is None and identity not in states:
-            # Tìm theo thư mục mà không còn thư mục nào đọc được: không phải một bài.
+            # Directory-based discovery with no readable directory left: not a paper.
             continue
         candidates = sorted(listings, key=lambda p: (p.name != get_paper_dir(identity).name, p.name))
         paper_dir = candidates[0] if candidates else None
@@ -274,21 +313,27 @@ def discover_publications(data_dir, target_ids=None, source_state_paths=None, *,
     return jobs
 
 
-def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
-    """Parse mọi phiên bản rồi hợp nhất, viết lại trích dẫn và tạo bảng đúng một lần.
+def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92, sentence_cache_bytes=4 * 1024 ** 2) -> dict:
+    """Parse every version, then unify, rewrite citations and build the tables exactly once.
 
-    Lỗi từng pha được giữ trong timings và errors của phiên bản, cảnh báo giữ
-    trong warnings. Cảnh báo API lỗi thời vẫn được đếm nhưng không hạ trạng
-    thái dữ liệu. Chỉ thiếu thư mục không chứng minh được not_found. Thư mục
-    không có TeX là bản rỗng; nếu trạng thái nói done thì đó là lỗi đầu vào.
-    input_bytes đếm tệp .tex/.bib trong các thư mục phiên bản, kể cả tệp dư,
-    mỗi đường dẫn thực một lần. elements_before đếm nút trước khử trùng lặp.
+    Per-stage errors are kept in the version's timings and errors, warnings in
+    warnings. Deprecated-API warnings are counted but do not lower the data
+    status. A missing directory alone does not prove not_found. A directory
+    without TeX is an empty version; if the state says done, that is an input
+    error. input_bytes counts .tex/.bib files in the version directories,
+    including unused files, once per real path. elements_before counts nodes
+    before deduplication. The SaT cache lives only for the current paper and is
+    bounded by sentence_cache_bytes; 0 disables it. _source_manifest is the
+    internal file inventory of the current run.
     """
+    if type(sentence_cache_bytes) is not int or sentence_cache_bytes < 0:
+        raise ValueError("sentence_cache_bytes must be a nonnegative integer")
     started = time.perf_counter()
+    sentence_cache = SentenceCache(sentence_cache_bytes) if sentence_cache_bytes else None
     identity = job["arxiv_id"]
     paper_dir = job.get("paper_dir")
-    # Thông điệp chỉ ghi đường dẫn tính từ thư mục dữ liệu: báo cáo không chứa
-    # đường dẫn máy chạy và giống nhau dù đọc từ Drive hay từ bản giải nén.
+    # Messages only contain paths relative to the data directory: reports hold no
+    # machine paths and are identical whether the data is read from Drive or an extracted copy.
     prefixes = []
     if paper_dir is not None:
         root = Path(paper_dir).parent
@@ -300,8 +345,8 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         return message
 
     discovery_errors = [relative(message) for message in job.get("discovery_errors", [])]
-    # Cảnh báo lỗi thời của thư viện (DeprecationWarning, ...) không nói gì về
-    # dữ liệu: chỉ đếm theo loại, không ghi từng dòng vào warnings.
+    # Library deprecation warnings (DeprecationWarning, ...) say nothing about the
+    # data: they are only counted by category, not written line by line to warnings.
     dependency_warnings = Counter()
     result = dict(elements=[], hierarchy=[], bibtex=[], version_status=[],
                   bibtex_debug=[], key_map={}, stats={}, timings=[], warnings=[])
@@ -333,7 +378,7 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                 row["status"] = "partial"
 
     def phase(stage, operation, version=None):
-        """Đo thời gian thực và thu cảnh báo ngay cả khi thao tác phát sinh lỗi."""
+        """Measure wall time and capture warnings even when the operation raises."""
         begin = datetime.now(timezone.utc).isoformat()
         tick = time.perf_counter()
         value, error = None, None
@@ -349,15 +394,18 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                 end = datetime.now(timezone.utc).isoformat()
         for item in caught:
             category = item.category
-            if issubclass(category, (DeprecationWarning, PendingDeprecationWarning, FutureWarning)):
+            # Progress-bar warnings (tqdm, e.g. "IProgress not found" in a kernel without
+            # ipywidgets while the SaT model loads) describe the environment, not the data.
+            if (issubclass(category, (DeprecationWarning, PendingDeprecationWarning, FutureWarning))
+                    or category.__module__.split(".")[0] == "tqdm"):
                 dependency_warnings[category.__name__] += 1
                 continue
             retained = issubclass(category, (HierarchyDeduplicationWarning, BibliographyMetadataWarning))
             optional_enrichment = issubclass(category, BibliographyWarning) and str(item.message).startswith(
                 ("CrossRef result rejected", "CrossRef enrichment failed", "LLM fallback failed"))
-            optional_bibliography = issubclass(category, MissingBibliographyWarning)
+            optional_bibliography = issubclass(category, (MissingBibliographyWarning, ExcludedFileWarning))
             blocking = not (retained or optional_enrichment or optional_bibliography)
-            # Hai trường hợp khử trùng đã được xử lý không mất dữ liệu, không cần người xem lại.
+            # Two deduplication cases are already handled without data loss and need no human review.
             safely_separated = issubclass(category, HierarchyDeduplicationWarning) and (
                 str(item.message).startswith("Identical content occurs with different node kinds")
                 or "have multiple parents in version" in str(item.message))
@@ -386,9 +434,10 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         rows[number] = row
         trees[number], entries[number] = [], []
         directory = directories.get(number)
+        files = None
 
         def inspect_input():
-            nonlocal input_bytes
+            nonlocal input_bytes, files
             status = row["source_status"]
             exists = directory is not None and Path(directory).is_dir()
             if not exists:
@@ -400,12 +449,18 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
                     return False
                 row.update(status="missing_dir", missing_count=1, missing=[f"v{number}"])
                 raise FileNotFoundError(f"Missing version directory v{number}")
-            files = list_files(directory)
-            for path in files:
+            snapshot = job.get("_source_manifest")
+            if snapshot is None:
+                files = file_inventory(directory)
+            else:
+                prefix = f"{number}/"
+                root = Path(directory).resolve()
+                files = {root / name[len(prefix):]: info for name, info in snapshot.items() if name.startswith(prefix)}
+            for path in sorted(files):
                 if path.suffix.lower() in {".tex", ".bib"}:
                     resolved = path.resolve()
                     if resolved not in counted:
-                        input_bytes += path.stat().st_size
+                        input_bytes += files[path]["size"]
                         counted.add(resolved)
             if status == "not_found":
                 row.update(status="not_found", message="Download state confirms the version was not found")
@@ -416,12 +471,14 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
 
         ready, has_directory = phase("input", inspect_input, number)
         if not ready or not has_directory:
+            files = None
             if row["status"] == "ok":
                 row["status"] = "error"
             result["timings"][-1].update(status=row["status"],
                                          message="; ".join(filter(None, [row["message"], *row["errors"]])))
             continue
-        ok, tex = phase("gather", lambda: gather_tex(Path(directory)), number)
+        ok, tex = phase("gather", lambda: gather_tex(Path(directory), files=files), number)
+        files = None
         if not ok:
             row["status"] = "error"
             continue
@@ -437,12 +494,22 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         row["missing"] = list(tex.missing)
         row["missing_count"] = len(tex.missing)
         optional_missing = [name for name in tex.missing if Path(name).suffix.lower() in {".bib", ".bbl"}]
-        required_missing = [name for name in tex.missing if name not in optional_missing]
+        # Milestone 1 keeps only .tex/.bib files, so an included TikZ/PGF figure, style
+        # or data file is absent by design: the parser cannot recover it and loses no
+        # TeX source. Only a missing .tex (or extension-less) include is lost content.
+        excluded_missing = [name for name in tex.missing if name not in optional_missing
+                            and excluded_by_corpus(name)]
+        required_missing = [name for name in tex.missing
+                            if name not in optional_missing and name not in excluded_missing]
         row["bibliography_missing"] = optional_missing
+        row["excluded_missing_count"] = len(excluded_missing)
         row["required_missing_count"] = len(required_missing)
         row["bibliography_status"] = "missing_sources" if optional_missing else "ok"
         if required_missing:
             warning("gather", "Missing content files: " + ", ".join(required_missing), number)
+        if excluded_missing:
+            warning("gather", "Skipped includes of non-TeX files not kept by the corpus (.tex/.bib only): "
+                    + ", ".join(excluded_missing), number, affects_status=False, requires_review=True)
         if optional_missing:
             warning("gather", "Skipped bibliography with missing sources: " + ", ".join(optional_missing), number,
                     affects_status=False, requires_review=True)
@@ -451,16 +518,24 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             decoded = note.startswith("encoding fallback (latin-1):")
             missing_bibliography = note.startswith("bibliography not found:") or any(
                 note.startswith(f"include not found: {name}") for name in optional_missing)
+            excluded = any(note == f"include not found: {name}" or note.startswith(f"include not found: {name} (")
+                           for name in excluded_missing)
+            # Kept verbatim where it can only select definitions or formatting: nothing is lost.
+            harmless_conditional = "kept verbatim in the preamble, a macro definition or the bibliography" in note
             warning("gather", f"Source gathering note: {note}", number,
-                    affects_status=not (intentional or decoded or missing_bibliography), requires_review=not intentional)
+                    affects_status=not (intentional or decoded or missing_bibliography or excluded
+                                        or harmless_conditional),
+                    requires_review=not intentional)
         if row["source_status"] and row["source_status"] != "done":
             warning("input", f"Existing TeX sources conflict with download state {row['source_status']}", number)
         clean_ok, cleaned = phase("cleanup", lambda: cleanup_latex(tex.source), number)
         if clean_ok:
-            tree_ok, nodes = phase("construct_hierarchy", lambda: construct_hierarchy(cleaned), number)
+            tree_ok, nodes = phase("construct_hierarchy", lambda: construct_hierarchy(cleaned, sentence_cache=sentence_cache), number)
             if tree_ok:
                 trees[number] = nodes
-        # Giữ GatherTex gốc: cleanup có thể làm mất cấu trúc bibitem cần trích xuất.
+            del nodes
+        del cleaned
+        # Keep the original GatherTex: cleanup may lose the bibitem structure needed for extraction.
         bib_ok, bibliography = phase("extract_bibtex", lambda: extract_bibtex(tex, identity, enrich=enrich), number)
         if bib_ok:
             entries[number] = bibliography
@@ -468,7 +543,12 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             row["bibliography_status"] = "error"
         if row["errors"]:
             row["status"] = "partial" if trees[number] or entries[number] else "error"
+        del tex, bibliography
 
+    if sentence_cache is not None:
+        sentence_cache.clear()
+    if "_source_manifest" in job:
+        job = {key: value for key, value in job.items() if key != "_source_manifest"}
     elements_before = sum(len(nodes) for nodes in trees.values())
     bibtex_before = sum(len(items) for items in entries.values())
 
@@ -479,31 +559,43 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
         result["key_map"] = {str(v): mapping for v, mapping in bibliography.key_map.items()}
         for item in bibliography.entries:
             if item.conflicts:
-                ambiguous = any(conflict["field"] == "ambiguous_citation_key" for conflict in item.conflicts)
+                duplicate = [c for c in item.conflicts if c["field"] == "ambiguous_citation_key"]
+                # Blocking only when \cite cannot be resolved; a duplicate key resolved
+                # as BibTeX/LaTeX resolve it keeps every entry and every citation.
+                unresolved = any(c.get("selected") is None for c in duplicate)
+                label = ("Ambiguous citation key" if unresolved else
+                         "Duplicate citation key resolved as in the compiled document" if duplicate else
+                         "Metadata selected according to the merge policy")
                 for v in item.versions_present:
-                    warning("unify_publication", f"{'Ambiguous citation key' if ambiguous else 'Metadata selected according to the merge policy'}: {item.citation_key}", v,
-                            affects_status=ambiguous, requires_review=True)
+                    warning("unify_publication", f"{label}: {item.citation_key}", v,
+                            affects_status=unresolved, requires_review=True)
         return bibliography
 
     unified_ok, bibliography = phase("unify_publication", unify)
+    entries.clear()
     if unified_ok:
         def rewrite():
             return {v: rewrite_citations(nodes, bibliography.key_map.get(v, {})) for v, nodes in trees.items()}
 
         rewritten_ok, rewritten = phase("rewrite_citations", rewrite)
+        trees.clear()
         if rewritten_ok:
             tables_ok, tables = phase("build_element_tables", lambda: build_element_tables(identity, rewritten))
             if tables_ok:
                 result["elements"], result["hierarchy"] = tables
-    # Đánh dấu entry có được \cite trong nội dung đã parse (\nocite{*} tính là tất cả).
-    # Bảng bibtex vẫn giữ mọi entry; cờ chỉ nằm trong bản debug và thống kê.
+            rewritten.clear()
+            del tables
+    trees.clear()
+    del bibliography
+    # Mark whether each entry is \cite'd in the parsed content (\nocite{*} counts as all).
+    # The bibtex table still keeps every entry; the flag lives only in the debug output and statistics.
     cited = set()
     for row in result["elements"]:
         cited |= citation_keys(row["content"])
     for row in result["bibtex_debug"]:
         row["cited"] = "*" in cited or row["citation_key"] in cited
-    # Khóa được \cite nhưng không có entry nào: thường do bibliography chỉ có ở dạng .bbl
-    # (Milestone 1 chỉ giữ .tex/.bib) hoặc tác giả trích khóa không tồn tại.
+    # Keys that are \cite'd but have no entry: usually the bibliography exists only as a .bbl
+    # (Milestone 1 keeps only .tex/.bib) or the author cites a key that does not exist.
     unresolved = sorted(cited - {"*"} - {row["citation_key"] for row in result["bibtex"]})
 
     for number, row in rows.items():
@@ -513,27 +605,34 @@ def parse_publication(job, *, enrich=False, fuzzy_threshold=0.92) -> dict:
             f"Version processed; {row['notice_count']} notices (see warnings.csv)" if row["notice_count"] else "Version processed")
         result["version_status"].append(row)
     counts = Counter(r["status"] for r in rows.values())
-    valid = counts["ok"] + counts["empty"]
-    error_count = sum(counts[s] for s in ("error", "missing_dir", "not_found"))
+    # A version that arXiv confirms does not exist (not_found) has no source, like a
+    # PDF-only version (empty): it lowers coverage, not the success of the others.
+    no_source = counts["empty"] + counts["not_found"]
+    valid = counts["ok"] + no_source
+    error_count = sum(counts[s] for s in ("error", "missing_dir"))
     has_data = bool(elements_before or bibtex_before)
     missing_input = (job.get("paper_dir") is None and not any(source_status.values()) and not has_data)
     if fatal:
         status = "error"
     elif missing_input:
         status = "missing_input"
+    elif counts["not_found"] == len(numbers):
+        status = "error"  # no version of the paper exists in the download state
     elif discovery_errors or error_count or counts["partial"]:
         status = "partial" if has_data or valid else "error"
     else:
-        status = "empty" if counts["empty"] == len(numbers) else "ok"
+        status = "empty" if no_source == len(numbers) else "ok"
     metadata = job.get("metadata", {})
     categories = metadata.get("categories", [])
     category = categories[0] if isinstance(categories, list) and categories else metadata.get("category", "")
     messages = discovery_errors + fatal
-    messages.extend(f"v{r['version']}: {r['message']}" for r in rows.values() if r["status"] not in {"ok", "empty"})
+    messages.extend(f"v{r['version']}: {r['message']}" for r in rows.values()
+                    if r["status"] not in {"ok", "empty", "not_found"})
     blocking_count = sum(w["affects_status"] for w in result["warnings"])
     review_count = sum(w["requires_review"] for w in result["warnings"])
     result["stats"] = dict(
-        arxiv_id=identity, status=status, paper_success=status in {"ok", "empty"},
+        # Success means parsed without losing content; a PDF-only paper is coverage, not success.
+        arxiv_id=identity, status=status, paper_success=status == "ok",
         versions_expected=len(numbers), versions_ok=counts["ok"], versions_empty=counts["empty"],
         versions_partial=counts["partial"], versions_error=error_count,
         versions_not_found=counts["not_found"], versions_missing_dir=counts["missing_dir"],

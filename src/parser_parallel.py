@@ -1,7 +1,8 @@
-"""Điều phối spawn theo RAM; mỗi tiến trình giữ cache SaT của parser gốc.
+"""RAM-aware spawn scheduling; each process keeps the original parser's SaT cache.
 
-Kết quả đến theo thứ tự hoàn thành, chỉ số luôn thuộc đầu vào. Không ghi tệp,
-không sửa thuật toán parser. Iterable chỉ được đọc trước tối đa một job.
+Results arrive in completion order, and indices always refer to the input. With
+result_dir, workers write their own partitions and return only metadata. The
+iterable is read at most one job ahead.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ def _read_number(path):
 
 
 def _cgroup_paths():
-    """Đọc nhóm hiện tại và các nhóm cha, hỗ trợ cgroup v1/v2 phổ biến."""
+    """Read the current cgroup and its parents; supports common cgroup v1/v2 layouts."""
     root = Path("/sys/fs/cgroup")
     paths = {root, root / "memory", root / "cpu", root / "cpu,cpuacct"}
     try:
@@ -49,7 +50,7 @@ def _cgroup_paths():
             root / name for name in (controllers, *controllers.split(","))]
         for base in bases:
             path = base / relative.lstrip("/")
-            # Một số namespace trả đường dẫn có '..'; không đi ra ngoài mount.
+            # Some namespaces return paths with '..'; never leave the mount.
             if ".." in path.parts:
                 continue
             while True:
@@ -86,7 +87,7 @@ def _cgroup_limits():
 
 
 def _resource_snapshot(pids=()):
-    """Ảnh tài nguyên độc lập để test có thể thay bằng dữ liệu cố định."""
+    """Independent resource snapshot, so tests can substitute fixed data."""
     memory = psutil.virtual_memory()
     total, available = memory.total, memory.available
     cpu = getattr(os, "process_cpu_count", os.cpu_count)() or 1
@@ -111,8 +112,8 @@ def _resource_snapshot(pids=()):
                 available_bytes=max(0, min(total, available)), rss_by_pid=rss)
 
 
-def _worker_main(connection, enrich, fuzzy_threshold):
-    """Đích spawn phải import được; chỉ cha nhận Ctrl-C."""
+def _worker_main(connection, enrich, fuzzy_threshold, sentence_cache_bytes, result_dir, debug_reports):
+    """Spawn target must be importable; only the parent handles Ctrl-C."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                  "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS", "BLIS_NUM_THREADS"):
@@ -123,16 +124,26 @@ def _worker_main(connection, enrich, fuzzy_threshold):
             if job is None:
                 break
             try:
-                # Nhập trễ để đặt giới hạn BLAS trước khi parser/model được nhập.
+                # Import late so the BLAS limits are set before the parser/model is imported.
                 if __package__:
                     from .parser_pipeline import parse_publication
                 else:
                     from parser_pipeline import parse_publication
-                result = parse_publication(job, enrich=enrich, fuzzy_threshold=fuzzy_threshold)
+                result = parse_publication(job, enrich=enrich, fuzzy_threshold=fuzzy_threshold,
+                                           sentence_cache_bytes=sentence_cache_bytes)
+                rss = psutil.Process().memory_info().rss
+                if result_dir is not None:
+                    if __package__:
+                        from .parser_storage import paper_name, persist_result
+                    else:
+                        from parser_storage import paper_name, persist_result
+                    result = persist_result(Path(result_dir) / paper_name(job["arxiv_id"]), result,
+                                            debug_reports=debug_reports, consume=True)
                 kind = "result"
             except Exception as exc:
                 kind, result = "error", f"{type(exc).__name__}: {exc}"
-            connection.send((kind, result, psutil.Process().memory_info().rss))
+                rss = 0
+            connection.send((kind, result, max(rss, psutil.Process().memory_info().rss)))
             del result, job
     except (EOFError, BrokenPipeError, OSError):
         pass
@@ -141,7 +152,7 @@ def _worker_main(connection, enrich, fuzzy_threshold):
 
 
 def _error_result(job, message, elapsed):
-    """Giữ đủ hợp đồng bảng/thống kê khi tiến trình hoặc IPC thất bại."""
+    """Keep the full table/statistics contract when a process or IPC fails."""
     identity = job.get("arxiv_id", "")
     sources = job.get("source_status_by_version", {})
     numbers = sorted(set(job.get("version_dirs", {})) | set(sources)) or [1]
@@ -175,7 +186,7 @@ class _Worker:
 
 
 def _dispose(workers, *, gentle=False):
-    """Đóng cả nhóm với thời gian chờ chung, không để con mồ côi."""
+    """Close the whole group with a shared timeout, leaving no orphaned children."""
     started_workers = []
     for worker in workers:
         if worker.process.pid is None:
@@ -217,26 +228,33 @@ def _number(name, value, minimum=0):
 def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                           reserve_ram_gb=None, ram_per_worker_gb=1.5, adaptive_ram=True,
                           enrich=False, fuzzy_threshold=.92, deadline=None, on_event=None,
-                          ram_wait_timeout_sec=60, job_timeout_sec=None, _worker_target=None):
-    """Yield ``(index, parse_publication(job))`` với tối đa một job mỗi worker.
+                          ram_wait_timeout_sec=60, sentence_cache_bytes=4 * 1024 ** 2,
+                          result_dir=None, debug_reports=False, job_timeout_sec=None,
+                          _worker_target=None):
+    """Yield ``(index, parse_publication(job))`` with at most one job per worker.
 
-    GB dùng GiB (2**30 byte); mặc định chừa max(0.5 GiB, 10% tổng RAM
-    theo giới hạn hệ thống). Ước lượng worker là max(sàn cấu hình, RSS đỉnh
-    * 1.2). adaptive_ram=False bỏ giới hạn RAM, vẫn hiệu chuẩn một job đầu.
-    deadline là perf_counter tuyệt đối; close()/Ctrl-C dừng ngay các con.
+    GB means GiB (2**30 bytes); by default max(0.5 GiB, 10% of total RAM under
+    the system limit) is reserved. The worker estimate is max(configured floor,
+    peak RSS * 1.2). adaptive_ram=False removes the RAM limit but still
+    calibrates on one first job. deadline is an absolute perf_counter value;
+    close()/Ctrl-C stops the children immediately.
 
-    on_event nhận dict JSON với event, elapsed_sec, workers, active, submitted,
-    completed. parallel_summary có pending (None nếu iterable không có len),
-    peak_workers, peak_in_flight, worker_errors, ram_wait_sec, stopped_reason.
-    Summary cũng giữ memory_estimate_gb, reserve_ram_gb, cpu_cap, worker_cap.
-    completed bao gồm lỗi worker; pending chỉ đếm job chưa giao.
+    on_event receives a JSON dict with event, elapsed_sec, workers, active,
+    submitted, completed. parallel_summary has pending (None if the iterable
+    has no len), peak_workers, peak_in_flight, worker_errors, ram_wait_sec,
+    stopped_reason. The summary also keeps memory_estimate_gb, reserve_ram_gb,
+    cpu_cap, worker_cap. completed includes worker errors; pending counts only
+    jobs not yet handed out. result_dir=None keeps the API that returns full
+    results. With a directory, each result is the metadata receipt of the
+    written partition, and no Python tables pass through the pipe.
 
-    job_timeout_sec giới hạn thời gian một bài: quá hạn thì worker bị dừng
-    cưỡng bức, bài nhận kết quả lỗi (thử lại ở phiên sau) và worker mới được
-    tạo khi cần. Summary đếm số lần quá hạn trong job_timeouts. Thời hạn tính
-    từ lúc giao bài, nên với worker mới gồm cả khởi động tiến trình và lần đầu
-    nạp/tải mô hình SaT; đừng đặt quá nhỏ.
-    _worker_target chỉ dành cho test: thay hàm chạy trong tiến trình con.
+    job_timeout_sec limits the time of one paper: when exceeded, the worker is
+    killed, the paper gets an error result (retried in a later session) and a
+    new worker is created when needed. The summary counts timeouts in
+    job_timeouts. The limit starts when the paper is handed out, so for a new
+    worker it includes process start-up and the first SaT model load/download;
+    do not set it too low.
+    _worker_target is for tests only: it replaces the function run in the child.
     """
     if num_workers != "auto":
         _positive_int("num_workers", num_workers)
@@ -255,6 +273,11 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
         raise ValueError("fuzzy_threshold must be <= 1")
     if not isinstance(adaptive_ram, bool) or not isinstance(enrich, bool):
         raise ValueError("adaptive_ram and enrich must be booleans")
+    if type(sentence_cache_bytes) is not int or sentence_cache_bytes < 0:
+        raise ValueError("sentence_cache_bytes must be a nonnegative integer")
+    if type(debug_reports) is not bool:
+        raise ValueError("debug_reports must be a boolean")
+    result_dir = None if result_dir is None else str(Path(result_dir).resolve())
     if on_event is not None and not callable(on_event):
         raise ValueError("on_event must be callable")
     if deadline is not None:
@@ -331,7 +354,7 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                 for worker in retiring:
                     workers.remove(worker)
                 resize(previous, "deadline" if expired else ("exhausted" if exhausted else "ram_pressure"))
-                # Lấy ảnh mới sau khi hệ điều hành thu hồi RSS.
+                # Take a fresh snapshot after the OS reclaims RSS.
                 continue
 
             if pending is not None and not expired and active < target:
@@ -342,7 +365,8 @@ def iter_parallel_results(jobs, *, num_workers="auto", max_workers=None,
                 index, job = pending
                 if worker is None:
                     parent, child = context.Pipe()
-                    process = context.Process(target=_worker_target or _worker_main, args=(child, enrich, threshold))
+                    process = context.Process(target=_worker_target or _worker_main,
+                        args=(child, enrich, threshold, sentence_cache_bytes, result_dir, debug_reports))
                     worker = _Worker(process, parent)
                     workers.append(worker)
                     try:

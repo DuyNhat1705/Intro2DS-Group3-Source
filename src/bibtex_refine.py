@@ -1,20 +1,22 @@
-r"""Hậu xử lý bảng ``bibtex`` sau ``run_parser``: tách lại ``\bibitem`` đáng ngờ bằng AnyStyle.
+r"""Post-process the ``bibtex`` table after ``run_parser``: re-split suspicious ``\bibitem`` entries with AnyStyle.
 
-AnyStyle (bộ tách trích dẫn dùng mô hình CRF) chỉ chạy cho các ``\bibitem`` có
-dấu hiệu tách sai: thiếu tiêu đề/tác giả, tiêu đề trông như tên nơi đăng, tên
-tác giả dài bất thường. Mọi mục được gửi trong một lần gọi CLI theo khối, không
-gọi riêng từng mục. Đầu vào duy nhất là văn bản ``\bibitem`` của chính bài báo:
-không dùng dữ liệu tham khảo đã thu thập (``references.json``) hay dịch vụ ngoài,
-vì Milestone 3 ghép chính các entry này với dữ liệu đó.
+AnyStyle (a citation parser based on a CRF model) only runs on ``\bibitem``
+entries that show signs of a wrong split: a missing title or authors, a title
+that looks like a venue, or unusually long author names. All entries are sent
+in one CLI call, in chunks, not one call per entry. The only input is the
+paper's own ``\bibitem`` text: neither the crawled reference data
+(``references.json``) nor external services are used, because Milestone 3
+matches these very entries against that data.
 
-Kết quả AnyStyle được cache trong ``anystyle.jsonl``: lần chạy sau chỉ gọi CLI
-cho phần chưa có, nên kết quả lặp lại được. Partition và checkpoint của parser
-không bị sửa. ``tables/<worker>/bibtex.parquet`` được thay bằng bảng đã tinh
-chỉnh (đánh dấu trong metadata Parquet), bảng gốc giữ ở ``bibtex_parsed.parquet``,
-mọi thay đổi ghi vào ``bibtex_refinement.jsonl``.
+AnyStyle results are cached in ``anystyle.jsonl``: later runs call the CLI only
+for missing entries, so results are reproducible. Parser partitions and
+checkpoints are not modified. ``tables/<worker>/bibtex.parquet`` is replaced by
+the refined table (marked in the Parquet metadata), the original table is kept
+as ``bibtex_parsed.parquet``, and every change is logged in
+``bibtex_refinement.jsonl``.
 
-Giới hạn: bước này không chạy lại khử trùng; nếu hai entry trở nên trùng nhau
-sau khi được sửa thì vẫn là hai dòng.
+Limitation: this step does not rerun deduplication; if two entries become
+identical after refinement they remain two rows.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ __all__ = ["refine_bibliography", "run_anystyle", "anystyle_available", "suspici
 _ANYSTYLE_CHUNK = 2000
 _REFINED_KEY = b"bibtex_refined"
 
-# Tên nơi đăng thường mở đầu như vầy; một "tiêu đề" như thế nhiều khả năng là tên tạp chí/hội nghị.
+# Venue names often start like this; such a "title" is most likely a journal or conference name.
 _VENUE_LIKE = re.compile(
     r"^(?:proc(?:eedings|\.)?|journal|transactions|advances in|annals|ann\.|bulletin|letters|"
     r"international (?:conference|journal|symposium|workshop|colloquium)|conference|symposium|workshop|"
@@ -56,7 +58,7 @@ _VENUE_LIKE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Cache JSONL: mỗi dòng {"key": ..., "value": ...}; dòng hỏng cuối tệp bị bỏ qua.
+# JSONL cache: one {"key": ..., "value": ...} per line; a broken last line is ignored.
 # ---------------------------------------------------------------------------
 
 
@@ -90,12 +92,20 @@ def anystyle_available(command: str = "anystyle") -> bool:
     return shutil.which(command) is not None
 
 
-def run_anystyle(texts: Sequence[str], *, command: str = "anystyle") -> List[dict]:
-    """Chạy ``anystyle -f json --stdout parse`` trên từng khối 2.000 dòng.
+def _resolve(command: str) -> str:
+    """Full path of the command: on Windows, RubyGems installs ``anystyle.bat``,
+    which subprocess cannot find by its bare name (only ``.exe`` is implied)."""
+    return shutil.which(command) or command
 
-    Mỗi dòng đầu vào là một reference; kết quả là danh sách dict cùng độ dài.
-    Khởi động Ruby và nạp mô hình tốn vài giây, nên gọi theo khối chứ không theo mục.
+
+def run_anystyle(texts: Sequence[str], *, command: str = "anystyle") -> List[dict]:
+    """Run ``anystyle -f json --stdout parse`` on chunks of 2,000 lines.
+
+    Each input line is one reference; the result is a list of dicts of the same
+    length. Starting Ruby and loading the model takes a few seconds, so calls
+    are made per chunk rather than per entry.
     """
+    command = _resolve(command)
     results: List[dict] = []
     for start in range(0, len(texts), _ANYSTYLE_CHUNK):
         chunk = [" ".join(text.split()) for text in texts[start : start + _ANYSTYLE_CHUNK]]
@@ -123,14 +133,14 @@ def run_anystyle(texts: Sequence[str], *, command: str = "anystyle") -> List[dic
 
 def anystyle_version(command: str = "anystyle") -> Optional[str]:
     try:
-        completed = subprocess.run([command, "--version"], capture_output=True, text=True, check=False)
+        completed = subprocess.run([_resolve(command), "--version"], capture_output=True, text=True, check=False)
     except OSError:
         return None
     return completed.stdout.strip() or None
 
 
 def _plain_reference(raw: str) -> str:
-    """Văn bản đưa vào AnyStyle: Unicode, khối \\newblock thành dấu chấm câu."""
+    """Text sent to AnyStyle: Unicode, with \\newblock blocks turned into sentence punctuation."""
     text = re.sub(r"\\newblock\b\s*", ". ", raw)
     return " ".join((_standardize_text(text) or "").split())
 
@@ -166,7 +176,7 @@ def _anystyle_fields(item: dict) -> Dict[str, Any]:
 
 
 def suspicion(row: dict) -> List[str]:
-    """Lý do một entry ``\\bibitem`` có thể đã bị tách sai (rỗng nếu trông ổn)."""
+    """Reasons a ``\\bibitem`` entry may have been split wrongly (empty if it looks fine)."""
     reasons = []
     title, authors, journal = row.get("title"), row.get("authors") or [], row.get("journal")
     if not title:
@@ -183,7 +193,7 @@ def suspicion(row: dict) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Hậu xử lý
+# Post-processing
 # ---------------------------------------------------------------------------
 
 
@@ -210,11 +220,12 @@ def refine_bibliography(
     anystyle_command: str = "anystyle",
     progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Tinh chỉnh ``tables/<worker>/bibtex.parquet``; trả về thống kê của lần chạy.
+    """Refine ``tables/<worker>/bibtex.parquet``; return the statistics of the run.
 
-    ``anystyle_runner`` thay được (để kiểm thử). Khi không có lệnh ``anystyle``,
-    bước này được bỏ qua và ghi lý do vào thống kê thay vì dừng; bảng vẫn được
-    ghi lại (giống bản do parser tạo) để đầu ra luôn ở cùng một trạng thái.
+    ``anystyle_runner`` can be replaced (for testing). Without an ``anystyle``
+    command the step is skipped and the reason is recorded in the statistics
+    instead of stopping; the table is still rewritten (identical to the
+    parser's) so the output is always in the same state.
     """
     root = Path(output_dir).resolve()
     tables = root / "tables" / worker
@@ -224,8 +235,8 @@ def refine_bibliography(
     if not current.is_file():
         raise FileNotFoundError(f"{current} not found; run run_parser first")
     metadata = pq.read_schema(current).metadata or {}
-    # bibtex.parquet mới do run_parser ghi thì lưu lại làm bản gốc; nếu đã tinh chỉnh thì
-    # đọc bản gốc đã lưu, để chạy lại nhiều lần cho cùng kết quả.
+    # A fresh bibtex.parquet written by run_parser is saved as the original; if it was already refined,
+    # the saved original is read instead, so repeated runs give the same result.
     if _REFINED_KEY not in metadata:
         shutil.copyfile(current, parsed)
     schema = table_schemas()["bibtex"]
@@ -281,7 +292,7 @@ def refine_bibliography(
                 row, found = rows[index], _anystyle_fields(cache.get(keys[text]) or {})
                 why = ",".join(reasons)
                 title_wrong = bool({"no_title", "title_is_venue", "title_equals_journal"} & set(reasons))
-                # Tiêu đề AnyStyle phải xuất hiện trong chính văn bản \bibitem.
+                # The AnyStyle title must occur in the \bibitem text itself.
                 if (
                     title_wrong
                     and found["title"]

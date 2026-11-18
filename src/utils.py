@@ -3,6 +3,53 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 
+def walk_files(root, *, ignore_missing=False):
+    """Yield ``(path, stat)`` for every regular file under ``root``.
+
+    One scandir pass; directory symlinks are not followed, file symlinks are.
+    Each file is stat'ed for real (``entry.stat()`` follows the link and, on
+    Linux, is not cached from the listing): Google Drive may list entries that
+    cannot be opened, and those are skipped, as are unreadable subdirectories.
+    Only an unreadable ``root`` raises, unless ``ignore_missing`` and the root
+    simply does not exist.
+    """
+    root = Path(root)
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        if not entry.is_file():
+                            continue
+                        info = entry.stat()
+                    except OSError:
+                        # Vanished during the scan, or listed but unopenable (Drive).
+                        continue
+                    yield Path(entry.path), info
+        except FileNotFoundError:
+            if current == root and not ignore_missing:
+                raise
+        except OSError:
+            if current == root:
+                raise
+
+
+def file_inventory(directory):
+    """One directory scan, reusable by input inspection and TeX gathering."""
+    return {path: {"size": info.st_size, "mtime_ns": info.st_mtime_ns}
+            for path, info in walk_files(Path(directory).resolve())}
+
+
+def list_files(directory) -> list[Path]:
+    """Every regular file under ``directory``, sorted; same rules as ``walk_files``."""
+    return sorted(path for path, _ in walk_files(directory))
+
+
 @dataclass
 class GatherTex:
     """The reachable LaTeX and bibliography files of one paper version.
@@ -33,32 +80,3 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 def get_paper_dir(arxiv_id: str) -> Path:
     return DATA_DIR / arxiv_id.replace(".", "-").replace("/", "-")
-
-
-def list_files(directory) -> list[Path]:
-    """Mọi tệp thường dưới ``directory``, sắp xếp theo đường dẫn.
-
-    Tương đương ``sorted(p for p in directory.rglob("*") if p.is_file())``.
-    Mỗi tệp vẫn được stat thật như ``is_file()`` của bản rglob: Google Drive
-    có thể liệt kê mục không mở được, và các mục đó phải bị bỏ qua. Thư mục
-    con không đọc được cũng bị bỏ qua. Không đi theo liên kết tượng trưng tới
-    thư mục; liên kết tới tệp vẫn tính.
-    """
-    directory = Path(directory)
-    files, stack = [], [directory]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(current / entry.name)
-                        elif (current / entry.name).is_file():
-                            files.append(current / entry.name)
-                    except OSError:
-                        continue
-        except OSError:
-            if current == directory:
-                raise
-    return sorted(files)

@@ -1,19 +1,20 @@
 """
 Milestone 2 — BibTeX Extraction Module
 =======================================
-Trích xuất và chuẩn hóa toàn bộ tài liệu tham khảo từ LaTeX sources (.tex và .bib).
-Tích hợp:
-  - Regex Engine bóc tách trường: Title, Authors, Year, DOI, Journal, Entry Type
-  - CrossRef API Auto-Enrichment: Tự động đối soát và sửa lỗi tiêu đề / bù đắp tác giả
-  - arXiv ID Hint Extractor: Bắt trước arXiv ID làm đòn bẩy cho Milestone 3
-  - Confidence Scoring: Chấm điểm chất lượng dữ liệu bóc tách
-  - LLM Fallback: Cơ chế dự phòng cho các cấu trúc LaTeX dị dạng
+Extracts and normalizes every bibliography entry from LaTeX sources (.tex and .bib).
+Components:
+  - Regex field extraction: Title, Authors, Year, DOI, Journal, Entry Type
+  - CrossRef auto-enrichment (optional): verifies titles and fills in missing authors
+  - arXiv ID hint extractor: captures arXiv IDs early as a key for Milestone 3
+  - Confidence scoring: rates the quality of each extracted entry
+  - LLM fallback (optional): backup parser for malformed LaTeX structures
 """
 
 from __future__ import annotations
 
 import copy
 import functools
+import itertools
 import re
 import urllib.parse
 import urllib.request
@@ -43,7 +44,8 @@ class BibliographyWarning(UserWarning):
 
 
 class BibliographyMetadataWarning(BibliographyWarning):
-    """A conflicting bibliography definition was resolved using the last value."""
+    """A bibliography definition was resolved without losing data: a conflicting
+    @string uses the last value, an undefined @string keeps its literal text."""
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +57,11 @@ _BIBITEM_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# The widest-label argument may nest braces, e.g. {CCG{\etalchar{+}}20} written by
+# the alpha/amsalpha styles; three levels cover what these styles produce.
 _BIBLIOGRAPHY_ENV = re.compile(
-    r"\\begin\s*\{thebibliography\}\s*\{[^{}]*\}(.*?)\\end\s*\{thebibliography\}",
+    r"\\begin\s*\{thebibliography\}\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}"
+    r"(.*?)\\end\s*\{thebibliography\}",
     re.DOTALL,
 )
 
@@ -110,22 +115,48 @@ def extract_bibtex(
                     if selected is None:
                         raise BibliographyParseError(f"{path}: bibliography not found: {name}")
                     bib_files.append(selected)
+    # pyparsing may retain exception frames used in normal parser control flow.
+    # Do not let those frames keep the caller's GatherTex/source map alive.
+    compilation_path = None
     entries = []
-    for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
-        entries.extend(_parse_bib_file(bib_path, arxiv_id))
-    entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
-    # Chuẩn hóa chung cho mọi nguồn (.bib, \bibitem, CrossRef, LLM); phép này
-    # lũy đẳng nên áp lại lên giá trị đã sạch không đổi gì.
+    # BibTeX reads the databases of ibliography{a,b} as one stream, so an
+    # @string defined in a.bib (e.g. IEEEabrv.bib) is available in b.bib.
+    strings: Dict[str, str] = {}
+    try:
+        for bib_path in dict.fromkeys(Path(path).resolve() for path in bib_files):
+            entries.extend(_parse_bib_file(bib_path, arxiv_id, strings=strings))
+        entries.extend(_parse_bibitems(source, arxiv_id, enrich=enrich))
+    finally:
+        source = bib_files = None
+        sources = text = match = None
+    # Shared normalization for every source (.bib, \bibitem, CrossRef, LLM); it is
+    # idempotent, so applying it again to an already clean value changes nothing.
     for entry in entries:
         entry.title = _standardize_text(entry.title)
         entry.journal = _standardize_text(entry.journal)
     return entries
 
 
-def _read_source(path: Path) -> str:
+_BIB_LINE_COMMENT = re.compile(r"(?m)^[ \t]*%[^\n]*$")
+_BIB_ENTRY_START = re.compile(r"(?m)^\s*@[A-Za-z]+\s*[{(][^\n]*")
+
+
+def _read_source(path: Path, *, lenient: bool = False) -> str:
+    """Read a source as UTF-8; with ``lenient`` a non-UTF-8 file falls back to latin-1
+    (as the TeX gatherer does), reported as a notice since no data is lost."""
     try:
         return path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError) as exc:
+    except UnicodeError as exc:
+        if lenient:
+            try:
+                text = path.read_bytes().decode("latin-1")
+            except OSError:
+                pass
+            else:
+                warnings.warn(f"{path}: encoding fallback (latin-1)", BibliographyMetadataWarning, stacklevel=2)
+                return text
+        raise BibliographyParseError(f"Cannot read bibliography source {path}: {exc}") from exc
+    except OSError as exc:
         raise BibliographyParseError(f"Cannot read bibliography source {path}: {exc}") from exc
 
 
@@ -151,22 +182,62 @@ def _scan_source(text: str) -> str:
     return _mask_literals(_strip_tex_comments(text))
 
 
-def _parse_bib_file(bib_path: Path, arxiv_id: str) -> List[BibtexEntry]:
-    """Parse file .bib bằng thư viện bibtexparser."""
+def _parse_bib_file(bib_path: Path, arxiv_id: str, *, strings: Optional[Dict[str, str]] = None) -> List[BibtexEntry]:
+    """Parse a .bib file with bibtexparser, following BibTeX's tolerance.
+
+    BibTeX warns about an undefined @string or a malformed entry and goes on; so
+    does this parser: an undefined macro keeps its literal text (notice) and a
+    malformed entry is skipped with a blocking warning. Only a file from which
+    nothing at all can be read raises BibliographyParseError. ``strings`` carries
+    the @string table from one database of the same bibliography to the next.
+    """
     try:
         import bibtexparser
         from bibtexparser.bparser import BibTexParser
-        from bibtexparser.bibdatabase import UndefinedString
+        from bibtexparser.bibdatabase import BibDataString, UndefinedString
         from pyparsing import ParseBaseException
     except ImportError as exc:
         raise BibliographyParseError(
             f"{bib_path}: install bibtexparser==1.4.3 from src/requirements.txt"
         ) from exc
 
+    undefined: set = set()
+
+    class LiteralFallbackString(BibDataString):
+        """A macro reference such as ``month = June`` or ``journal = PAMI``.
+
+        BibTeX itself only warns about an undefined @string and goes on with the
+        rest of the database; bibtexparser raises instead, which would drop every
+        entry of the file. An undefined name is therefore kept as its literal
+        text (original case) and reported once per file as a notice.
+        """
+
+        def __init__(self, database, name):
+            super().__init__(database, name)
+            self.literal = name
+
+        def get_value(self):
+            try:
+                return super().get_value()
+            except UndefinedString:
+                if self.name not in undefined:
+                    undefined.add(self.name)
+                    warnings.warn(
+                        f"{bib_path}: undefined @string macro {self.literal!r}; kept as literal text",
+                        BibliographyMetadataWarning,
+                        stacklevel=2,
+                    )
+                return self.literal
+
     class MetadataParser(BibTexParser):
+        def _init_expressions(self):
+            super()._init_expressions()
+            self._expr.set_string_name_parse_action(
+                lambda s, l, t: LiteralFallbackString(self.bib_database, t[0]))
+
         def _add_string(self, string_key, string):
             # Compare interpolated values, so quoting, concatenation and aliases
-            # follow the library's own semantics. Undefined macros still raise.
+            # follow the library's own semantics (undefined macros: see above).
             value = self._clean_val(string)
             strings = self.bib_database.strings
             if string_key in strings and strings[string_key] != value:
@@ -181,17 +252,39 @@ def _parse_bib_file(bib_path: Path, arxiv_id: str) -> List[BibtexEntry]:
 
     entries: List[BibtexEntry] = []
     try:
-        source = _read_source(bib_path)
+        source = _read_source(bib_path, lenient=True)
+        # Whole-line % comments, which biber accepts and authors use to switch off a
+        # field, break bibtexparser's entry grammar; a % inside a value is kept.
+        source = _BIB_LINE_COMMENT.sub("", source)
         parser = MetadataParser(common_strings=True, ignore_nonstandard_types=False)
+        common = dict(parser.bib_database.strings)
+        if strings:
+            parser.bib_database.strings.update(strings)
         db = bibtexparser.loads(source, parser=parser)
-        # v1 accepts malformed entries as implicit comments; never lose them silently.
-        if any(re.search(r"(?m)^\s*@[A-Za-z]+\s*[{(]", comment)
-               for comment in db.comments):
+        if strings is not None:
+            strings.update({k: v for k, v in db.strings.items() if common.get(k) != v})
+        # v1 accepts malformed entries as implicit comments. Like BibTeX, skip only
+        # those entries and keep the rest of the database, but never silently: the
+        # warning is blocking because the skipped entries are lost.
+        skipped = [match.group(0).strip() for comment in db.comments
+                   for match in _BIB_ENTRY_START.finditer(comment)]
+        skipped += [f"@{e.get('ENTRYTYPE', 'misc')}{{,"
+                    for e in db.entries if not e.get("ID", "").strip()]
+        defines_strings = any(common.get(k) != v for k, v in db.strings.items())
+        if skipped and not defines_strings and not any(e.get("ID", "").strip() for e in db.entries):
             raise BibliographyParseError(f"{bib_path}: malformed BibTeX entry")
+        if skipped:
+            warnings.warn(
+                f"{bib_path}: skipped {len(skipped)} malformed BibTeX "
+                f"entr{'y' if len(skipped) == 1 else 'ies'} (first: {skipped[0][:60]}); "
+                "the other entries are kept",
+                BibliographyWarning,
+                stacklevel=2,
+            )
         for e in db.entries:
             key = e.get("ID", "").strip()
             if not key:
-                raise BibliographyParseError(f"{bib_path}: empty citation key")
+                continue
             entries.append(BibtexEntry(
                 arxiv_id=arxiv_id,
                 citation_key=key,
@@ -200,7 +293,7 @@ def _parse_bib_file(bib_path: Path, arxiv_id: str) -> List[BibtexEntry]:
                 authors=_split_authors(e.get("author", "")),
                 year=_bib_year(e),
                 doi=_norm_doi(e.get("doi")) or None,
-                # biblatex dùng journaltitle thay cho journal.
+                # biblatex uses journaltitle instead of journal.
                 journal=_standardize_text(e.get("journal") or e.get("journaltitle") or e.get("booktitle")),
                 url=e.get("url"),
                 arxiv_id_hint=_bib_arxiv_id(e),
@@ -218,7 +311,7 @@ def _parse_bibitem_from_tex(
     *,
     enrich: bool = True,
 ) -> List[BibtexEntry]:
-    """Tìm \\begin{thebibliography}...\\end{...} trong .tex, extract từng \\bibitem."""
+    """Find \\begin{thebibliography}...\\end{...} in the .tex source and extract each \\bibitem."""
     combined = "\n".join(_read_source(Path(path)) for path in compilation_path)
     return _parse_bibitems(combined, arxiv_id, enrich=enrich)
 
@@ -246,7 +339,7 @@ def _parse_bibitems(source: str, arxiv_id: str, *, enrich: bool) -> List[BibtexE
     return entries
 
 
-# {\it Tiêu đề}, {\em ...}, {\sl ...}: nhóm in nghiêng kiểu cũ, cho phép một tầng ngoặc bên trong.
+# {\it Title}, {\em ...}, {\sl ...}: old-style italic groups, allowing one nested brace level.
 _GROUP_ITALIC = re.compile(r"\{\\(?:it|em|sl|itshape|slshape)(?![A-Za-z])\s*((?:[^{}]|\{[^{}]*\})*)\}")
 
 
@@ -257,10 +350,10 @@ def _parse_bibitem_block(
     *,
     enrich: bool = True,
 ) -> BibtexEntry:
-    """Parse một block \\bibitem thô thành BibtexEntry chuẩn."""
+    """Parse one raw \\bibitem block into a normalized BibtexEntry."""
     source = re.sub(r"\s+", " ", raw_text).strip()
-    # Style cũ in nghiêng bằng nhóm {\it ...}/{\em ...}: viết lại thành \textit{...}
-    # để cùng được nhận như chữ in nghiêng (tiêu đề hoặc tên tạp chí).
+    # Old styles italicize with {\it ...}/{\em ...} groups: rewrite them as \textit{...}
+    # so they are recognized as italics too (a title or a journal name).
     text = _GROUP_ITALIC.sub(lambda m: "\\textit{" + m.group(1).strip() + "}", source)
 
     # 1. Year
@@ -271,7 +364,7 @@ def _parse_bibitem_block(
     doi_match = re.search(r"\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", text)
     doi = _norm_doi(doi_match.group(1)) or None if doi_match else None
 
-    # 3. URL & arXiv ID Hint (Đòn bẩy Milestone 3)
+    # 3. URL & arXiv ID hint (key for Milestone 3)
     url_match = re.search(r"https?://[^\s{}]+", text)
     url = url_match.group(0).rstrip(".,;)") if url_match else None
 
@@ -282,7 +375,7 @@ def _parse_bibitem_block(
     authors: List[str] = []
     journal: Optional[str] = None
 
-    # \" là dấu umlaut (Birkh\"auser), không phải dấu ngoặc kép bao tiêu đề.
+    # \" is an umlaut (Birkh\"auser), not a quotation mark around a title.
     quote_match = re.search(r"(?:``|(?<!\\)\")([^\"']+?)(?:''|(?<!\\)\")", text)
     style_match = re.search(r"\\(?:textit|emph|textbf|em)\{([^}]+)\}", text)
 
@@ -331,7 +424,7 @@ def _parse_bibitem_block(
     if title:
         title = (_standardize_text(title) or "").rstrip(",.")
 
-    # 5. Phân loại Entry Type
+    # 5. Entry type classification
     text_lower = text.lower()
     if journal and any(kw in journal.lower() for kw in ("proc", "conference", "symposium", "inproceedings")):
         entry_type = "inproceedings"
@@ -359,7 +452,7 @@ def _parse_bibitem_block(
             journal = journal or enriched.get("journal")
             source_method = "crossref"
 
-    # LLM Fallback (khi regex thiếu trường nghiêm trọng)
+    # LLM fallback (when regex misses critical fields)
     if enrich and (not title or not authors):
         llm_entry = _fallback_parse_with_llm(citation_key, raw_text, arxiv_id)
         if llm_entry:
@@ -395,7 +488,7 @@ def _parse_bibitem_block(
 
 def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int, int]]:
     """Recognize authors and a complete plain title before later venue styling."""
-    # "Tác giả. Tiêu đề. In \emph{Hội nghị}": chữ "In" dẫn tới nơi đăng, không phải một khối riêng.
+    # "Author. Title. In \emph{Conference}": "In" introduces the venue, not a separate block.
     prefix = re.sub(r"(?:(?<=\s)|^)[Ii]n:?\s*$", "", text[:style_start])
     # Top-level separators only: braces protect corporate names and title text.
     # Explicit blocks also keep a multi-sentence title together.
@@ -408,29 +501,29 @@ def _plain_title_before_style(text: str, style_start: int) -> Optional[tuple[int
         if len(parts) != 2:
             return None
     candidate = parts[1]
-    # Tiêu đề có thể là câu hỏi/câu cảm thán ("Are ... useful for forecasting?").
+    # A title may be a question or an exclamation ("Are ... useful for forecasting?").
     if len(candidate) <= 5 or not candidate.endswith((".", "?", "!")):
         return None
     start = prefix.rfind(candidate)
     return start, start + len(candidate)
 
 
-# Khối thứ hai không phải tiêu đề khi nó mở đầu như phần nơi đăng hoặc định danh.
+# The second block is not a title when it starts like a venue or an identifier.
 _NOT_A_TITLE_BLOCK = re.compile(
     r"(?:in\b|arxiv\b|preprint\b|available\b|https?:|doi\b|vol\b|volume\b|pp\b|pages?\b"
     r"|\\(?:url|href|doi)\b|\(?\d{4}\)?[.,]?$)", re.IGNORECASE)
 
 
 def _newblock_fields(text: str) -> Optional[tuple[str, str, str]]:
-    r"""(tác giả, tiêu đề, phần còn lại) theo khối ``\newblock`` của BibTeX.
+    r"""(authors, title, rest) from the ``\newblock`` blocks of BibTeX output.
 
-    Các style chuẩn (plain, abbrv, alpha, unsrt, amsplain, ...) xuất mỗi
-    ``\bibitem`` thành các khối: tác giả, tiêu đề, rồi nơi đăng. Trả về
-    ``None`` khi cấu trúc không rõ để các heuristic khác xử lý: ít hơn hai
-    khối, khối tác giả rỗng, hoặc khối thứ hai trông như nơi đăng (``In ...``,
-    ``arXiv:...``, URL, năm). Khi chỉ có hai khối và khối thứ hai được in
-    nghiêng toàn bộ, đó thường là tên tạp chí đi sau "tác giả, tiêu đề", nên
-    cũng trả về ``None``.
+    Standard styles (plain, abbrv, alpha, unsrt, amsplain, ...) write each
+    ``\bibitem`` as blocks: authors, title, then venue. Returns ``None`` when
+    the structure is unclear so that other heuristics handle it: fewer than two
+    blocks, an empty author block, or a second block that looks like a venue
+    (``In ...``, ``arXiv:...``, a URL, a year). With only two blocks and a fully
+    italic second block, that block is usually a journal name following
+    "authors, title", so ``None`` is returned as well.
     """
     if not re.search(r"\\newblock\b", text):
         return None
@@ -447,23 +540,23 @@ def _newblock_fields(text: str) -> Optional[tuple[str, str, str]]:
 
 
 def _venue_from_tail(tail: str) -> Optional[str]:
-    """Tên tạp chí/hội nghị trong phần sau tiêu đề: chữ in nghiêng, hoặc sau ``In``."""
+    """Journal/conference name in the part after the title: italic text, or the phrase after ``In``."""
     match = re.search(r"(?:in\s+)?\\(?:textit|emph|em)\{([^}]+)\}", tail, re.IGNORECASE)
     if not match:
         match = re.search(r"\bin\s+([A-Z][A-Za-z0-9\s,\.:&-]+?)(?:,|\.|\b\d{4}\b|$)", tail, re.IGNORECASE)
     return match.group(1).strip() if match else None
 
 
-# Khối nơi đăng bắt đầu như vầy thì không chứa tên tạp chí/nhà xuất bản.
+# A venue block starting like this does not hold a journal or publisher name.
 _NOT_A_VENUE = re.compile(r"(?:url|https?:|arxiv|preprint|doi|available|accessed)\b", re.IGNORECASE)
 
 
 def _venue_from_blocks(tail: str) -> Optional[str]:
-    r"""Nơi đăng sau tiêu đề ở dạng ``\newblock``.
+    r"""Venue after the title in ``\newblock`` form.
 
-    Ưu tiên chữ in nghiêng hoặc cụm sau ``In`` như ``_venue_from_tail``. Nếu
-    không có, lấy khối đầu tiên (``Annals of Probability, 48(2):963--1001,
-    2020``) và cắt trước số tập, trang hoặc năm.
+    Prefers italic text or the phrase after ``In``, like ``_venue_from_tail``.
+    Otherwise takes the first block (``Annals of Probability, 48(2):963--1001,
+    2020``) and cuts it before the volume, pages or year.
     """
     venue = _venue_from_tail(tail)
     if venue or not tail.strip():
@@ -479,11 +572,11 @@ def _venue_from_blocks(tail: str) -> Optional[str]:
 
 def _parse_authors_from_text(raw_authors: str) -> List[str]:
     """Split prose authors conservatively, retaining protected corporate names."""
-    # "~" là dấu cách không ngắt: "T.~Smith" là hai từ, không phải một họ.
+    # "~" is a non-breaking space: "T.~Smith" is two words, not one surname.
     raw = re.sub(r"\bet\s+al\b\.?", "", raw_authors.replace("~", " "), flags=re.IGNORECASE).strip()
-    # Style tác giả–năm ("..., and D. Sahoo. 2024."): năm không thuộc tên tác giả cuối.
+    # Author-year style ("..., and D. Sahoo. 2024."): the year is not part of the last author.
     raw = re.sub(r"[\s,]*\(?\b(?:1[5-9]\d{2}|20\d{2})[a-z]?\)?[\s.,]*$", "", raw)
-    # Dấu chấm kết khối sau họ đầy đủ ("D. Sahoo.") không thuộc tên; "J." thì giữ.
+    # The period closing a block after a full surname ("D. Sahoo.") is not part of the name; "J." is kept.
     raw = re.sub(r"(?<=\w\w)(?<!\bJr)(?<!\bSr)(?<!\bInc)(?<!\bLtd)(?<!\bCo)\.$", "", raw)
     names = []
     for segment in _split_names(raw, r"\band\b|\\?&|;"):
@@ -495,8 +588,8 @@ def _parse_authors_from_text(raw_authors: str) -> List[str]:
                 len(chunks[i].split()) == 1 for i in range(0, len(chunks), 2)):
             chunks = [", ".join(chunks[i:i + 2]) for i in range(0, len(chunks), 2)]
         elif len(chunks) > 2:
-            # Kiểu trộn "Petropoulos, F., S. Makridakis": họ đứng riêng rồi tới
-            # cụm chỉ gồm chữ viết tắt là một tên "Họ, Tên viết tắt".
+            # Mixed style "Petropoulos, F., S. Makridakis": a lone surname followed by
+            # a run of initials only is one "Surname, Initials" name.
             merged, i = [], 0
             while i < len(chunks):
                 if (i + 1 < len(chunks) and len(chunks[i].split()) == 1
@@ -543,9 +636,9 @@ def _split_names(text: str, separator: str) -> List[str]:
     return parts
 
 
-# ===== arXiv ID VÀ NĂM =====
+# ===== arXiv ID AND YEAR =====
 
-# ID mới (2007 trở đi) và ID cũ dạng archive/YYMMNNN.
+# New-style IDs (2007 onwards) and old-style archive/YYMMNNN IDs.
 _ARXIV_ID = r"(\d{4}\.\d{4,5}|[a-z][a-z-]*(?:\.[A-Z]{2})?/\d{7})(v\d+)?"
 _ARXIV_IN_TEXT = re.compile(
     r"(?:arxiv(?:\.org)?(?:/(?:abs|pdf))?[:/\s]+|10\.48550/arxiv\.)" + _ARXIV_ID, re.IGNORECASE)
@@ -554,7 +647,7 @@ _YEAR = re.compile(r"(?<!\d)(1[5-9]\d{2}|20\d{2})(?!\d)")
 
 
 def _find_arxiv_id(*texts: Optional[str]) -> Optional[str]:
-    """ID arXiv đi sau tiền tố arXiv, URL arxiv.org hoặc DOI 10.48550/arXiv."""
+    """arXiv ID following an arXiv prefix, an arxiv.org URL or a 10.48550/arXiv DOI."""
     for text in texts:
         if text:
             match = _ARXIV_IN_TEXT.search(text)
@@ -564,7 +657,7 @@ def _find_arxiv_id(*texts: Optional[str]) -> Optional[str]:
 
 
 def _bib_arxiv_id(fields: Dict[str, str]) -> Optional[str]:
-    """Lấy arXiv ID từ eprint (khi archivePrefix là arXiv hoặc trống) rồi các trường khác."""
+    """arXiv ID from eprint (when archivePrefix is arXiv or empty), then from the other fields."""
     eprint = fields.get("eprint", "")
     prefix = (fields.get("archiveprefix") or fields.get("eprinttype") or "arxiv").strip().lower()
     if eprint and prefix == "arxiv":
@@ -576,7 +669,7 @@ def _bib_arxiv_id(fields: Dict[str, str]) -> Optional[str]:
 
 
 def _bib_year(fields: Dict[str, str]) -> Optional[int]:
-    """Năm từ trường year (chấp nhận ``2017a``, ``{2017}``) hoặc date của biblatex."""
+    """Year from the year field (accepts ``2017a``, ``{2017}``) or the biblatex date field."""
     for name in ("year", "date"):
         match = _YEAR.search(fields.get(name) or "")
         if match:
@@ -585,7 +678,7 @@ def _bib_year(fields: Dict[str, str]) -> Optional[int]:
 
 
 def _year_from_arxiv_id(hint: Optional[str]) -> Optional[int]:
-    """Năm nộp bản đầu tiên, mã hóa trong ID: 2306.11478 là 2023, hep-th/9901001 là 1999."""
+    """Year of the first submission encoded in the ID: 2306.11478 is 2023, hep-th/9901001 is 1999."""
     if not hint:
         return None
     if re.match(r"\d{4}\.", hint):
@@ -597,55 +690,110 @@ def _year_from_arxiv_id(hint: Optional[str]) -> Optional[int]:
     return None
 
 
-# ===== SO KHỚP CHUỖI KHÔNG DẤU =====
+# ===== ACCENT-INSENSITIVE STRING MATCHING =====
 
 def _folded(text: Optional[str]) -> str:
-    """Chữ thường không dấu, chỉ giữ chữ và số, mỗi cụm còn lại thành một dấu cách.
+    """Lowercase without accents, keeping only letters and digits; every other run becomes one space.
 
-    Dùng ở bước hậu xử lý AnyStyle (``bibtex_refine``) để so tiêu đề với văn
-    bản ``\\bibitem`` gốc mà không phụ thuộc dấu câu, hoa thường hay dấu thanh.
+    Used by the AnyStyle post-processing step (``bibtex_refine``) to compare a
+    title with the original ``\\bibitem`` text regardless of punctuation, case
+    or diacritics.
     """
     text = unicodedata.normalize("NFKD", text or "")
     text = "".join(c for c in text if not unicodedata.combining(c)).lower()
     return " ".join("".join(c if c.isalnum() else " " for c in text).split())
 
 
-# ===== CHUẨN HÓA TRƯỜNG VĂN BẢN =====
+# ===== TEXT FIELD NORMALIZATION =====
 
-# Lệnh định dạng chỉ bọc nội dung: giữ phần trong ngoặc, bỏ lệnh.
+# Formatting commands that only wrap content: keep what is inside the braces, drop the command.
 _WRAPPER_COMMAND = re.compile(
     r"\\(?:textit|textbf|textsc|textrm|textsf|texttt|textup|textmd|textnormal|emph|em|bf|it|sc"
     r"|mbox|hbox|text|uppercase|MakeUppercase|NoCaseChange|url|href\s*\{[^{}]*\})\s*"
     r"\{((?:[^{}]|\{[^{}]*\})*)\}")
-# \bibinfo{field}{value} (natbib/REVTeX) chỉ giữ value; \newblock là dấu ngắt khối.
+# \bibinfo{field}{value} (natbib/REVTeX) keeps only value; \newblock is a block separator.
 _BIBINFO = re.compile(r"\\bibinfo\s*\{[^{}]*\}\s*")
 _NEWBLOCK = re.compile(r"\\newblock\b\s*")
 _MATH_SPAN = re.compile(r"(?<!\\)\$[^$]*\$|\\\(.*?\\\)")
 _LEFTOVER_COMMAND = re.compile(r"\\[A-Za-z@]+\*?")
-# Lệnh nhiều chữ cái (\it, \bf, \small, ...) bị bỏ trước khi đổi dấu, nếu không
-# latex_to_unicode đọc "\it" thành "\i" (ı) + "t". Giữ các ký hiệu chữ thật.
+# Multi-letter commands (\it, \bf, \small, ...) are dropped before converting accents, otherwise
+# latex_to_unicode reads "\it" as "\i" (ı) + "t". Real letter symbols are kept.
 _MULTI_LETTER_COMMAND = re.compile(r"\\([A-Za-z@]{2,})\*?\s*")
 _SYMBOL_COMMANDS = {"ss", "ae", "AE", "oe", "OE", "aa", "AA", "textendash", "textemdash",
                     "textquoteleft", "textquoteright", "textquotedblleft", "textquotedblright"}
-# latex_to_unicode đổi sai từ dấu không ngoặc thứ hai trở đi ("S\'eminaire de
-# Probabilit\'es"); bọc từng dấu thành {\'e} trước để luôn đổi đúng.
+# latex_to_unicode mis-converts unbraced accents from the second one on ("S\'eminaire de
+# Probabilit\'es"); wrap each accent as {\'e} first so it is always converted.
 _UNBRACED_SYMBOL_ACCENT = re.compile(r"(?<!\{)\\([`'^\"~=.])\s*([A-Za-z])")
 _UNBRACED_LETTER_ACCENT = re.compile(r"(?<!\{)\\([uvHcdbtrk])(?:\s+([A-Za-z])|\{([A-Za-z])\})")
 
 
-def _standardize_text(value: Optional[str]) -> Optional[str]:
-    """Đổi văn bản LaTeX của trường BibTeX thành Unicode dễ đọc.
+@functools.lru_cache(maxsize=1)
+def _latex_tables():
+    r"""bibtexparser's LaTeX-to-Unicode tables with their multi-code-point entries repaired.
 
-    Bỏ lệnh định dạng và ngoặc bảo vệ chữ hoa (``{BoxE}`` thành ``BoxE``),
-    đổi dấu LaTeX sang Unicode (``{\\"u}`` thành ``ü``) bằng bibtexparser.
-    Công thức ``$...$`` giữ nguyên; lệnh lạ còn lại bị bỏ như trước đây.
+    bibtexparser 1.4.3 writes about twenty symbols as one string of joined code
+    points, e.g. ``" -0200A-0200A"`` for ``\;``. Its ``latex_to_unicode``
+    then calls ``unicodedata.combining`` on that string and raises TypeError,
+    which used to drop the whole .bib file. Here such a value is decoded into
+    the code points it stands for; an undecodable value is left out.
+    """
+    from bibtexparser import latexenc
+
+    def decode(value):
+        if len(value) == 1:
+            return value
+        head, *rest = value.split("-")
+        try:
+            return head + "".join(chr(int(point, 16)) for point in rest)
+        except ValueError:
+            return None
+
+    def table(*sources):
+        rows = ((decode(u), latex.rstrip()) for u, latex in itertools.chain(*sources))
+        return tuple((u, latex) for u, latex in rows if u)
+
+    return (table(latexenc.unicode_to_crappy_latex1, latexenc.unicode_to_latex),
+            table(latexenc.unicode_to_crappy_latex2))
+
+
+def _replace_latex(string: str, latex: str, unicod: str) -> str:
+    """bibtexparser's replacement step; a combining accent is moved after the next character."""
+    if latex not in string:
+        return string
+    if len(unicod) == 1 and unicodedata.combining(unicod):
+        for m in re.finditer(re.escape(latex), string):
+            i, j = m.span()
+            if j < len(string):
+                string = "".join([string[:i], string[j], unicod, string[j + 1:]])
+            else:
+                string = string[:i]
+        return string
+    return string.replace(latex, unicod)
+
+
+def _latex_to_unicode(string: str) -> str:
+    """Same result as ``bibtexparser.latexenc.latex_to_unicode`` without its TypeError."""
+    first, second = _latex_tables()
+    if "\\" in string or "{" in string:
+        for unicod, latex in first:
+            string = _replace_latex(string, latex, unicod)
+    string = string.replace("{", "").replace("}", "")
+    if "\\" in string or "{" in string:
+        for unicod, latex in second:
+            string = _replace_latex(string, latex, unicod)
+    return unicodedata.normalize("NFC", string)
+
+
+def _standardize_text(value: Optional[str]) -> Optional[str]:
+    """Convert the LaTeX text of a BibTeX field into readable Unicode.
+
+    Drops formatting commands and case-protecting braces (``{BoxE}`` becomes
+    ``BoxE``) and converts LaTeX accents to Unicode (``{\\"u}`` becomes ``ü``)
+    with bibtexparser's tables (see ``_latex_tables``). ``$...$`` math is kept; other unknown commands are
+    dropped as before.
     """
     if not value:
         return value
-    try:
-        from bibtexparser.latexenc import latex_to_unicode
-    except ImportError:  # pragma: no cover - requirements luôn có bibtexparser
-        latex_to_unicode = None
     text = _NEWBLOCK.sub(" ", _BIBINFO.sub("", value))
     previous = None
     while previous != text:
@@ -659,16 +807,15 @@ def _standardize_text(value: Optional[str]) -> Optional[str]:
     out = []
     for kind, piece in parts:
         if kind == "text":
-            piece = re.sub(r"\\\\\*?(?:\[[^\]]*\])?", " ", piece)  # ngắt dòng \\
+            piece = re.sub(r"\\\\\*?(?:\[[^\]]*\])?", " ", piece)  # line break \\
             piece = _MULTI_LETTER_COMMAND.sub(
                 lambda m: m.group(0) if m.group(1) in _SYMBOL_COMMANDS else "", piece)
             piece = _UNBRACED_SYMBOL_ACCENT.sub(lambda m: "{\\" + m.group(1) + m.group(2) + "}", piece)
             piece = _UNBRACED_LETTER_ACCENT.sub(
                 lambda m: "{\\" + m.group(1) + "{" + (m.group(2) or m.group(3)) + "}}", piece)
-            if latex_to_unicode is not None:
-                piece = latex_to_unicode(piece)
+            piece = _latex_to_unicode(piece)
             piece = _LEFTOVER_COMMAND.sub("", piece).replace("{", "").replace("}", "")
-            piece = re.sub(r"\\([$&%#_])", r"\1", piece).replace("~", " ")  # ký tự thoát \$ \& \% \# \_
+            piece = re.sub(r"\\([$&%#_])", r"\1", piece).replace("~", " ")  # escaped characters \$ \& \% \# \_
         out.append(piece)
     cleaned = " ".join("".join(out).split())
     return cleaned or None
@@ -679,10 +826,10 @@ _NOT_GIVEN_NAME = re.compile(r"^(?:inc|ltd|llc|co|corp|gmbh|et al)\.?$", re.IGNO
 
 
 def _first_last(name: str) -> str:
-    """Đổi ``Last, First`` (và ``Last, Jr., First``) thành ``First Last``.
+    """Turn ``Last, First`` (and ``Last, Jr., First``) into ``First Last``.
 
-    Các tên không có dạng đó, hoặc phần sau dấu phẩy không phải tên riêng
-    (``Inc.``, ``Ltd.``), giữ nguyên để không làm hỏng tên tổ chức.
+    Names in another form, or whose part after the comma is not a given name
+    (``Inc.``, ``Ltd.``), are kept as is so organization names stay intact.
     """
     parts = [part.strip() for part in name.split(",")]
     if len(parts) == 2 and all(parts) and not _NOT_GIVEN_NAME.match(parts[1]) and not _NAME_SUFFIX.match(parts[1]):
@@ -693,7 +840,7 @@ def _first_last(name: str) -> str:
 
 
 def _clean_author(name: str) -> str:
-    # Tên bọc trọn trong ngoặc là tên tổ chức (BibTeX): không đảo thứ tự.
+    # A name fully wrapped in braces is an organization (BibTeX): do not reorder it.
     protected = name.strip().startswith("{") and name.strip().endswith("}") and _split_names(name, ",") == [name.strip()]
     name = name.replace(r"\&", "&")
     name = _standardize_text(name) or ""
@@ -702,7 +849,7 @@ def _clean_author(name: str) -> str:
 
 
 def _split_authors(author_str: str) -> List[str]:
-    """Tách chuỗi authors từ bibtexparser format."""
+    """Split the authors string in bibtexparser format."""
     if not author_str:
         return []
     return [_clean_author(name) for name in _split_names(author_str, r"\band\b")
@@ -710,7 +857,7 @@ def _split_authors(author_str: str) -> List[str]:
 
 
 def _calculate_confidence_score(entry: BibtexEntry) -> float:
-    """Tính điểm chất lượng bóc tách từ 0.0 đến 1.0"""
+    """Extraction quality score from 0.0 to 1.0."""
     score = 0.0
     if entry.title and len(entry.title.strip()) >= 5:
         score += 0.45
@@ -724,11 +871,12 @@ def _calculate_confidence_score(entry: BibtexEntry) -> float:
 
 
 def _cached_with_warnings(maxsize: int = 4096):
-    """Cache theo tham số và phát lại cảnh báo của lần gọi đầu khi trúng cache.
+    """Cache by arguments and replay the first call's warnings on a cache hit.
 
-    Cùng một reference thường lặp ở mọi phiên bản của bài; không cache thì mỗi
-    phiên bản lại chờ mạng. Phát lại cảnh báo giữ nguyên chẩn đoán từng phiên
-    bản; trả bản sao sâu vì nơi gọi có thể sửa đối tượng trả về.
+    The same reference usually repeats in every version of a paper; without a
+    cache each version would wait on the network again. Replaying warnings keeps
+    each version's diagnostics; a deep copy is returned because callers may
+    modify the result.
     """
     def decorate(function):
         store: "OrderedDict[tuple, tuple[Any, list]]" = OrderedDict()
@@ -831,7 +979,7 @@ def _fallback_parse_with_llm(
     raw_text: str,
     arxiv_id: str,
 ) -> Optional[BibtexEntry]:
-    """Cơ chế dự phòng bằng mô hình ngôn ngữ nhỏ khi cú pháp lỗi nghiêm trọng."""
+    """Fallback to a small language model when the syntax is badly broken."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -885,7 +1033,7 @@ def _fallback_parse_with_llm(
         return None
 
 
-# ===== PHẦN MỚI: UNIFY ACROSS VERSIONS + DEDUPLICATION =====
+# ===== UNIFY ACROSS VERSIONS + DEDUPLICATION =====
 
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -910,7 +1058,7 @@ _PUNCTUATION_PATTERN = re.compile(r"[^\w\s]", re.UNICODE)
 
 @dataclass
 class UnifiedBibEntry:
-    """Một entry đã hợp nhất qua các version của cùng một publication."""
+    """One entry unified across the versions of a single publication."""
 
     arxiv_id: str
     citation_key: str
@@ -927,13 +1075,13 @@ class UnifiedBibEntry:
     confidence: float = 0.0
     arxiv_id_hint: Optional[str] = None
     conflicts: List[Dict[str, Any]] = field(default_factory=list)
-    # Trường được suy ra thay vì đọc từ nguồn (hiện chỉ có "year" từ arXiv ID).
+    # Fields inferred rather than read from the source (currently only "year" from the arXiv ID).
     inferred_fields: List[str] = field(default_factory=list)
-    # Văn bản \bibitem của phiên bản mới nhất có mục này dưới dạng \bibitem.
+    # \bibitem text of the newest version that has this entry as a \bibitem.
     raw_text: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
-        """Trả về đúng các cột của bảng chuẩn bibtex."""
+        """Return exactly the columns of the standard bibtex table."""
         return {
             "arxiv_id": self.arxiv_id,
             "citation_key": self.citation_key,
@@ -947,7 +1095,7 @@ class UnifiedBibEntry:
         }
 
     def to_debug_row(self) -> Dict[str, Any]:
-        """Trả về bản ghi đầy đủ phục vụ kiểm tra quá trình hợp nhất."""
+        """Return the full record used to audit the unification."""
         return {**self.to_row(),
                 "aliases": list(self.aliases),
                 "versions_present": list(self.versions_present),
@@ -961,7 +1109,7 @@ class UnifiedBibEntry:
 
 @dataclass
 class UnifiedBibliography:
-    """Kết quả hợp nhất một publication, gồm dữ liệu, ánh xạ key và thống kê."""
+    """Unification result of one publication: data, key mapping and statistics."""
 
     entries: List[UnifiedBibEntry]
     key_map: Dict[int, Dict[str, str]]
@@ -969,7 +1117,7 @@ class UnifiedBibliography:
 
 
 def _norm_text(value: Optional[str]) -> str:
-    """Bỏ dấu LaTeX, chuẩn hóa accent và dấu câu để so khớp."""
+    """Strip LaTeX accents and normalize diacritics and punctuation for matching."""
     if not value:
         return ""
     text = _LATEX_COMMAND_PATTERN.sub(" ", value)
@@ -981,12 +1129,12 @@ def _norm_text(value: Optional[str]) -> str:
 
 
 def _norm_title(value: Optional[str]) -> str:
-    """Chuẩn hóa title riêng cho các bước nhận diện cùng tài liệu."""
+    """Normalize a title for same-document detection only."""
     return _norm_text(value)
 
 
 def _norm_doi(value: Optional[str]) -> str:
-    """Chuẩn hóa DOI nhưng không thay đổi giá trị lưu trong entry."""
+    """Normalize a DOI without changing the value stored in the entry."""
     if not value:
         return ""
     doi = value.strip().lower()
@@ -1001,14 +1149,14 @@ def _norm_doi(value: Optional[str]) -> str:
 
 
 def _norm_arxiv(value: Optional[str]) -> str:
-    """Bỏ hậu tố version khỏi arXiv ID hint."""
+    """Strip the version suffix from an arXiv ID hint."""
     if not value:
         return ""
     return re.sub(r"v\d+$", "", value.strip().lower())
 
 
 def _author_surname(author: str) -> str:
-    """Rút họ từ tên dạng Last, First hoặc First Last."""
+    """Extract the surname from a name in Last, First or First Last form."""
     clean = _norm_text(re.sub(r"\bet\s+al\.?\b", "", author, flags=re.IGNORECASE))
     if not clean:
         return ""
@@ -1021,12 +1169,12 @@ def _author_surname(author: str) -> str:
     parts = clean.split()
     if len(parts) == 1:
         return parts[0]
-    # Họ compound phổ biến được giữ nguyên theo token cuối để ổn định giữa định dạng.
+    # Common compound surnames are kept by their last token so they stay stable across formats.
     return parts[-1]
 
 
 def _author_surnames(authors: Sequence[str]) -> frozenset[str]:
-    """Trả về tập họ đã chuẩn hóa, không tính et al."""
+    """Return the set of normalized surnames, excluding et al."""
     names = set()
     for author in authors or []:
         if re.search(r"\bet\s+al\.?\b", author, flags=re.IGNORECASE):
@@ -1038,7 +1186,7 @@ def _author_surnames(authors: Sequence[str]) -> frozenset[str]:
 
 
 def _entry_identity(entry: BibtexEntry) -> Tuple[Any, ...]:
-    """Khóa xác định để sắp xếp đầu vào ổn định, không dùng thứ tự list."""
+    """Deterministic key for a stable input order, independent of list order."""
     return (
         entry.citation_key or "",
         _norm_title(entry.title),
@@ -1067,12 +1215,12 @@ def _authors_compatible(left: Sequence[str], right: Sequence[str]) -> bool:
 
 
 def _title_similarity(left: str, right: str) -> float:
-    """So khớp bằng difflib cố định, không phụ thuộc package tùy chọn."""
+    """Fixed difflib matching, with no dependency on optional packages."""
     return SequenceMatcher(None, left, right).ratio()
 
 
 class _UnionFind:
-    """Union-Find có chọn root ổn định theo chỉ số đầu vào."""
+    """Union-Find with a stable root chosen by input index."""
 
     def __init__(self, size: int) -> None:
         self.parent = list(range(size))
@@ -1113,7 +1261,7 @@ def _can_merge(
     same_key_requires_title: bool = False,
     same_key_threshold: float = 0.80,
 ) -> bool:
-    """Áp dụng veto DOI, đồng thời kiểm tra title/năm/tác giả theo tầng."""
+    """Apply the DOI veto and check title/year/authors tier by tier."""
     left_dois = {_norm_doi(item.doi) for item in left if _norm_doi(item.doi)}
     right_dois = {_norm_doi(item.doi) for item in right if _norm_doi(item.doi)}
     if left_dois and right_dois and (
@@ -1139,7 +1287,7 @@ def _can_merge(
             if not _authors_compatible(first.authors or [], second.authors or []):
                 continue
             return True
-    # DOI/arXiv chắc chắn được phép nối dù metadata phụ không khớp.
+    # A definite DOI/arXiv match may merge even if secondary metadata disagrees.
     return False
 
 
@@ -1238,7 +1386,7 @@ def _select_authors(
 def _key_choice(
     members: Sequence[Tuple[int, BibtexEntry]],
 ) -> Tuple[str, List[str]]:
-    """Chọn key theo số version, version mới nhất rồi thứ tự từ điển."""
+    """Choose the key by version count, then the newest version, then lexicographic order."""
     key_versions: Dict[str, set[int]] = defaultdict(set)
     key_latest: Dict[str, int] = {}
     for version, entry in members:
@@ -1289,8 +1437,8 @@ def _build_unified_entry(
         })
     inferred = []
     if year is None and hints:
-        # Không phiên bản nào ghi năm: dùng năm nộp mã hóa trong arXiv ID và
-        # đánh dấu trong debug để phân biệt với năm có trong nguồn.
+        # No version records a year: use the submission year encoded in the arXiv ID and
+        # mark it in the debug output to tell it apart from a year found in the source.
         year = _year_from_arxiv_id(hints[0])
         if year is not None:
             inferred.append("year")
@@ -1322,10 +1470,10 @@ def unify_publication(
     *,
     fuzzy_threshold: float = 0.92,
 ) -> UnifiedBibliography:
-    """Gộp BibTeX của các version, deduplicate theo các tầng có veto DOI.
+    """Merge the BibTeX entries of all versions and deduplicate them in tiers with a DOI veto.
 
-    Thứ tự hợp nhất: DOI/arXiv chắc chắn, title chuẩn hóa, cùng citation key
-    tương thích, sau đó so khớp fuzzy có blocking để giới hạn số cặp cần xét.
+    Merge order: definite DOI/arXiv match, normalized title, compatible
+    citation key, then fuzzy matching with blocking to limit the pairs compared.
     """
     if not 0.0 <= fuzzy_threshold <= 1.0:
         raise ValueError("fuzzy_threshold must be in [0, 1].")
@@ -1338,8 +1486,8 @@ def unify_publication(
     entries = [entry for _, entry in indexed]
     uf = _UnionFind(len(entries))
     merge_counts = {"doi": 0, "arxiv_hint": 0, "title": 0, "citation_key": 0, "fuzzy": 0}
-    # Chỉ số thành viên của mỗi cụm, luôn tăng dần như khi quét toàn bộ entry,
-    # để mỗi lần nối chỉ tốn theo kích thước hai cụm thay vì cả bài.
+    # Member indices of each cluster, always ascending as in a full scan of the entries,
+    # so each union costs the size of the two clusters rather than the whole paper.
     members = {index: [index] for index in range(len(entries))}
 
     def union(left_index: int, right_index: int) -> None:
@@ -1376,7 +1524,7 @@ def unify_publication(
                 union(left_index, right_index)
                 merge_counts[stage] += 1
 
-    # Tầng 1: đồng nhất DOI hoặc arXiv ID hint. Khác DOI luôn veto.
+    # Tier 1: identical DOI or arXiv ID hint. A different DOI always vetoes.
     for identity_field, stage in (("doi", "doi"), ("arxiv_id_hint", "arxiv_hint")):
         groups: Dict[str, List[int]] = defaultdict(list)
         for index, entry in enumerate(entries):
@@ -1386,7 +1534,7 @@ def unify_publication(
         pairs = (pair for value in sorted(groups) for pair in itertools.combinations(groups[value], 2))
         connect_pairs(pairs, stage, strong=True)
 
-    # Tầng 2: tiêu đề bằng nhau, đủ dài, không mâu thuẫn về năm hoặc tác giả.
+    # Tier 2: equal, long enough titles with no conflicting year or authors.
     groups = defaultdict(list)
     for index, entry in enumerate(entries):
         title = _norm_title(entry.title)
@@ -1395,7 +1543,7 @@ def unify_publication(
     pairs = (pair for title in sorted(groups) for pair in itertools.combinations(groups[title], 2))
     connect_pairs(pairs, "title")
 
-    # Cùng key không tự động chứng minh cùng tài liệu: title khác nhau là tái sử dụng key.
+    # The same key does not prove the same document: different titles mean a reused key.
     key_groups: Dict[str, List[int]] = defaultdict(list)
     for index, entry in enumerate(entries):
         if entry.citation_key:
@@ -1404,7 +1552,7 @@ def unify_publication(
              for pair in itertools.combinations(key_groups[key], 2))
     connect_pairs(pairs, "citation_key", same_key=True)
 
-    # Tầng 3: blocking theo họ đầu và prefix token tiêu đề; chỉ so cặp trong cùng block.
+    # Tier 3: blocking by first surname and title token prefix; only pairs within a block are compared.
     blocks: Dict[Tuple[str, Tuple[str, ...]], List[int]] = defaultdict(list)
     for index, entry in enumerate(entries):
         title_tokens = _norm_title(entry.title).split()
@@ -1457,7 +1605,7 @@ def unify_publication(
         tuple((version, _entry_identity(entry)) for version, entry in pair[1]),
     ))
 
-    # Một key duy nhất trong publication; nếu key bị tái sử dụng, ghi xung đột.
+    # One key per publication; if a key is reused, record a conflict.
     used_keys = set()
     original_key_targets: Dict[Tuple[int, str], set[str]] = defaultdict(set)
     for item, members in components:
@@ -1481,27 +1629,43 @@ def unify_publication(
             })
 
     unified = [item for item, _ in components]
+    target_of = {id(entry): item.citation_key for item, members in components for _, entry in members}
     key_map: Dict[int, Dict[str, str]] = {}
     ambiguous_keys = []
     for (version, old_key), targets in sorted(original_key_targets.items()):
-        # Key bị tái sử dụng cùng version là mơ hồ; không tạo một ánh xạ sai.
         if len(targets) == 1:
             target = next(iter(targets))
             if old_key != target:
                 key_map.setdefault(version, {})[old_key] = target
-        else:
-            ambiguity = {"version": version, "citation_key": old_key,
-                         "targets": sorted(targets)}
-            ambiguous_keys.append(ambiguity)
-            for item in unified:
-                if item.citation_key in targets:
-                    item.conflicts.append({"field": "ambiguous_citation_key", **ambiguity,
-                                           "selected": None})
+            continue
+        # A key defined twice in one version with different content. Resolve \cite the
+        # way the document was compiled: BibTeX keeps the first entry of the databases
+        # ("Repeated entry"); with \bibitem, LaTeX's last \bibcite wins.
+        same_key = [e for e in per_version.get(version) or [] if (e.citation_key or "").strip() == old_key]
+        from_bib = [e for e in same_key if e.source_method == "bib_file"]
+        chosen = from_bib[0] if from_bib else (same_key[-1] if same_key else None)
+        target = target_of.get(id(chosen)) if chosen is not None else None
+        ambiguity = {"version": version, "citation_key": old_key,
+                     "targets": sorted(targets)}
+        ambiguous_keys.append({**ambiguity, "selected": target})
+        for item in unified:
+            if item.citation_key in targets:
+                item.conflicts.append({"field": "ambiguous_citation_key", **ambiguity,
+                                       "selected": target})
+        if target is None:  # not expected: the entries come from per_version
             warnings.warn(
                 f"{arxiv_id} v{version}: ambiguous citation key {old_key!r} refers to "
                 f"{sorted(targets)}; citations with this key cannot be resolved",
                 BibliographyWarning, stacklevel=2,
             )
+            continue
+        if old_key != target:
+            key_map.setdefault(version, {})[old_key] = target
+        warnings.warn(
+            f"{arxiv_id} v{version}: citation key {old_key!r} is defined twice ({sorted(targets)}); "
+            f"citations use {target!r}, as {'BibTeX' if from_bib else 'LaTeX'} does",
+            BibliographyMetadataWarning, stacklevel=2,
+        )
     key_map = {version: dict(sorted(mapping.items()))
                for version, mapping in sorted(key_map.items()) if mapping}
 
@@ -1542,10 +1706,10 @@ def rewrite_cites(
     key_map: Dict[int, Dict[str, str]],
     version: int,
 ) -> str:
-    r"""Viết lại cite commands bằng đúng key_map của version được chỉ định.
+    r"""Rewrite cite commands with the key_map of the given version.
 
-    Gọi hàm này TRƯỚC bước so khớp full-text dedup của elements để các câu
-    giống nhau nhưng khác key cite vẫn được gộp thành một element_id.
+    Call this BEFORE the full-text deduplication of elements so that identical
+    sentences with different cite keys still merge into one element_id.
     """
     if __package__:
         from .hierarchy import _rewrite_citation_text
@@ -1575,7 +1739,7 @@ def process_publication(
     *,
     fuzzy_threshold: float = 0.92,
 ) -> UnifiedBibliography:
-    """Trích xuất BibTeX từng version rồi hợp nhất; version rỗng vẫn được ghi nhận."""
+    """Extract BibTeX per version, then unify; empty versions are still recorded."""
     per_version: Dict[int, List[BibtexEntry]] = {}
     path_getter = get_compilation_path or _gather_version
     for version in sorted(version_dirs):
@@ -1589,7 +1753,7 @@ def process_publication(
 
 
 def _find_publications(root: Path) -> Dict[str, Dict[int, Path]]:
-    """Tìm <root>/<arxiv_id>/<vN hoặc N>/...tex theo bố cục corpus đã quy ước."""
+    """Find <root>/<arxiv_id>/<vN or N>/...tex following the agreed corpus layout."""
     publications: Dict[str, Dict[int, Path]] = {}
     for publication_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         versions: Dict[int, Path] = {}
@@ -1599,7 +1763,7 @@ def _find_publications(root: Path) -> Dict[str, Dict[int, Path]]:
                 version_number = int(match.group(1))
                 if version_number in versions:
                     raise ValueError(
-                        f"Có nhiều directory cho version {version_number} trong "
+                        f"Multiple directories for version {version_number} in "
                         f"{publication_dir}: {versions[version_number].name}, "
                         f"{version_dir.name}"
                     )
@@ -1623,7 +1787,7 @@ def _run_publication_job(
         bool,
     ],
 ) -> Tuple[str, UnifiedBibliography, float]:
-    """Worker top-level để tương thích ProcessPoolExecutor trên Windows."""
+    """Top-level worker, for ProcessPoolExecutor compatibility on Windows."""
     arxiv_id, versions, path_getter, fuzzy_threshold, no_network = job
     original_crossref = _enrich_with_crossref
     original_llm = _fallback_parse_with_llm
@@ -1644,7 +1808,7 @@ def _run_publication_job(
 
 
 def _rss_tree_bytes(psutil_module: Any) -> int:
-    """Đo RSS tiến trình runner và các worker đang tồn tại."""
+    """Measure the RSS of the runner process and its live workers."""
     process = psutil_module.Process()
     processes = [process]
     try:
@@ -1668,19 +1832,19 @@ def run_corpus(
     fuzzy_threshold: float = 0.92,
     get_compilation_path: Optional[Callable[[Path], GatherTex | List[Path] | None]] = None,
 ) -> Dict[str, Any]:
-    """Chạy corpus và xuất Parquet (nếu có pyarrow) hoặc JSONL.
+    """Run the corpus and export Parquet (when pyarrow is available) or JSONL.
 
-    Bố cục mặc định là <root>/<arxiv_id>/<vN hoặc N>/...tex; corpus khác có thể
-    dùng get_compilation_path tùy chỉnh khi gọi process_publication/run_corpus.
+    The default layout is <root>/<arxiv_id>/<vN or N>/...tex; other corpora can
+    pass a custom get_compilation_path to process_publication/run_corpus.
     """
     if workers < 1:
-        raise ValueError("workers phải lớn hơn hoặc bằng 1.")
+        raise ValueError("workers must be greater than or equal to 1.")
     if not 0.0 <= fuzzy_threshold <= 1.0:
         raise ValueError("fuzzy_threshold must be in [0, 1].")
     root = Path(root)
     out_dir = Path(out_dir)
     if not root.is_dir():
-        raise FileNotFoundError(f"Không tìm thấy directory corpus: {root}")
+        raise FileNotFoundError(f"Corpus directory not found: {root}")
     out_dir.mkdir(parents=True, exist_ok=True)
     publications = _find_publications(root)
     jobs = [(arxiv_id, versions) for arxiv_id, versions in sorted(publications.items())]
@@ -1846,7 +2010,7 @@ def run_corpus(
 
 
 def _selftest() -> None:
-    """Chạy mười nhóm kiểm thử nội bộ, chỉ dựng dữ liệu, không gọi mạng."""
+    """Run ten internal test groups; builds data only, makes no network calls."""
     tests = 10
     passed = 0
 
@@ -1970,10 +2134,10 @@ def _selftest() -> None:
 
 def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Hợp nhất BibTeX giữa các version arXiv."
+        description="Unify BibTeX entries across arXiv versions."
     )
-    parser.add_argument("--root", type=Path, help="Thư mục corpus")
-    parser.add_argument("--out", type=Path, help="Thư mục đầu ra")
+    parser.add_argument("--root", type=Path, help="Corpus directory")
+    parser.add_argument("--out", type=Path, help="Output directory")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--no-network", action="store_true")
     parser.add_argument("--fuzzy-threshold", type=float, default=0.92)
@@ -1983,7 +2147,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         _selftest()
         return 0
     if args.root is None or args.out is None:
-        parser.error("--root và --out là bắt buộc nếu không dùng --selftest")
+        parser.error("--root and --out are required unless --selftest is used")
     stats = run_corpus(
         args.root,
         args.out,

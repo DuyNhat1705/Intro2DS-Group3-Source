@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class BibtexEntry:
-    """Một mục tài liệu tham khảo đã chuẩn hóa."""
+    """One normalized bibliography entry."""
     arxiv_id: str
     citation_key: str         # vd: "vaswani2017attention"
     entry_type: str           # "article" | "inproceedings" | "book" | "misc"
@@ -20,10 +20,10 @@ class BibtexEntry:
     doi: Optional[str] = None
     journal: Optional[str] = None
     url: Optional[str] = None
-    arxiv_id_hint: Optional[str] = None     # Bóc được arXiv ID gốc (phục vụ Milestone 3)
-    confidence_score: float = 1.0           # Điểm chất lượng bóc tách (0.0 - 1.0)
+    arxiv_id_hint: Optional[str] = None     # Extracted original arXiv ID (for Milestone 3)
+    confidence_score: float = 1.0           # Extraction quality score (0.0 - 1.0)
     source_method: str = "regex"            # "bib_file", "regex", "crossref", "llm"
-    # Văn bản \bibitem đã gộp khoảng trắng (None với entry .bib), cho bước hậu xử lý.
+    # \bibitem text with collapsed whitespace (None for .bib entries), for post-processing.
     raw_text: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

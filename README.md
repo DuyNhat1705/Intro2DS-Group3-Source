@@ -13,7 +13,6 @@
 - [Installation and Setup](#iv-installation-and-setup)
 - [Usage](#v-usage)
 - [Dependencies](#vi-dependencies)
-- [Running the Tests](#vii-running-the-tests)
 
 ---
 
@@ -60,12 +59,13 @@ Intro2DS-Group3-Source/
 |   ├── m2_types.py                  # Milestone 2: BibtexEntry data class
 |   ├── parser_pipeline.py           # Milestone 2: publication discovery and per-paper parsing
 |   ├── parser_parallel.py           # Milestone 2: RAM-aware parallel workers
-|   ├── parser_reporting.py          # Milestone 2: checkpoints, Parquet tables, statistics
+|   ├── parser_reporting.py          # Milestone 2: checkpoints, combined tables, statistics
+|   ├── parser_storage.py            # Milestone 2: atomic per-paper Parquet/JSONL partitions
 |   ├── bibtex_refine.py             # Milestone 2: optional AnyStyle post-processing
 |   ├── parser.ipynb                 # Milestone 2: parsing and reporting notebook
+|   ├── make_data_tar.ipynb          # Milestone 2: packs data/ into data.tar for faster Colab reads
 |   ├── intro2ds-env.yml             # Conda environment (Python 3.12)
 |   └── requirements.txt             # Pinned Python dependencies
-├── tests/                           # Milestone 2 automated tests (pytest)
 ├── data/                            # Local generated corpus
 |   └── 2310-12345/                  # Example normalized arXiv ID
 |       ├── metadata.json
@@ -130,7 +130,7 @@ Each paper is parsed from its own LaTeX sources only. The crawled reference meta
 
 - `discover_publications(data_dir, target_ids=None)`: Lists papers and versions from the Milestone 1 folders and download state; IDs without data are kept so coverage statistics stay complete.
 - `parse_publication(job)`: Runs gathering, cleanup, hierarchy, bibliography extraction, unification, citation rewriting, and element tables for every version of one paper, recording per-stage timings, warnings, and statistics.
-- `run_parser(jobs, output_dir, ...)`: Parses papers sequentially or with RAM-aware parallel workers (`iter_parallel_results`), skips papers whose checkpoint matches the source/code signature, writes per-paper partitions and the three combined Parquet tables, and exports the statistics (`per_paper.csv`, `per_version.csv`, `summary_stats.json`, ...).
+- `run_parser(jobs, output_dir, ...)`: Parses papers sequentially or with RAM-aware parallel workers (`iter_parallel_results`; each worker writes its own partition through `parser_storage` and returns only metadata, and `paper_timeout_sec` stops a hung paper), skips papers whose checkpoint matches the source/code signature, writes the three combined Parquet tables, and exports the statistics (`per_paper.csv`, `per_version.csv`, `summary_stats.json`; more with `debug_reports=True`). Checkpoint signatures use paths relative to the paper folder, so the same data read from Drive or from an extracted copy reuses the same checkpoints.
 
 #### E. `src/bibtex_refine.py`
 
@@ -204,11 +204,17 @@ Outputs include paper metadata, references, versioned `.tex`/`.bib` sources, Par
 1. Open `src/parser.ipynb` on Colab with a **CPU** runtime. `BRANCH` selects the branch that the notebook clones.
 2. Set `RUN_RANGES` (or `"local"` to parse whatever is in the data folder) and optionally `SAMPLE_N` for a trial run.
 3. Optional: put `data.tar.gz` (or `.tgz`/`.tar`) in `MyDrive/Intro2DS-Group3`; the notebook extracts it to the local disk and reads from there, which is much faster than reading many small files from Drive. The extraction time is recorded in `summary_stats.json` (`run.data_preparation`).
-4. Choose **Runtime > Run all**. Outputs go to `MyDrive/Intro2DS-Group3/statistics_data/parser`. Running again resumes from checkpoints; `VERIFY_CHECKPOINTS = "full"` re-hashes every output file for a final check.
+4. Choose **Runtime > Run all**. Outputs go to `MyDrive/Intro2DS-Group3/statistics_data/parser`. Running again resumes from checkpoints; the default `CHECKPOINT_VALIDATION = "fast"` compares size/mtime and re-hashes only changed files, while `"full"` re-hashes every file for a final check.
 5. `REFINE_WITH_ANYSTYLE = True` installs Ruby and `anystyle-cli` on Colab (a few minutes) for the optional post-processing step; set it to `False` to skip.
 
 ### 2. Running locally using VS Code
-In VS Code, open the notebook and use **Select Kernel** to choose the virtual environment has been created.
+In VS Code, open the notebook and use **Select Kernel** to choose the virtual environment that has been created.
+
+**Milestone 2 (`parser.ipynb`) locally:** the notebook detects that it is not on Colab, finds the repository from the current directory, reads `<repo>/data`, and writes results to `<repo>/statistics_data/parser` (ignored by Git). In the configuration cell:
+
+- Set `RUN_RANGES` to the ranges whose papers are in your local `data/` folder (or `"local"` to parse whatever is there); a range without local data only records every paper as missing input.
+- Set `NUM_WORKERS = 1` on a machine with little free RAM. With `"auto"`, the scheduler starts a worker only if the free RAM minus a 10% system reserve covers `RAM_PER_WORKER_GB` (1.5 GiB), and stops with `MemoryError: Insufficient RAM to start a worker safely` after `RAM_WAIT_TIMEOUT_SEC`.
+- Set `REFINE_WITH_ANYSTYLE = False` unless Ruby and `anystyle-cli` are installed; otherwise the step is skipped with a message.
 
 ### 3. Running locally using Conda
 
@@ -244,16 +250,3 @@ The project uses the following libraries specified in `src/requirements.txt`:
 - [`bibtexparser`](https://pypi.org/project/bibtexparser/) (`==1.4.3`): `.bib` parsing and LaTeX-to-Unicode conversion.
 - [`wtpsplit`](https://pypi.org/project/wtpsplit/) (`==2.2.2`) and [`onnxruntime`](https://pypi.org/project/onnxruntime/) (`==1.31.1`): SaT sentence segmentation on CPU.
 - [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Report figures and sanity-check plots in the notebooks.
-
----
-
-## VII. Running the Tests
-
-The Milestone 2 parser has an automated test suite in `tests/` (pytest). `pytest` is not part of `src/requirements.txt`, so install it in the environment created above, then run the suite from the repository root:
-
-```bash
-pip install pytest
-python -m pytest tests -q
-```
-
-The tests replace the SaT sentence model with a stub and disable the optional network lookups, so they run offline and do not download any model.
