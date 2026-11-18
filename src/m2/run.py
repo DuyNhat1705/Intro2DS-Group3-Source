@@ -45,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--workers", default="auto", help="'auto', N >= 1, or 0 for in-process")
     ap.add_argument("--limit", type=int, default=None, help="first K papers (sorted by key)")
     ap.add_argument("--papers", nargs="*", default=None, help="arXiv IDs or paper keys")
+    ap.add_argument("--sample", choices=["dev"], default=None,
+                    help="restrict to the 200-paper stratified dev sample (tests/samples.py)")
     ap.add_argument("--resume", action="store_true", help="skip papers with unchanged signature")
     ap.add_argument("--compact", action="store_true", help="merge shards after the run")
     ap.add_argument("--compact-only", action="store_true", help="only merge existing shards")
@@ -70,7 +72,11 @@ def main(argv=None) -> int:
         os.environ["M2_REFINE_BIBITEM"] = "1"
     run_id = time.strftime("%Y%m%d-%H%M%S")
     t0 = time.perf_counter()
-    jobs = discover(data, papers=a.papers, limit=a.limit)
+    papers = a.papers
+    if a.sample == "dev":
+        from .tests.samples import DEV_SAMPLE
+        papers = list(DEV_SAMPLE) + list(papers or [])
+    jobs = discover(data, papers=papers, limit=a.limit)
     t_disc = time.perf_counter() - t0
     prev = {}
     if a.resume:

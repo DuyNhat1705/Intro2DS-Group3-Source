@@ -15,6 +15,7 @@ from . import config as C
 _STRIP_RE = re.compile(r"\\label\s*\{[^{}]{0,300}\}|\\tag\*?\s*\{[^{}]{0,300}\}"
                        r"|\\(?:nonumber|notag)(?![A-Za-z@])")
 _WS_RE = re.compile(r"\s+")
+_STRAY_DELIM_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\[()\[\]]")
 _ENV_TOK_RE = re.compile(r"\\(begin|end)\s*\{[^}]*\}|\\\\")
 # Leading argument of some environments: alignat{2}, IEEEeqnarray{rCl}, empheq[..]{align}
 _LEAD_ARG_ENVS = {"alignat", "alignat*", "xalignat", "xalignat*", "xxalignat", "IEEEeqnarray",
@@ -28,6 +29,9 @@ AL_OPEN, AL_CLOSE = "\\begin{aligned}", "\\end{aligned}"
 def clean_math(body: str) -> str:
     if "\\" in body:
         body = _STRIP_RE.sub(" ", body)
+        if "\\(" in body or "\\)" in body or "\\[" in body or "\\]" in body:
+            # stray math delimiters inside a formula (malformed source such as "$a\) b$")
+            body = _STRAY_DELIM_RE.sub(r"\1 ", body)
     return _WS_RE.sub(" ", body).strip()
 
 

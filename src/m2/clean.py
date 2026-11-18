@@ -37,6 +37,11 @@ _TOK_RE = re.compile(
     r"|(?P<ph>\ue000\d+\ue001|\ue002\d+\ue003)"
 )
 _WS_RE = re.compile(r"\s+")
+_ADJ_MATH_RE = re.compile(r"(?<!\\)\$\$")
+_DIMEN_RE = re.compile(r"[ \t]*=?[ \t]*[-+]?(?:\d+(?:\.\d*)?|\.\d+)[ \t]*(?:pt|em|ex|cm|mm|in|bp|sp|pc|dd|cc|mu|px)"
+                       r"(?:[ \t]+(?:plus|minus)[ \t]*[-+]?[\d.]+[ \t]*(?:pt|em|ex|fil+))*(?![A-Za-z])"
+                       r"|[ \t]*=?[ \t]*[-+]?(?:\d+(?:\.\d*)?|\.\d+)?[ \t]*\\(?:linewidth|textwidth|columnwidth|"
+                       r"baselineskip|textheight|paperwidth|hsize|parindent)(?![A-Za-z])")
 _SPACE_PUNCT_RE = re.compile(r" +([,.;:!?)\]])")
 _OPEN_SPACE_RE = re.compile(r"([(\[]) +")
 
@@ -341,9 +346,17 @@ def _clean(text: str, ctx: _Ctx) -> str:
                     _g, i = _read_braces(text, i, na)
                 continue
             if cmd in C.DROP_SWITCHES:
-                # switches may be followed by a dimension, e.g. \vskip 2pt
+                # switches may be followed by a dimension, e.g. \vskip 2pt, \itemsep1pt
+                dm = _DIMEN_RE.match(text, i)
+                if dm:
+                    i = dm.end()
                 continue
-            # ---- unknown command: keep the text of its last argument
+            # ---- unknown command: a TeX length assignment (\itemsep1pt, \parskip=0pt) is
+            # dropped with its value; otherwise keep the text of its last argument
+            dm = _DIMEN_RE.match(text, i)
+            if dm:
+                i = dm.end()
+                continue
             _o, j = _read_opts(text, i, 2) if i < n and text[i] in "[ " else ([], i)
             g, j2 = _read_braces(text, j, 6, adjacent=True)
             if g:
@@ -399,7 +412,10 @@ def _clean(text: str, ctx: _Ctx) -> str:
                 continue
             if sym in (")", "]"):
                 continue
-            if sym in "%&_#${}":
+            if sym == "$":
+                out.append("\\$")  # escaped dollar stays escaped: never confused with math
+                continue
+            if sym in "%&_#{}":
                 out.append(sym)
                 continue
             if sym in " \n\t,;:!>":
@@ -453,20 +469,30 @@ def _finish(s: str) -> str:
     if "\n" in s or "\t" in s or "  " in s or "\u00a0" in s:
         s = _WS_RE.sub(" ", s)
     s = unicodedata.normalize("NFC", s.strip())
+    if "$$" in s:
+        # two adjacent inline formulas ("$\sim$$6'$") must not read as a display delimiter
+        s = _ADJ_MATH_RE.sub("$ $", s)
     if " " in s:
         s = _SPACE_PUNCT_RE.sub(r"\1", s)
         s = _OPEN_SPACE_RE.sub(r"\1", s)
     return s
 
 
+_SPECIAL_RE = re.compile(r"[\\{}$~&`'\--]")
+
+
 def clean_with_footnotes(raw: str, lits: Literals | None = None) -> tuple[str, list[str]]:
     """Clean a prose fragment. Returns ``(text_with_footnote_markers, footnotes)``."""
+    if not _SPECIAL_RE.search(raw):
+        return _finish(raw), []
     ctx = _Ctx(lits, True)
     return _finish(_clean(raw, ctx)), ctx.footnotes
 
 
 def clean_inline(raw: str, lits: Literals | None = None) -> str:
     """Clean a fragment and drop footnotes (titles, captions, cells)."""
+    if not _SPECIAL_RE.search(raw):
+        return _finish(raw)
     ctx = _Ctx(lits, False)
     return _finish(_clean(raw, ctx))
 
@@ -476,7 +502,7 @@ def strip_markers(text: str) -> str:
 
 
 _RESIDUAL_RE = re.compile(r"\\[a-zA-Z]+")
-_MATH_SPAN_RE = re.compile(r"\$[^$]*\$")
+_MATH_SPAN_RE = re.compile(r"(?<!\\)\$[^$]*?(?<!\\)\$")
 _CITEREF_RE = re.compile(r"\\(?:cite|ref)\{[^}]*\}")
 
 

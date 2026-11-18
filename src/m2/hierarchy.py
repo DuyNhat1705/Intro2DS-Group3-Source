@@ -264,8 +264,10 @@ class TreeBuilder:
         self._add(Node(kind, content))
 
     # ------------------------------------------------------------------ main loop
-    def build(self, body: str, preamble: str = "") -> Node:
-        if preamble:
+    def build(self, body: str, preamble: str = "", abstract_text: str = "") -> Node:
+        if abstract_text:
+            self._abstract_text(abstract_text)
+        elif preamble:
             self._preamble_abstract(preamble)
         self._parse(body)
         self.flush()

@@ -41,6 +41,7 @@ _THEBIB_RE = re.compile(r"\\begin\s*\{thebibliography\}")
 _THEBIB_END_RE = re.compile(r"\\end\s*\{thebibliography\}")
 _CITE_IN_CONTENT_RE = re.compile(r"\\cite\{([^{}]*)\}")
 _NOCITE_RE = re.compile(r"\\nocite\s*\{([^{}]*)\}")
+_CUSTOM_ABS_RE = re.compile(r"\\([A-Za-z]*[Aa]bstract[A-Za-z]*)\*?\s*(?:\[[^\]]{0,200}\])?\s*\{")
 
 
 # ---------------------------------------------------------------------------------------
@@ -166,6 +167,24 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
     pre, table = collect_definitions(gr.preamble, MacroTable())
     body, table = collect_definitions(gr.body, table)
     thm_names, _titles = collect_theorem_names(gr.preamble + "\n" + body[:5000])
+    # class/author-specific abstract commands (\paperabstract{..}, \Abstract{..}): take the
+    # argument as the abstract before macro expansion hides it
+    custom_abs = ""
+    if not re.search(r"\\begin\s*\{abstract\}", body[:300000]):
+        for which in ("pre", "body"):
+            src = pre if which == "pre" else body
+            m = _CUSTOM_ABS_RE.search(src)
+            if m and m.group(1) != "abstract":
+                from .preprocess import match_brace
+                k = match_brace(src, m.end() - 1)
+                if k > 0:
+                    custom_abs = src[m.end():k - 1]
+                    src = src[:m.start()] + " " + src[k:]
+                    if which == "pre":
+                        pre = src
+                    else:
+                        body = src
+                    break
     if not safe_mode:
         body = expand_macros(body, table)
         pre_x = expand_macros(pre, table) if ("\\title" in pre or "\\abstract" in pre) else pre
@@ -182,7 +201,11 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
     tb = TreeBuilder(gr.literals, thm_names, splitter=splitter, para_cache=para_cache,
                      safe_mode=safe_mode)
     pre_for_abs = pre_x if not re.search(r"\\begin\s*\{abstract\}|\\abstract\s*\{", body[:200000]) else ""
-    tree = tb.build(body, preamble=pre_for_abs)
+    if custom_abs:
+        if not safe_mode:
+            custom_abs = expand_macros(custom_abs, table)
+        pre_for_abs = ""
+    tree = tb.build(body, preamble=pre_for_abs, abstract_text=custom_abs)
     vp.title = _extract_title(pre_x, body, gr.literals) or (meta_title or "").strip()
     tree.content = vp.title
     vp.tree = tree
@@ -191,24 +214,7 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
     vp.times["hierarchy"] = t3 - t2
 
     # ---- bibliography of this version
-    for b in gr.bib_files:
-        ents, _st = parse_bib(files.get(b, ""))
-        for e in ents:
-            e.source = "bib"
-            e.version = version
-        vp.bib_entries.extend(ents)
-    vp.n_bib_raw = len(vp.bib_entries)
-    tb_text = _thebibliography_text(gr.body)
-    if tb_text:
-        items = parse_bibitems(tb_text, gr.literals)
-        if os.environ.get("M2_REFINE_BIBITEM") == "1":
-            from .bib_refine import refine_entries
-            items = refine_entries(items)
-        for e in items:
-            e.version = version
-        vp.n_bibitem = len(items)
-        vp.bib_entries.extend(items)
-    # cited keys: from cleaned contents + \nocite
+    # cited keys first (from cleaned contents + \nocite): only cited entries are normalized
     cited: Counter = Counter()
     for n in tree.walk():
         if n.kind in ("sentence", "figure", "table") and "\\cite{" in n.content:
@@ -222,8 +228,24 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
             if k and k != "*":
                 cited[k] += 0 if k in cited else 1
     vp.cited = cited
-    if not gr.nocite_all:
-        vp.bib_entries = [e for e in vp.bib_entries if e.key in cited]
+    wanted = None if gr.nocite_all else set(cited)
+    for b in gr.bib_files:
+        ents, st = parse_bib(files.get(b, ""), wanted)
+        for e in ents:
+            e.source = "bib"
+            e.version = version
+        vp.bib_entries.extend(ents)
+        vp.n_bib_raw += st["entries"]
+    tb_text = _thebibliography_text(gr.body)
+    if tb_text:
+        items, n_items = parse_bibitems(tb_text, gr.literals, wanted=wanted, with_count=True)
+        if os.environ.get("M2_REFINE_BIBITEM") == "1":
+            from .bib_refine import refine_entries
+            items = refine_entries(items)
+        for e in items:
+            e.version = version
+        vp.n_bibitem = n_items
+        vp.bib_entries.extend(items)
     vp.n_cited = len(vp.bib_entries)
     t4 = time.perf_counter()
     vp.times["bib"] = t4 - t3

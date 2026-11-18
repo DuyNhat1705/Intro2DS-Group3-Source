@@ -41,6 +41,8 @@ from .mathnorm import braces_balanced
 
 _LEAVES = {"sentence", "formula", "figure", "table"}
 _CITE_RE = re.compile(r"\\cite\{([^{}]*)\}")
+# an unescaped "\(" or "\[" (an even number of backslashes before it), or "$$" not "\$$"
+_RAW_DELIM_RE = re.compile(r"(?<!\\)(?:\\\\)*\\[(\[]|(?<!\\)\$\$")
 
 
 def _norm_text(t: str) -> str:
@@ -94,9 +96,8 @@ def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=pr
                 R[f"kind:{k}"] += 1
                 if k in _LEAVES and not (c or "").strip():
                     ex("empty_leaf", eid)
-                if c and ("\\(" in c or "\\[" in c or "$$" in c):
-                    if k != "formula" or "$$" in c or "\\[" in c:
-                        ex("raw_math_delimiter", eid)
+                if c and ("\\(" in c or "\\[" in c or "$$" in c) and _RAW_DELIM_RE.search(c):
+                    ex("raw_math_delimiter", eid)
                 if k == "formula":
                     if not c.startswith("\\begin{equation}"):
                         ex("formula_not_equation", eid)
@@ -113,6 +114,8 @@ def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=pr
                         for key in m.group(1).split(","):
                             if key:
                                 R["cite_keys"] += 1
+                                has_src = aid in bib_keys
+                                R["cite_keys_with_source"] += has_src
                                 if key in bib_keys.get(aid, ()):
                                     R["cite_keys_covered"] += 1
         if H is None:
@@ -220,6 +223,10 @@ def validate(out_dir: Path, work_dir: Path, data_dir: Path | None = None, log=pr
         "residual_latex_rate": R["sentences_residual_latex"] / max(R["sentences"], 1),
         "cite_keys": R["cite_keys"],
         "cite_coverage": R["cite_keys_covered"] / max(R["cite_keys"], 1),
+        # papers whose source ships no bibliography at all (.bib not uploaded, .bbl not crawled)
+        # cannot be covered without external data; this rate excludes them
+        "cite_coverage_papers_with_bib_source": R["cite_keys_covered"] / max(R["cite_keys_with_source"], 1),
+        "papers_with_bib_source": len(bib_keys),
         "section_cmds": sec_cmds, "section_nodes": sec_nodes,
         "abstract_fidelity_median": statistics.median(absf) if absf else None,
         "abstract_fidelity_mean": statistics.fmean(absf) if absf else None,

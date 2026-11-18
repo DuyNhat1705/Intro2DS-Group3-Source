@@ -28,7 +28,7 @@ from . import config as C
 _P = "\ue010"  # placeholder for a protected '.', '!' or '?'
 _TRANS = str.maketrans({".": _P, "!": _P, "?": _P})
 
-_MATH_RE = re.compile(r"\$[^$]{0,3000}\$")
+_MATH_RE = re.compile(r"(?<!\\)\$[^$]{0,3000}?(?<!\\)\$")
 _CITEREF_RE = re.compile(r"\\(?:cite|ref)\{[^{}]{0,2000}\}")
 _URL_RE = re.compile(r"(?:https?://|ftp://|www\.)[^\s<>\"]+")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -51,9 +51,6 @@ Figure Table Section Fig Tab Eq Sec Appendix Algorithm Theorem Lemma Proposition
 Definition Remark Example Proof Our Their What Which Who How Why Where Yet But And Or So
 """.split())
 
-_ABBR = sorted(set(C.ABBREVIATIONS), key=len, reverse=True)
-_ABBR_RE = re.compile(r"(?<![\w])(?:" + "|".join(re.escape(a) for a in _ABBR if a.endswith(".") or a.endswith("~"))
-                      + r")")
 _TERMINAL = C.TERMINAL_ABBREVIATIONS
 
 _SPLIT_RE = re.compile(r"[.!?]+(?:[\"'”’)\]]|'')*(?=\s)")
@@ -63,69 +60,85 @@ _PUNCT_ONLY_RE = re.compile(r"^[\W_]*$")
 _TRAILING_DOTS_RE = re.compile(r"(?<=[.!?])(?:\s+[.!?]+)+\s*$")
 
 
-def _mask_span(chars: list[str], s: int, e: int) -> None:
-    for k in range(s, e):
-        if chars[k] in ".!?":
-            chars[k] = _P
-
-
 def _trim_end(text: str, s: int, e: int) -> int:
     while e > s and text[e - 1] in _TRAIL_PUNCT:
         e -= 1
     return e
 
 
+# Single-token abbreviations ("Fig.", "e.g.", "w.r.t.") are looked up in a set; "et al." is
+# handled through its last token "al." preceded by "et".
+_ABBR_SET = frozenset(a for a in C.ABBREVIATIONS if a.endswith(".") and " " not in a and "~" not in a)
+_WORDDOT_RE = re.compile(r"(?<![\w.])[A-Za-z][A-Za-z.]{0,14}\.")
+_STARTER_AFTER_RE = re.compile(r"\s+([A-Z][\w'’\-]*)")
+_ET_RE = re.compile(r"\bet[ ~]$")
+_MULTI_ABBR_RE = re.compile(r"(?:[a-z]{1,2}\.){2,4}")  # i.i.d., a.k.a., w.r.t.
+
+
 def mask(text: str) -> str:
     """Return a copy of ``text`` where non-terminal ``.!?`` are replaced by a placeholder."""
-    if not any(c in text for c in ".!?"):
+    if "." not in text and "!" not in text and "?" not in text:
         return text
-    chars = list(text)
+    spans: list[tuple[int, int]] = []
+    add = spans.append
     if "$" in text:
         for m in _MATH_RE.finditer(text):
-            _mask_span(chars, m.start(), m.end())
+            add((m.start(), m.end()))
     if "\\" in text:
         for m in _CITEREF_RE.finditer(text):
-            _mask_span(chars, m.start(), m.end())
+            add((m.start(), m.end()))
     if "://" in text or "www." in text:
         for m in _URL_RE.finditer(text):
-            _mask_span(chars, m.start(), _trim_end(text, m.start(), m.end()))
+            add((m.start(), _trim_end(text, m.start(), m.end())))
     if "@" in text:
         for m in _EMAIL_RE.finditer(text):
-            _mask_span(chars, m.start(), _trim_end(text, m.start(), m.end()))
+            add((m.start(), _trim_end(text, m.start(), m.end())))
     if "10." in text:
         for m in _DOI_RE.finditer(text):
-            _mask_span(chars, m.start(), _trim_end(text, m.start(), m.end()))
-    for m in _NUM_RE.finditer(text):
-        _mask_span(chars, m.start(), m.end())
-    for m in _ELLIPSIS_RE.finditer(text):
-        # an ellipsis followed by a capitalised starter and preceded by a word may end a
-        # sentence; keep the last dot unmasked in that case
-        e = m.end()
-        nxt = text[e:e + 30].lstrip()
-        word = re.match(r"[A-Z][a-z]*", nxt)
-        if word and word.group(0) in STARTERS and e < len(text) and text[e].isspace():
-            _mask_span(chars, m.start(), e - 1)
-        else:
-            _mask_span(chars, m.start(), e)
-    for m in _ABBR_RE.finditer(text):
-        a = m.group(0)
-        s, e = m.start(), m.end()
-        if a.rstrip("~") in _TERMINAL or a in ("al.", "et al.", "et~al.", "etal."):
-            nxt = text[e:e + 40]
-            w = re.match(r"\s+([A-Z][\w'’\-]*)", nxt)
-            if (w and w.group(1) in STARTERS) or not nxt.strip():
-                _mask_span(chars, s, e - 1)  # keep the final dot as a boundary
-                continue
-        _mask_span(chars, s, e)
-    for m in _INITIAL_RE.finditer(text):
-        nxt = m.group(2) or ""
-        word = nxt.rstrip(".")
-        if word in STARTERS and not (len(word) == 1):
-            continue  # "... in Appendix A. The next" -> real boundary
-        if not nxt:
+            add((m.start(), _trim_end(text, m.start(), m.end())))
+    if "." in text:
+        for m in _NUM_RE.finditer(text):
+            add((m.start(), m.end()))
+        if ".." in text or "…" in text:
+            for m in _ELLIPSIS_RE.finditer(text):
+                # an ellipsis followed by a capitalised starter may end a sentence: keep the
+                # last dot unmasked in that case
+                e = m.end()
+                w = _STARTER_AFTER_RE.match(text, e)
+                add((m.start(), e - 1 if (w and w.group(1) in STARTERS) else e))
+        for m in _WORDDOT_RE.finditer(text):
+            tok = m.group(0)
+            s, e = m.start(), m.end()
+            is_al = tok == "al." and _ET_RE.search(text, max(0, s - 3), s)
+            if tok in _ABBR_SET or is_al or _MULTI_ABBR_RE.fullmatch(tok):
+                if is_al or tok in _TERMINAL:
+                    w = _STARTER_AFTER_RE.match(text, e)
+                    if (w and w.group(1) in STARTERS) or not text[e:].strip():
+                        add((s, e - 1))  # genuinely ends the sentence: keep the final dot
+                        continue
+                add((s, e))
+        if "." in text:
+            for m in _INITIAL_RE.finditer(text):
+                nxt = m.group(2) or ""
+                word = nxt.rstrip(".")
+                if not nxt or (word in STARTERS and len(word) > 1):
+                    continue  # "... in Appendix A. The next" -> real boundary
+                add((m.start(), m.end()))
+    if not spans:
+        return text
+    spans.sort()
+    out = []
+    pos = 0
+    for s, e in spans:
+        if e <= pos:
             continue
-        _mask_span(chars, m.start(), m.end())
-    return "".join(chars)
+        if s < pos:
+            s = pos
+        out.append(text[pos:s])
+        out.append(text[s:e].translate(_TRANS))
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def split_sentences(text: str) -> list[str]:

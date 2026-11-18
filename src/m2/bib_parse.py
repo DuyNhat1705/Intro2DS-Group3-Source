@@ -199,28 +199,22 @@ class _Malformed(Exception):
     pass
 
 
+_BRACE_TOK_RE = re.compile(r"\\.|[{}]|\n[ \t]*@[ \t]*[A-Za-z]+[ \t\n]*[{(]", re.S)
+
+
 def _match_brace_bib(text: str, i: int) -> int:
     """``text[i] == '{'``; index after the matching ``}``. Stops at a new entry line."""
     depth = 0
-    n = len(text)
-    j = i
-    while j < n:
-        c = text[j]
-        if c == "{":
+    for m in _BRACE_TOK_RE.finditer(text, i):
+        t = m.group(0)
+        if t == "{":
             depth += 1
-        elif c == "}":
+        elif t == "}":
             depth -= 1
             if depth == 0:
-                return j + 1
-        elif c == "\n":
-            k = j + 1
-            while k < n and text[k] in " \t":
-                k += 1
-            if k < n and text[k] == "@" and _ENTRY_START_RE.match(text, k):
-                raise _Malformed
-        elif c == "\\":
-            j += 1
-        j += 1
+                return m.end()
+        elif t[0] == "\n":
+            raise _Malformed
     raise _Malformed
 
 
@@ -326,8 +320,12 @@ def _entry_from_fields(etype: str, key: str, f: dict[str, str]) -> BibEntry:
     return e
 
 
-def parse_bib(text: str) -> tuple[list[BibEntry], dict]:
-    """Parse a ``.bib`` file. Returns ``(entries, stats)``; never raises."""
+def parse_bib(text: str, wanted: set[str] | None = None) -> tuple[list[BibEntry], dict]:
+    """Parse a ``.bib`` file. Returns ``(entries, stats)``; never raises.
+
+    With ``wanted`` (the cited keys), only those entries are normalized and returned; the
+    others are parsed (to stay in sync) and counted in ``stats["entries"]``.
+    """
     entries: list[BibEntry] = []
     stats = {"entries": 0, "malformed": 0, "strings": 0}
     if not text or "@" not in text:
@@ -374,6 +372,11 @@ def parse_bib(text: str) -> tuple[list[BibEntry], dict]:
                 raise _Malformed
             key = km.group(1).strip()
             k = km.end()
+            if key and wanted is not None and key not in wanted and opener == "{":
+                # not cited: skip the whole entry with one brace match
+                i = _match_brace_bib(text, m.end() - 1)
+                stats["entries"] += 1
+                continue
             fields: dict[str, str] = {}
             while True:
                 while k < n and text[k] in " \t\n,":
@@ -389,6 +392,9 @@ def parse_bib(text: str) -> tuple[list[BibEntry], dict]:
             i = k
             if not key:
                 stats["malformed"] += 1
+                continue
+            if wanted is not None and key not in wanted:
+                stats["entries"] += 1
                 continue
             e = _entry_from_fields(etype, key, fields)
             e.raw = ""

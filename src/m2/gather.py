@@ -26,7 +26,7 @@ from .io_utils import content_hash, split_dup_suffix
 from .preprocess import (CondNotes, Literals, clean_file_text, evaluate_all, normalize_newlines,
                          strip_comments)
 
-_DOCCLASS_RE = re.compile(r"\\document(?:class|style)\s*(?:\[[^\]]{0,2000}\])?\s*\{\s*([^}\s]{1,200})\s*\}")
+_DOCCLASS_RE = re.compile(r"\\document(?:class|style)\s*(?:\\expandafter\s*)?(?:\[[^\]]{0,2000}\])?\s*\{\s*([^}\s]{1,200})\s*\}")
 _BEGIN_DOC_RE = re.compile(r"\\begin\s*\{document\}")
 _END_DOC_RE = re.compile(r"\\end\s*\{document\}")
 _INCLUDE_RE = re.compile(

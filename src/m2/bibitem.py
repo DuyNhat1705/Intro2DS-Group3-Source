@@ -612,11 +612,16 @@ def bibitem_to_entry(key: str, label: str | None, body: str) -> BibEntry:
     return e
 
 
-def parse_bibitems(text: str, lits: Literals | None = None) -> list[BibEntry]:
-    """Parse every ``\\bibitem[label]{key} text`` of ``text``."""
+def parse_bibitems(text: str, lits: Literals | None = None, wanted: set[str] | None = None,
+                   with_count: bool = False):
+    """Parse every ``\\bibitem[label]{key} text`` of ``text``.
+
+    With ``wanted`` only those keys are converted. With ``with_count`` the result is
+    ``(entries, number_of_bibitems)``."""
     out: list[BibEntry] = []
+    count = 0
     if "\\bibitem" not in text:
-        return out
+        return (out, 0) if with_count else out
     starts = list(_BIBITEM_RE.finditer(text))
     for idx, m in enumerate(starts):
         i = m.end()
@@ -640,6 +645,9 @@ def parse_bibitems(text: str, lits: Literals | None = None) -> list[BibEntry]:
         key = text[j + 1:k - 1].strip()
         if not key:
             continue
+        count += 1
+        if wanted is not None and key not in wanted:
+            continue
         body = text[k:end]
         if lits is not None:
             body = lits.restore_inline(body)
@@ -648,4 +656,4 @@ def parse_bibitems(text: str, lits: Literals | None = None) -> list[BibEntry]:
         except (IndexError, ValueError, RecursionError, StopIteration):
             out.append(BibEntry(key=key, source="bibitem", parse_method="regex", confidence=0.0,
                                 raw=body[:2000]))
-    return out
+    return (out, count) if with_count else out
