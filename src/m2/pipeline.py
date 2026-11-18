@@ -15,6 +15,7 @@ on success, ``failed`` otherwise.
 from __future__ import annotations
 
 import copy
+import os
 import re
 import time
 import traceback
@@ -200,6 +201,9 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
     tb_text = _thebibliography_text(gr.body)
     if tb_text:
         items = parse_bibitems(tb_text, gr.literals)
+        if os.environ.get("M2_REFINE_BIBITEM") == "1":
+            from .bib_refine import refine_entries
+            items = refine_entries(items)
         for e in items:
             e.version = version
         vp.n_bibitem = len(items)
@@ -288,11 +292,12 @@ def _rename_tree(tree: Node, mapping: dict[str, str]) -> None:
             n.content = rename_cites(n.content, mapping)
 
 
-def process_paper(job: PaperJob, safe_mode: bool = False, use_fast_path: bool = True) -> PaperResult:
+def process_paper(job: PaperJob, safe_mode: bool = False, use_fast_path: bool = True,
+                  loaded: dict[int, tuple] | None = None) -> PaperResult:
     """Process all versions of one paper. Never raises: errors are recorded per version."""
     res = PaperResult(arxiv_id=job.arxiv_id, paper_key=job.paper_key)
     try:
-        return _process(job, res, safe_mode, use_fast_path)
+        return _process(job, res, safe_mode, use_fast_path, loaded)
     except Exception as exc:  # last-resort guard: the paper is recorded as failed
         res.error = f"{type(exc).__name__}: {exc}"
         res.elements, res.hierarchy, res.bibtex, res.bibtex_full, res.key_map = [], [], [], [], []
@@ -302,7 +307,28 @@ def process_paper(job: PaperJob, safe_mode: bool = False, use_fast_path: bool = 
         return res
 
 
-def _process(job: PaperJob, res: PaperResult, safe_mode: bool, use_fast_path: bool) -> PaperResult:
+def load_paper_files(job: PaperJob) -> tuple[dict[int, tuple], str]:
+    """Read every file of every version once. Returns ``(loaded, signature)`` where the
+    checkpoint signature hashes relative paths + sizes + contents + ``PARSER_VERSION``."""
+    import hashlib
+    h = hashlib.blake2b(digest_size=12)
+    h.update(C.PARSER_VERSION.encode())
+    loaded: dict[int, tuple] = {}
+    for vi in job.versions:
+        if not vi.on_disk:
+            h.update(f"|v{vi.version}:missing".encode())
+            continue
+        vf = scan_version_dirs([d for d in vi.dirs if d.is_dir()])
+        files, sizes = read_version_files(vf) if vf.tex else ({}, {})
+        loaded[vi.version] = (vf, files, sizes)
+        for rel in sorted(vf.files):
+            h.update(f"|v{vi.version}/{rel}:{vf.sizes.get(rel, 0)}:".encode("utf-8", "surrogatepass"))
+            h.update(content_hash(files.get(rel, "")).encode())
+    return loaded, h.hexdigest()
+
+
+def _process(job: PaperJob, res: PaperResult, safe_mode: bool, use_fast_path: bool,
+             loaded: dict[int, tuple] | None = None) -> PaperResult:
     splitter, para_cache = worker_caches()
     parses: dict[int, VersionParse] = {}
     status_rows: dict[int, dict] = {}
@@ -316,13 +342,16 @@ def _process(job: PaperJob, res: PaperResult, safe_mode: bool, use_fast_path: bo
                                          "listed in metadata/state but no folder")
             prev = None
             continue
-        vf = scan_version_dirs([d for d in vi.dirs if d.is_dir()])
+        if loaded is not None and v in loaded:
+            vf, files, sizes = loaded[v]
+        else:
+            vf = scan_version_dirs([d for d in vi.dirs if d.is_dir()])
+            files, sizes = read_version_files(vf) if vf.tex else ({}, {})
         if not vf.tex:
             status_rows[v] = _status_row(job, v, None, "empty",
                                          "no .tex file" + (f" ({len(vf.bib)} .bib)" if vf.bib else ""))
             prev = None
             continue
-        files, sizes = read_version_files(vf)
         vp = None
         reason = ""
         for mode in (("normal", "safe") if not safe_mode else ("safe",)):
