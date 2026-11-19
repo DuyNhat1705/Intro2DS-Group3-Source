@@ -42,6 +42,27 @@ _NEWIF_RE = re.compile(r"\\newif\s*\\if([A-Za-z@]+)")
 _SETIF_RE = re.compile(r"\\([A-Za-z@]+?)(true|false)(?![A-Za-z@])")
 
 MAX_COMBINED = 40 * 1024 * 1024
+_BRACE_RE = re.compile(r"(?<!\\)[{}]")
+_SW_OPEN, _SW_CLOSE = "", ""      # spliced switch assignments, removed after use
+_SW_SPAN_RE = re.compile("[^]*")
+
+
+def _search_top(rx: re.Pattern, text: str, start: int = 0) -> re.Match | None:
+    """First match of ``rx`` at brace depth 0 (relative to ``start``), so that
+    ``\\def\\bd{\\begin{document}}`` in a preamble is not taken for the real one. Falls back to
+    the first match anywhere when none is at depth 0 (e.g. unbalanced braces)."""
+    first = None
+    depth = 0
+    pos = start
+    for m in rx.finditer(text, start):
+        if first is None:
+            first = m
+        for b in _BRACE_RE.finditer(text, pos, m.start()):
+            depth = depth + 1 if b.group() == "{" else max(0, depth - 1)
+        pos = m.start()
+        if depth == 0:
+            return m
+    return first
 
 
 @dataclass
@@ -52,10 +73,13 @@ class GatherResult:
     redundant_files: list[str] = field(default_factory=list)
     excluded_files: list[str] = field(default_factory=list)
     missing_includes: list[str] = field(default_factory=list)
+    missing_body_includes: list[str] = field(default_factory=list)   # .tex content lost in the body
     bib_names: list[str] = field(default_factory=list)
     bib_files: list[str] = field(default_factory=list)
     bib_fallback: bool = False
     nocite_all: bool = False
+    path_macros: dict = field(default_factory=dict)       # literal macros usable in file names
+    header_file: str = ""                                 # documentclass file input by the root
     text: str = ""
     preamble: str = ""
     body: str = ""
@@ -110,8 +134,48 @@ def _canonicalize(files: dict[str, str], res: GatherResult,
     return mapping
 
 
+_PATH_DEF_RE = re.compile(r"\\(?:g|e|x)?def\s*\\([A-Za-z@]+)\s*\{([^{}\\%\n]{0,200})\}"
+                          r"|\\(?:re)?newcommand\*?\s*\{?\s*\\([A-Za-z@]+)\s*\}?\s*\{([^{}\\%\n]{0,200})\}")
+_PATH_MACRO_RE = re.compile(r"\\([A-Za-z@]+)\s*")
+
+
+def _path_macros(texts) -> dict[str, list[str]]:
+    """Literal-valued macros (``\\def\\root{arxiv/}``) usable inside include paths."""
+    out: dict[str, list[str]] = {}
+    for t in texts:
+        if "def" not in t and "newcommand" not in t:
+            continue
+        for m in _PATH_DEF_RE.finditer(t):
+            k, v = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+            vals = out.setdefault(k, [])
+            if v.strip() not in vals:
+                vals.append(v.strip())
+    return out
+
+
 def _resolve(name: str, cur_dir: str, root_dir: str, canon: dict[str, str],
-             lower: dict[str, str], exts: tuple[str, ...] = (".tex",)) -> str | None:
+             lower: dict[str, str], exts: tuple[str, ...] = (".tex",),
+             macros: dict[str, list[str]] | None = None) -> str | None:
+    if macros and "\\" in name:
+        # \input{\arxivroot sec/intro}: try every literal value of the path macros
+        names = [name]
+        for _ in range(4):
+            nxt = []
+            for nm in names:
+                m = _PATH_MACRO_RE.search(nm)
+                if not m:
+                    nxt.append(nm)
+                    continue
+                for v in macros.get(m.group(1), [None]):
+                    if v is not None:
+                        nxt.append(nm[:m.start()] + v + nm[m.end():])
+            names = nxt[:16]
+        for nm in names:
+            if "\\" not in nm:
+                r = _resolve(nm, cur_dir, root_dir, canon, lower, exts)
+                if r:
+                    return r
+        return None
     name = name.strip().strip('"').strip("'").strip()
     if not name or "\\" in name or "#" in name:
         return None
@@ -199,15 +263,15 @@ def _document_body(t: str) -> str | None:
     """Body of a file that is itself a complete document (subfiles / nested documents)."""
     if not _DOCCLASS_RE.search(t):
         return None
-    b = _BEGIN_DOC_RE.search(t)
+    b = _search_top(_BEGIN_DOC_RE, t)
     if not b:
         return None
-    e = _END_DOC_RE.search(t, b.end())
+    e = _search_top(_END_DOC_RE, t, b.end())
     return t[b.end():e.start() if e else len(t)]
 
 
 def _reachable(root: str, stripped: dict[str, str], canon: dict[str, str],
-               lower: dict[str, str]) -> set[str]:
+               lower: dict[str, str], macros: dict[str, list[str]] | None = None) -> set[str]:
     """Cheap include closure (no conditional evaluation) used for root ranking."""
     seen = {root}
     stack = [root]
@@ -221,7 +285,7 @@ def _reachable(root: str, stripped: dict[str, str], canon: dict[str, str],
             name, _k, _e = _parse_include(t, m)
             if not name:
                 continue
-            r = _resolve(name, posixpath.dirname(f), root_dir, canon, lower)
+            r = _resolve(name, posixpath.dirname(f), root_dir, canon, lower, macros=macros)
             if r and r not in seen:
                 seen.add(r)
                 stack.append(r)
@@ -229,7 +293,36 @@ def _reachable(root: str, stripped: dict[str, str], canon: dict[str, str],
 
 
 def _pick_root(stripped: dict[str, str], canon: dict[str, str], lower: dict[str, str],
-               res: GatherResult) -> str | None:
+               res: GatherResult, macros: dict[str, list[str]] | None = None) -> str | None:
+    root = _pick_class_root(stripped, canon, lower, res, macros)
+    if root is None or res.status == "root_fallback":
+        return root
+    # The file with \documentclass is a header \input by the real main file, which has no
+    # \documentclass of its own: "\input{preamble} \begin{document} ..." or
+    # "\input{header} \input{body} \input{footer}". LaTeX compiles the includer.
+    root_reach = _reachable(root, stripped, canon, lower, macros)
+    includers = [c for c, rel in canon.items()
+                 if c not in root_reach and c.lower().endswith(".tex") and not _DOCCLASS_RE.search(stripped[rel])
+                 and root in _reachable(c, stripped, canon, lower, macros)]
+    if not includers:
+        return root
+    reach = {c: _reachable(c, stripped, canon, lower, macros) for c in includers}
+    if _search_top(_BEGIN_DOC_RE, stripped[canon[root]]):
+        # the class file is a whole document: switch only when the includer adds other files
+        # (header/body/footer split), not for a pure wrapper such as "\input{template/sample}"
+        includers = [c for c in includers if reach[c] - root_reach - {c}]
+        if not includers:
+            return root
+    top = [c for c in includers if not any(o != c and c in reach[o] for o in includers)] or includers
+    top.sort(key=lambda c: (posixpath.splitext(posixpath.basename(c))[0].lower() in C.ROOT_PREFERRED_NAMES,
+                            len(reach[c]), len(stripped[canon[c]]), -len(c)), reverse=True)
+    res.notes.append(f"root_includes_preamble:{root}")
+    res.header_file = root
+    return top[0]
+
+
+def _pick_class_root(stripped: dict[str, str], canon: dict[str, str], lower: dict[str, str],
+                     res: GatherResult, macros: dict[str, list[str]] | None = None) -> str | None:
     cands = []
     for c, rel in canon.items():
         if not c.lower().endswith(".tex"):
@@ -252,7 +345,7 @@ def _pick_root(stripped: dict[str, str], canon: dict[str, str], lower: dict[str,
             cands = non_aux
     if len(cands) == 1:
         return cands[0][0]
-    reach = {c: _reachable(c, stripped, canon, lower) for c, _cls in cands}
+    reach = {c: _reachable(c, stripped, canon, lower, macros) for c, _cls in cands}
     included = {c for c, _ in cands for o, _2 in cands if o != c and c in reach[o]}
     top = [x for x in cands if x[0] not in included] or cands
 
@@ -260,7 +353,7 @@ def _pick_root(stripped: dict[str, str], canon: dict[str, str], lower: dict[str,
         c = x[0]
         t = stripped[canon[c]]
         stem = posixpath.splitext(posixpath.basename(c))[0].lower()
-        return (bool(_BEGIN_DOC_RE.search(t)), stem in C.ROOT_PREFERRED_NAMES,
+        return (bool(_search_top(_BEGIN_DOC_RE, t)), stem in C.ROOT_PREFERRED_NAMES,
                 len(reach[c]), len(t), -len(c))
     top.sort(key=rank, reverse=True)
     return top[0][0]
@@ -291,7 +384,9 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
     lower = {c.lower(): c for c in canon}
     res._file_text = {c: stripped[rel] for c, rel in canon.items()}
 
-    root = _pick_root(stripped, canon, lower, res)
+    path_macros = _path_macros(stripped.values())
+    res.path_macros = path_macros
+    root = _pick_root(stripped, canon, lower, res, path_macros)
     if root is None:
         res.status = "empty"
         return res
@@ -301,18 +396,67 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
     # context for conditionals: macros defined anywhere, switches declared anywhere
     defined: set[str] = set()
     switch_init: dict[str, bool] = {}
+    names: set[str] = set()
+    sw_memo: dict[str, str] = {}
+
+    def file_switches(c: str, seen: frozenset) -> str:
+        """Switch assignments (``\\Xtrue`` / ``\\Xfalse``) a file makes, including those of the
+        files it includes, in source order."""
+        if c in sw_memo:
+            return sw_memo[c]
+        t = stripped.get(canon.get(c, c), "")
+        out: list[str] = []
+        if "\\" in t and len(seen) < C.MAX_INCLUDE_DEPTH:
+            ev = [(m.start(), 0, m) for m in _SETIF_RE.finditer(t) if m.group(1) in names]
+            ev += [(m.start(), 1, m) for m in _INCLUDE_RE.finditer(t)]
+            ev.sort(key=lambda x: (x[0], x[1]))
+            for _p, kind, m in ev:
+                if kind == 0:
+                    out.append(m.group(0))
+                    continue
+                name, _k, _e = _parse_include(t, m)
+                r = _resolve(name, posixpath.dirname(c), root_dir, canon, lower, macros=path_macros) if name else None
+                if r and r != c and r not in seen:
+                    out.append(file_switches(r, seen | {c}))
+        sw_memo[c] = "".join(out)
+        return sw_memo[c]
+
+    def splice_switches(t: str, c: str) -> str:
+        """Copy the switch assignments of included files right after their include command:
+        conditionals are evaluated before includes are inlined, so ``\\input{params}`` setting
+        ``\\eprinttrue`` must be visible to a later ``\\ifeprint`` of the including file."""
+        if not names or "\\" not in t:
+            return t
+        out: list[str] = []
+        pos = 0
+        for m in _INCLUDE_RE.finditer(t):
+            if m.start() < pos:
+                continue
+            name, _k, end = _parse_include(t, m)
+            r = _resolve(name, posixpath.dirname(c), root_dir, canon, lower, macros=path_macros) if name else None
+            if r is None or r == c:
+                continue
+            a = file_switches(r, frozenset({c}))
+            if a:
+                out.append(t[pos:end])
+                out.append(_SW_OPEN + a + _SW_CLOSE)
+                pos = end
+        if not out:
+            return t
+        out.append(t[pos:])
+        return "".join(out)
+
     if not safe_mode:
         for t in stripped.values():
             if "\\" in t:
                 for m in _DEFINED_RE.finditer(t):
                     defined.add(m.group(1) or m.group(2) or m.group(3))
         rt = stripped[canon[root]]
-        names = set()
         for t in stripped.values():
             names.update(_NEWIF_RE.findall(t))
         if names:
-            pre_end = _BEGIN_DOC_RE.search(rt)
-            pre = rt[:pre_end.start()] if pre_end else rt
+            pre_end = _search_top(_BEGIN_DOC_RE, rt)
+            pre = splice_switches(rt[:pre_end.start()] if pre_end else rt, root)
             for m in _SETIF_RE.finditer(pre):
                 if m.group(1) in names:
                     switch_init[m.group(1)] = m.group(2) == "true"
@@ -329,6 +473,7 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
     pos_total = [0]
     compile_seen: list[str] = []
     missing: list[str] = []
+    missing_at: list[tuple[int, str]] = []
 
     def emit(s: str, f: str, file_off: int):
         if not s:
@@ -340,12 +485,13 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
 
     def prepare(c: str, is_root: bool) -> str:
         t = stripped[canon[c]]
-        if not is_root:
+        if not is_root and c != res.header_file:
             body = _document_body(t)
             if body is not None:
                 res.notes.append(f"nested_document:{c}")
                 t = body
         if not safe_mode and "\\if" in t:
+            t = splice_switches(t, c)
             init = switch_init if not is_root else None
             if init:
                 # make preamble switch values visible to included files
@@ -355,6 +501,8 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
                 t = t[t.find("\n") + 1:] if "\n" in t else t
             else:
                 t = evaluate_all(t, defined, res.cond)
+            if _SW_OPEN in t:
+                t = _SW_SPAN_RE.sub("", t)
         return t
 
     def inline(c: str, ancestry: tuple[str, ...], depth: int):
@@ -379,13 +527,14 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
             if cmd in ("subimport", "subincludefrom", "subinputfrom", "import", "includefrom",
                        "inputfrom"):
                 base_dir = cur_dir
-            target = _resolve(name, base_dir, root_dir, canon, lower)
+            target = _resolve(name, base_dir, root_dir, canon, lower, macros=path_macros)
             emit(t[pos:m.start()], c, pos)
             pos = end
             if target is None:
                 nm = name.strip()
                 if nm not in missing:
                     missing.append(nm)
+                    missing_at.append((pos_total[0], nm))
                 continue
             if target in ancestry or target == c:
                 res.notes.append(f"include_cycle:{target}")
@@ -415,12 +564,14 @@ def gather_files(files: dict[str, str], sizes: dict[str, int] | None = None,
             res.redundant_files.append(rel)
     res.redundant_files.sort()
 
-    b = _BEGIN_DOC_RE.search(text)
+    b = _search_top(_BEGIN_DOC_RE, text)
     if b:
         res.preamble = text[:b.start()]
-        e = _END_DOC_RE.search(text, b.end())
+        e = _search_top(_END_DOC_RE, text, b.end())
         res.body = text[b.end():e.start() if e else len(text)]
         res.body_offset = b.end()
+        res.missing_body_includes = [nm for p, nm in missing_at if p >= b.start()
+                                     and posixpath.splitext(nm)[1].lower() in ("", ".tex")]
         if not e:
             res.notes.append("no_end_document")
     else:
@@ -450,7 +601,7 @@ def resolve_bib_files(res: GatherResult, bib_paths: list[str]) -> None:
     root_dir = posixpath.dirname(res.root_file or "")
     out: list[str] = []
     for name in res.bib_names:
-        r = _resolve(name, root_dir, root_dir, canon, lower, exts=(".bib",))
+        r = _resolve(name, root_dir, root_dir, canon, lower, exts=(".bib",), macros=res.path_macros)
         if r and r not in out:
             out.append(r)
     if not out and bib_paths:

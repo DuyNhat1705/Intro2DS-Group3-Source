@@ -8,7 +8,7 @@ the output must bump :data:`PARSER_VERSION`, which invalidates the resume checkp
 from __future__ import annotations
 
 # Bump on any change that alters parser output (part of the checkpoint signature).
-PARSER_VERSION = "m2-1.1.0"
+PARSER_VERSION = "m2-1.2.1"
 
 # ---------------------------------------------------------------------------------------
 # Limits
@@ -16,6 +16,11 @@ PARSER_VERSION = "m2-1.1.0"
 MAX_TEX_FILE_BYTES = 5 * 1024 * 1024      # larger .tex files are usually generated data
 MAX_BIB_FILE_BYTES = 20 * 1024 * 1024
 MAX_INCLUDE_DEPTH = 32
+# A version whose tree keeps less than this share of the body's prose letters is "partial"
+# (low_coverage), see pipeline.coverage(). On the 5,000 local papers the median is ~0.99 and the
+# lowest values left after removing drawings / data macros / author lists are ~0.6 (text inside
+# figure boxes, which the data model does not keep), so 0.5 flags real loss only.
+MIN_COVERAGE = 0.50
 MAX_MACRO_PASSES = 10
 MAX_MACRO_GROWTH = 4.0                    # expanded body may grow at most x4 (+64 KB)
 MAX_MACRO_GROWTH_ABS = 64 * 1024

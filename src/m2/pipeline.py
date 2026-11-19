@@ -30,7 +30,7 @@ from .clean import clean_inline, clean_with_footnotes, has_residual_latex, strip
 from .dedup import build_tables
 from .discover import PaperJob
 from .gather import GatherResult, gather_files, resolve_bib_files
-from .hierarchy import Node, TreeBuilder, TreeStats
+from .hierarchy import HEADING_KINDS, Node, TreeBuilder, TreeStats
 from .io_utils import VersionFiles, content_hash, decode_bytes, scan_version_dirs
 from .preprocess import (Literals, MacroTable, collect_definitions, collect_theorem_names,
                          expand_macros, mask_literals)
@@ -78,6 +78,8 @@ class VersionParse:
     reused_from_prev: bool = False
     retry_mode: str = ""
     notes: list[str] = field(default_factory=list)
+    coverage: float = 1.0                                  # see coverage()
+    reasons: list[str] = field(default_factory=list)       # why the version is not ok
 
 
 def read_version_files(vf: VersionFiles) -> tuple[dict[str, str], dict[str, int]]:
@@ -120,6 +122,26 @@ def _extract_title(pre: str, body: str, lits: Literals) -> str:
     return ""
 
 
+def _drop_gobbled(text: str, table: MacroTable) -> str:
+    """Remove the arguments of author macros that discard them (``\\newcommand{\\remove}[1]{}``)."""
+    names = [m.name for m in table.macros.values() if m.nargs >= 1 and not m.body.strip()]
+    if not names or "\\" not in text:
+        return text
+    from .preprocess import match_brace
+    rx = re.compile(r"\\(?:" + "|".join(map(re.escape, names)) + r")(?![A-Za-z@])\s*\{")
+    out, pos = [], 0
+    for m in rx.finditer(text):
+        if m.start() < pos:
+            continue
+        k = match_brace(text, m.end() - 1)
+        if k <= 0:
+            continue
+        out.append(text[pos:m.start()])
+        pos = k
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _thebibliography_text(body: str) -> str:
     out = []
     for m in _THEBIB_RE.finditer(body):
@@ -159,6 +181,7 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
         vp.n_bib_raw, vp.n_bibitem, vp.n_cited = prev.n_bib_raw, prev.n_bibitem, prev.n_cited
         vp.cited = Counter(prev.cited)
         vp.status = prev.status
+        vp.coverage, vp.reasons = prev.coverage, list(prev.reasons)
         vp.reused_from_prev = True
         vp.times["hierarchy"] = 0.0
         return vp
@@ -236,7 +259,10 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
             e.version = version
         vp.bib_entries.extend(ents)
         vp.n_bib_raw += st["entries"]
-    tb_text = _thebibliography_text(gr.body)
+    # a thebibliography kept inside a discarding macro (\newcommand{\remove}[1]{}) is not
+    # compiled and must not contribute entries; the rest is parsed unexpanded so that
+    # \doi{..}-like author macros stay recognizable
+    tb_text = _thebibliography_text(_drop_gobbled(gr.body, table))
     if tb_text:
         items, n_items = parse_bibitems(tb_text, gr.literals, wanted=wanted, with_count=True)
         if os.environ.get("M2_REFINE_BIBITEM") == "1":
@@ -252,10 +278,73 @@ def parse_version_files(files: dict[str, str], sizes: dict[str, int] | None = No
 
     if gr.status == "root_fallback":
         vp.status = "root_fallback"
-    if tb.stats.recoveries or safe_mode:
+    vp.coverage = coverage(gr.body, tree)
+    vp.reasons = quality_reasons(vp, gr, tb.stats, table.truncated, safe_mode)
+    if vp.reasons:
         vp.status = "partial"
+    if gr.cond.undecided:
+        vp.notes.append(f"undecided_if:{gr.cond.undecided}")
     vp.notes.extend(gr.notes[:50])
     return vp
+
+
+# ---------------------------------------------------------------------------------------
+# Quality signals: a version is "ok" only when nothing suggests that content was lost
+# ---------------------------------------------------------------------------------------
+# prose words only: whitespace-separated alphabetic tokens (TikZ coordinates, key=value
+# options and data stored in macro arguments do not count on either side)
+_WORD_RE = re.compile(r"(?<!\S)[(\"'`]*([A-Za-z]{2,})[.,;:!?'\")\]]*(?!\S)")
+_DRAWING_ENVS = r"tikzpicture|pgfpicture|axis|semilogyaxis|loglogaxis|forest|circuitikz|tikzcd|pspicture|picture"
+_COV_DROP_RE = re.compile(
+    r"\\begin\s*\{thebibliography\}.*?(?:\\end\s*\{thebibliography\}|$)"
+    rf"|\\begin\s*\{{({_DRAWING_ENVS})\*?\}}.*?(?:\\end\s*\{{\1\*?\}}|$)"
+    r"|\\pgfplotstableread\s*\{[^{}]*\}"
+    r"|\\(?:author|affiliation|altaffiliation|address|email|thanks|institute|orcid|collaboration)"
+    r"\*?\s*(?:\[[^\]]{0,300}\]\s*)?\{[^{}]{0,1000}\}"
+    r"|\\[A-Za-z@]+\*?\s*\[[^\]]{0,500}\]"
+    r"|\\(?:label|ref|eqref|cref|Cref|autoref|pageref|cite[a-zA-Z]*|nocite|includegraphics|input|include"
+    r"|bibliography|bibliographystyle|usepackage|graphicspath|url|href|hypersetup|setlength|vspace|hspace"
+    r"|addtolength|setcounter|definecolor)\*?\s*(?:\[[^\]]{0,300}\]\s*)?\{[^{}]{0,500}\}"
+    r"|\\(?:begin|end)\s*\{[^}]{0,50}\}(?:\s*\{[^{}]{0,200}\})?"
+    r"|\\[A-Za-z@]+\*?|[\ue000-\ue0ff]\d*[\ue000-\ue0ff]?", re.S)
+_COVER_KINDS = frozenset({"sentence", "formula", "figure", "table", "abstract"}) | HEADING_KINDS
+
+
+def _letters(s: str) -> int:
+    return sum(map(len, _WORD_RE.findall(_COV_DROP_RE.sub(" ", s)))) if s else 0
+
+
+def coverage(body: str, tree: Node | None) -> float:
+    """Prose letters kept in the tree / prose letters of the compiled body (commands, options,
+    labels, citation keys, file names, drawings and the bibliography removed). Near 1 for a
+    complete parse; a body that is mostly lost scores low. 1.0 for a body without prose."""
+    src = _letters(body)
+    if src < 200 or tree is None:
+        return 1.0
+    out = sum(_letters(n.content) for n in tree.walk() if n.kind in _COVER_KINDS and n.content)
+    return round(min(out / src, 9.99), 4)
+
+
+def quality_reasons(vp: "VersionParse", gr: GatherResult, st: TreeStats, macro_limit: bool,
+                    safe_mode: bool) -> list[str]:
+    r = []
+    if safe_mode:
+        r.append("safe_mode")
+    if st.recoveries:
+        r.append(f"syntax_recovery:{st.recoveries}")
+    if st.n_sentences == 0:
+        r.append("no_sentences")
+    if "no_begin_document" in gr.notes:
+        r.append("no_begin_document")
+    if gr.missing_body_includes:
+        r.append(f"missing_include:{len(gr.missing_body_includes)}")
+    if macro_limit:
+        r.append("macro_growth_limit")
+    if any(n.startswith(("include_limit", "big_file")) for n in gr.notes):
+        r.append("include_or_size_limit")
+    if st.n_sentences and vp.coverage < C.MIN_COVERAGE:
+        r.append(f"low_coverage:{vp.coverage:.2f}")
+    return r
 
 
 # ---------------------------------------------------------------------------------------
@@ -302,6 +391,7 @@ def _status_row(job: PaperJob, v: int, vp: VersionParse | None, status: str, rea
         "t_dedup_ms": 0.0,
         "elapsed_ms": round(1000 * elapsed, 2),
         "retry_mode": vp.retry_mode if vp else "",
+        "coverage": float(vp.coverage) if vp else 0.0,
         "notes": ";".join((vp.notes if vp else [])[:20]),
     }
 
@@ -402,10 +492,10 @@ def _process(job: PaperJob, res: PaperResult, safe_mode: bool, use_fast_path: bo
             status_rows[v] = _status_row(job, v, vf_, "empty", "no root .tex", elapsed)
             prev = None
             continue
-        if vf_.stats.n_sentences == 0 and vf_.status == "ok":
-            vf_.notes.append("no_sentences")
+        if vf_.retry_mode == "safe" and "safe_mode" not in vf_.reasons:
+            vf_.reasons.insert(0, "safe_mode")
         parses[v] = vf_
-        status_rows[v] = _status_row(job, v, vf_, vf_.status, "", elapsed)
+        status_rows[v] = _status_row(job, v, vf_, vf_.status, ";".join(vf_.reasons), elapsed)
         prev = vf_
 
     # ---- BibTeX dedup across versions + key map

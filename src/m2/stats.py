@@ -32,7 +32,8 @@ def _read(d: Path, columns=None) -> pa.Table | None:
     files = sorted(d.glob("*.parquet")) if d.is_dir() else []
     if not files:
         return None
-    return pa.concat_tables([pq.read_table(f, columns=columns) for f in files]).unify_dictionaries()
+    tabs = [pq.read_table(f, columns=columns) for f in files]
+    return pa.concat_tables(tabs, promote_options="default").unify_dictionaries()
 
 
 def _write_csv(path: Path, header: list[str], rows) -> None:
@@ -54,8 +55,9 @@ def export(out_dir: Path, work_dir: Path, log=print, exports_dir: Path | None = 
         status = [str(s) for s in d["status"]]
         cnt = Counter(status)
         _write_csv(ed / "status_counts.csv", ["status", "versions"], sorted(cnt.items()))
-        reasons = Counter((s, (r or "").split(":")[0][:80]) for s, r in zip(status, d["failure_reason"])
-                          if s in ("failed", "missing", "empty"))
+        # one row per (status, reason): a partial version can carry several ";"-joined reasons
+        reasons = Counter((s, x.split(":")[0][:80]) for s, r in zip(status, d["failure_reason"])
+                          if s != "ok" for x in ((r or "").split(";") if r else [""]))
         _write_csv(ed / "failure_reasons.csv", ["status", "reason", "versions"],
                    [(s, r, c) for (s, r), c in sorted(reasons.items())])
         cov = defaultdict(Counter)
@@ -90,11 +92,18 @@ def export(out_dir: Path, work_dir: Path, log=print, exports_dir: Path | None = 
         non_empty = sum(c for s, c in cnt.items() if s not in ("empty", "missing"))
         succ = sum(cnt[s] for s in ("ok", "root_fallback", "partial"))
         succ1 = sum(1 for i in range(st.num_rows) if status[i] in ("ok", "root_fallback", "partial")
-                    and (status[i] != "partial" or d["n_sentences"][i] >= 1))
+                    and d["n_sentences"][i] >= 1)
         res["status"] = dict(cnt)
         res["success_rate_non_empty"] = succ / max(non_empty, 1)
         res["success_rate_with_sentence_rule"] = succ1 / max(non_empty, 1)
+        # strict rate: only versions without any quality reason (status "ok") count
+        res["ok_rate_non_empty"] = cnt["ok"] / max(non_empty, 1)
         res["failed_rate_non_empty"] = cnt["failed"] / max(non_empty, 1)
+        cv = sorted(c for c, s in zip(d.get("coverage", []), status)
+                    if c is not None and s in ("ok", "root_fallback", "partial"))
+        if cv:
+            res["coverage_quantiles"] = {q: round(cv[min(len(cv) - 1, int(q * len(cv)))], 4)
+                                         for q in (0.01, 0.05, 0.25, 0.5)}
         res["versions_without_sentences"] = sum(1 for i in range(st.num_rows)
                                                 if status[i] in ("ok", "root_fallback", "partial")
                                                 and d["n_sentences"][i] == 0)

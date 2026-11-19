@@ -84,7 +84,8 @@ SCHEMAS["parse_status"] = pa.schema(
     + [pa.field("bib_source", _DICT), pa.field("bib_fallback", pa.bool_()),
        pa.field("reused_from_prev", pa.bool_())]
     + [pa.field(c, pa.float32()) for c in _STATUS_FLOAT]
-    + [pa.field("retry_mode", pa.string()), pa.field("notes", pa.string())])
+    + [pa.field("retry_mode", pa.string()), pa.field("coverage", pa.float32()),
+       pa.field("notes", pa.string())])
 SCHEMAS["paper_stats"] = pa.schema([
     pa.field("arxiv_id", pa.string(), nullable=False), pa.field("paper_key", pa.string()),
     pa.field("n_versions", pa.int32()), pa.field("nodes_before", pa.int64()),
@@ -117,6 +118,14 @@ def to_table(name: str, rows: list[dict]) -> pa.Table:
         else:
             cols[f.name] = pa.array(vals, f.type)
     return pa.Table.from_pydict(cols, schema=schema)
+
+
+def _conform(tab: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Cast a shard to ``schema``; columns added since the shard was written become nulls."""
+    if tab.schema.names != schema.names:
+        tab = pa.table({f.name: tab[f.name] if f.name in tab.schema.names
+                        else pa.nulls(tab.num_rows, f.type) for f in schema})
+    return tab.cast(schema)
 
 
 def _write_atomic(table: pa.Table, path: Path) -> None:
@@ -244,7 +253,7 @@ def compact(out_dir: Path, work_dir: Path, n_shards: int = 8, log=print) -> dict
                     parts.append(tab)
             if not parts:
                 continue
-            tab = pa.concat_tables([p.cast(SCHEMAS[t]) for p in parts]).unify_dictionaries()
+            tab = pa.concat_tables([_conform(p, SCHEMAS[t]) for p in parts]).unify_dictionaries()
             tab = tab.append_column("__row", pa.array(range(tab.num_rows), pa.int64()))
             tab = tab.sort_by([("arxiv_id", "ascending"), ("__row", "ascending")]).drop_columns(["__row"])
             p = d / f"new-c{bi:05d}.parquet"

@@ -126,6 +126,35 @@ def test_cite_and_ref_normalization(src, expected):
     assert clean_inline(src) == expected
 
 
+def sentences(body: str, pre: str = "") -> list[str]:
+    files = {"main.tex": "\\documentclass{article}\n" + pre + "\\begin{document}\n" + body + "\n\\end{document}"}
+    return [n.content for n in parse_version_files(files).tree.walk() if n.kind == "sentence"]
+
+
+@pytest.mark.parametrize("src", [
+    "$\\mbox{$a \\cdot b$}$",
+    "$\\text{if $a\\cdot b$}$",
+    "$\\colorbox{red}{$\\displaystyle X \\boldsymbol{\\cdot} Y$}$",
+])
+def test_math_nested_in_text_box_is_kept(src):
+    # 2608.14648: the inner $ opened inside a box must not close the outer inline math
+    assert sentences("Text (" + src + "). Next one.") == ["Text (" + src + ").", "Next one."]
+    assert clean_inline("A " + src + " b.") == "A " + src + " b."
+
+
+def test_math_from_macro_with_box_keeps_operators():
+    pre = "\\newcommand{\\mathcolorbox}[2]{\\colorbox{#1}{$\\displaystyle #2$}}\n"
+    out = sentences("GEMM ($\\mathcolorbox{lightpeach}{X \\boldsymbol{\\cdot} Y}$). Done.", pre)
+    assert out[0] == "GEMM ($\\colorbox{lightpeach}{$\\displaystyle X \\boldsymbol{\\cdot} Y$}$)."
+
+
+def test_macro_after_line_break_is_not_expanded():
+    # 2608.07286: "\bmat{E_m\\F_m\\C}" with \def\F{..}: "\\F" is a line break followed by "F"
+    from src.m2.preprocess import MacroTable, collect_definitions, expand_macros
+    _, t = collect_definitions(r"\def \F {{\vec{F}}} \newcommand{\C}{\mathbb{C}}", MacroTable())
+    assert expand_macros(r"E_m\\F_m\\C and \F x \\\F y", t) == r"E_m\\F_m\\C and {\vec{F}} x \\{\vec{F}} y"
+
+
 def test_no_residual_inline_delimiters():
     out = clean_inline("A \\(x\\) and \\begin{math}y\\end{math} and $z$.")
     assert "\\(" not in out and "\\begin{math}" not in out

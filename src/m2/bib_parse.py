@@ -8,7 +8,8 @@ r"""Tolerant hand-written ``.bib`` parser (``@string``, ``#`` concatenation, mal
   normalized to ``"First Last"`` (``"Last, First"`` and ``"Last, Jr, First"`` inverted,
   ``others`` / ``et al.`` dropped);
 * ``year`` is an int (from ``year``, else ``date``, else the ``YYMM`` of an arXiv identifier);
-  ``doi`` is lowercased without resolver prefix; ``journal`` falls back to ``booktitle``.
+  ``doi`` is lowercased without resolver prefix; ``journal`` falls back to ``booktitle``;
+* ``entry_type`` is normalized to :data:`ENTRY_TYPES` (aliases and typos mapped, else ``misc``).
 
 :class:`BibEntry` is shared with :mod:`bibitem` and :mod:`bib_dedup`.
 """
@@ -275,8 +276,49 @@ def _read_value(text: str, i: int, strings: dict[str, str]) -> tuple[str, int]:
         return "".join(parts), i
 
 
+# Entry types kept as they are: the 14 BibTeX types and the common biblatex ones.
+ENTRY_TYPES = frozenset({
+    "article", "book", "booklet", "inbook", "incollection", "inproceedings", "manual",
+    "mastersthesis", "phdthesis", "misc", "proceedings", "techreport", "unpublished",
+    "online", "software", "dataset", "report", "thesis", "collection", "patent", "standard",
+    "periodical", "reference"})
+_TYPE_ALIASES = {
+    "conference": "inproceedings", "inproc": "inproceedings", "proceeding": "proceedings",
+    "electronic": "online", "www": "online", "url": "online", "webpage": "online", "web": "online",
+    "website": "online",
+    "masterthesis": "mastersthesis", "master": "mastersthesis", "msthesis": "mastersthesis",
+    "phd": "phdthesis",
+    "data": "dataset", "std": "standard", "bookchapter": "incollection", "chapter": "incollection",
+    "incoll": "incollection", "tech": "techreport", "techrep": "techreport",
+    "mvbook": "book", "bookinbook": "inbook", "suppbook": "inbook", "mvcollection": "collection",
+    "suppcollection": "incollection", "mvproceedings": "proceedings", "inreference": "incollection",
+    "mvreference": "reference", "suppperiodical": "article", "codefragment": "software",
+}
+
+
+def normalize_entry_type(t: str) -> str:
+    """Map a ``@type`` to :data:`ENTRY_TYPES`: aliases (``conference``, ``electronic``, ``www``,
+    ``masterthesis``), typos and suffixes (``articl``, ``inproeedings``, ``articlebazan``) go to
+    the nearest standard type; anything else is ``misc``."""
+    t = (t or "").strip().lower()
+    if t in ENTRY_TYPES:
+        return t
+    if t in _TYPE_ALIASES:
+        return _TYPE_ALIASES[t]
+    if len(t) >= 5:
+        for s in sorted(ENTRY_TYPES, key=len, reverse=True):
+            if len(s) >= 5 and (t.startswith(s) or (s.startswith(t) and len(t) >= len(s) - 2)):
+                return s
+        from rapidfuzz import fuzz, process
+        best = process.extractOne(t, ENTRY_TYPES, scorer=fuzz.ratio)
+        if best and best[1] >= 85:
+            return best[0]
+    return "misc"
+
+
 def _entry_from_fields(etype: str, key: str, f: dict[str, str]) -> BibEntry:
-    e = BibEntry(key=key, entry_type=etype, source="bib", parse_method="bib", confidence=1.0)
+    e = BibEntry(key=key, entry_type=normalize_entry_type(etype), source="bib", parse_method="bib",
+                 confidence=1.0)
     if f.get("title"):
         e.title = clean_inline(f["title"])
     auth = f.get("author") or f.get("editor") or ""

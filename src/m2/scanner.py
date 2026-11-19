@@ -67,6 +67,49 @@ def find_env_end(text: str, start: int, name: str, limit: int = C.MAX_ENV_SCAN) 
     return -1, -1
 
 
+def _brace_depth(text: str, i: int, k: int) -> int:
+    """Brace depth at ``k`` relative to ``i`` (escaped braces ignored, never below 0)."""
+    depth = 0
+    j = i
+    while j < k:
+        c = text[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}" and depth:
+            depth -= 1
+        j += 1
+    return depth
+
+
+def dollar_at_top(text: str, i: int, k: int, stop: int) -> int:
+    """Given the first unescaped ``$`` at ``k`` after an opening ``$`` at ``i - 1``, return the
+    closing ``$`` at brace depth 0: ``$\\mbox{if $a\\cdot b$}$`` closes at the last ``$``, not
+    at the one opening the text-mode math inside the box. ``k`` is kept when the braces before
+    it are balanced (the common case) or when no depth-0 ``$`` exists (unbalanced source)."""
+    if "{" not in text[i:k] or _brace_depth(text, i, k) == 0:
+        return k
+    depth = 0
+    j = i
+    while j < stop:
+        c = text[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if depth == 0:
+                return k
+            depth -= 1
+        elif c == "$" and depth == 0:
+            return j
+        j += 1
+    return k
+
+
 def find_inline_math_end(text: str, i: int, delim: str, limit: int = 8000) -> int:
     """Closing delimiter of inline math opened before ``i``; -1 if none before a blank line."""
     stop = min(len(text), i + limit)
@@ -76,6 +119,8 @@ def find_inline_math_end(text: str, i: int, delim: str, limit: int = 8000) -> in
         if k < 0:
             return -1
         if not escaped(text, k):
+            if delim == "$":
+                k = dollar_at_top(text, i, k, stop)
             seg = text[i:k]
             if "\n" in seg and re.search(r"\n[ \t]*\n", seg):
                 return -1

@@ -79,3 +79,53 @@ def test_hierarchy_preorder():
                              N("section", "B", [N("sentence", "b1.")])])
     _e, h = build_tables("p", "p", {1: v1})
     assert [r["element_id"] for r in h] == ["p#h1", "p#s1", "p#h2", "p#s2", "p#h3", "p#s3"]
+
+
+def test_version_without_sentences_is_not_ok(tmp_path):
+    from src.m2.discover import PaperJob, VersionInfo
+    from src.m2.pipeline import process_paper
+    for v, body in ((1, "Hello world."), (2, "")):
+        d = tmp_path / f"v{v}"
+        d.mkdir()
+        (d / "main.tex").write_text(r"\documentclass{article}\begin{document}" + body + r"\end{document}",
+                                    encoding="utf-8")
+    job = PaperJob(paper_key="p", arxiv_id="p", paper_dir=tmp_path,
+                   versions=[VersionInfo(1, [tmp_path / "v1"]), VersionInfo(2, [tmp_path / "v2"])])
+    st = {r["version"]: r for r in process_paper(job).status}
+    assert st[1]["status"] == "ok"
+    assert st[2]["status"] == "partial" and st[2]["failure_reason"] == "no_sentences"
+
+
+def _doc(body, pre=""):
+    return {"main.tex": r"\documentclass{article}" "\n" + pre + r"\begin{document}" "\n" + body + "\n"
+            + r"\end{document}"}
+
+
+def test_quality_reasons_make_version_partial():
+    text = " ".join(f"Sentence number {i} has several plain words in it." for i in range(40))
+    ok = parse_version_files(_doc(text))
+    assert ok.status == "ok" and ok.reasons == [] and ok.coverage > 0.8
+    miss = parse_version_files(_doc(text + "\n" + r"\input{sections/lost}"))
+    assert miss.status == "partial" and miss.reasons == ["missing_include:1"]
+    nobegin = parse_version_files({"main.tex": r"\documentclass{article}" "\n" + text})
+    assert "no_begin_document" in nobegin.reasons and nobegin.status == "partial"
+
+
+def test_low_coverage_flag():
+    from src.m2.pipeline import coverage
+    from src.m2.hierarchy import Node
+    body = " ".join(["word"] * 400)
+    t = Node("document", "T", [Node("sentence", "word " * 50)])
+    assert coverage(body, t) < 0.3
+    t2 = Node("document", "T", [Node("sentence", body)])
+    assert coverage(body, t2) == 1.0
+
+
+def test_thebibliography_inside_discarding_macro_is_ignored():
+    body = (r"See \cite{a}." "\n" r"\remove{\begin{thebibliography}{9}\bibitem{a} X. Old, Dead entry, 1999."
+            r"\end{thebibliography}}" "\n" r"\begin{thebibliography}{9}\bibitem{a} A. Live, The live entry title, 2020."
+            r"\end{thebibliography}")
+    files = {"main.tex": r"\documentclass{article}" "\n" r"\newcommand{\remove}[1]{}" "\n" r"\begin{document}" "\n"
+             + body + "\n" + r"\end{document}"}
+    vp = parse_version_files(files)
+    assert [e.year for e in vp.bib_entries] == [2020]

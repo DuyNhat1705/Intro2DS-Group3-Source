@@ -22,6 +22,7 @@ import unicodedata
 
 from . import config as C
 from .mathnorm import normalize_inline
+from .scanner import dollar_at_top
 from .preprocess import (BL_CLOSE, BL_OPEN, IL_OPEN, Literals, match_brace, match_bracket,
                          read_arg)
 
@@ -141,6 +142,8 @@ def _find_math_end(text: str, i: int, delim: str) -> int:
             bs += 1
             p -= 1
         if bs % 2 == 0:
+            if delim == "$":
+                k = dollar_at_top(text, i, k, limit)
             # a blank line ends inline math (TeX error); stop there
             if "\n\n" in text[i:k] and re.search(r"\n[ \t]*\n", text[i:k]):
                 return -1

@@ -79,6 +79,71 @@ def test_iffalse_and_newif_around_includes():
     assert r.compile_files == ["main.tex", "longv.tex", "pdf.tex"]
 
 
+def test_switch_set_in_included_params_file():
+    # 2608.18841: \newif in the root, \eprinttrue in an \input-ed params file
+    root = ("\\newif\\ifeprint\n\\newif\\ifconference\n\\input{PARAMS}\n"
+            "\\ifeprint\n\\documentclass{article}\n\\fi\n"
+            "\\ifconference\n\\documentclass{llncs}\n\\fi\n"
+            "\\begin{document}\n\\ifconference\n\\input{CONF}\n\\fi\n"
+            "\\ifeprint\n\\input{EPRINT}\n\\fi\n\\end{document}\n")
+    r = g({"main.tex": root, "PARAMS.tex": "\\eprinttrue\n%\\eprintfalse\n\\conferencefalse\n",
+           "EPRINT.tex": "\\input{body}", "body.tex": "Real body text.", "CONF.tex": "CONF"})
+    assert r.compile_files == ["main.tex", "PARAMS.tex", "EPRINT.tex", "body.tex"]
+    assert "Real body text." in r.body and "CONF" not in r.body
+    assert "\ue010" not in r.text
+
+
+def test_begin_document_inside_macro_definition_ignored():
+    # 2608.16374: \def\bd{\begin{document}} \def\ed{\end{document}} in the preamble
+    src = ("\\documentclass{article}\n\\def\\bd{\\begin{document}}\n\\def\\ed{\\end{document}}\n"
+           "\\begin{document}\nThe body.\n\\end{document}\n")
+    r = g({"main.tex": src})
+    assert r.body.strip() == "The body."
+    assert "\\def\\ed" in r.preamble
+
+
+def test_documentclass_in_included_preamble_root_is_includer():
+    # 2608.16293 / 17969 / 18402: main.tex = "\input{preamble} \begin{document} ..."
+    r = g({"main.tex": "\\input{preamble}\n\\begin{document}\n\\input{body}\n\\end{document}\n",
+           "preamble.tex": "\\documentclass{article}\n\\usepackage{amsmath}\n",
+           "body.tex": "The real body."})
+    assert r.root_file == "main.tex"
+    assert r.compile_files == ["main.tex", "preamble.tex", "body.tex"]
+    assert "The real body." in r.body
+    assert any(n.startswith("root_includes_preamble") for n in r.notes)
+
+
+def test_header_body_footer_split_and_pure_wrapper():
+    # 2608.05800 v2: main = \input{header} \input{main-text} \input{footer}
+    r = g({"paper.tex": "\\input{header}\n\\input{main-text}\n\\input{footer}\n",
+           "header.tex": "\\documentclass{article}\n\\title{T}\n\\begin{document}\n\\maketitle\n",
+           "main-text.tex": "Body sentence here.", "footer.tex": "\\bibliography{refs}\n\\end{document}\n"})
+    assert r.root_file == "paper.tex"
+    assert r.compile_files == ["paper.tex", "header.tex", "main-text.tex", "footer.tex"]
+    assert "Body sentence here." in r.body and "\\title{T}" in r.preamble
+    # 2608.07314: "% Overleaf entry point" wrapper around a complete document keeps the document
+    w = g({"main.tex": "\\input{template/sample.tex}\n",
+           "template/sample.tex": DOC % "Sample body."})
+    assert w.root_file == "template/sample.tex"
+
+
+def test_include_path_with_literal_macro():
+    # 2608.18034: \def\arxivroot{} ... \def\arxivroot{arxiv/} ... \input{\arxivroot sec/intro}
+    root = ("\\def\\arxivroot{}\n\\IfFileExists{x}{\\def\\arxivroot{arxiv/}}{}\n\\documentclass{article}\n"
+            "\\begin{document}\n\\input{\\arxivroot sec/intro}\n\\bibliography{\\arxivroot refs}\n\\end{document}\n")
+    r = g({"main.tex": root, "sec/intro.tex": "Intro text."})
+    assert r.compile_files == ["main.tex", "sec/intro.tex"]
+    assert r.missing_includes == [] and "Intro text." in r.body
+
+
+def test_missing_include_in_body_vs_preamble():
+    src = ("\\documentclass{article}\n\\input{glyphtounicode}\n\\begin{document}\n"
+           "\\input{sections/method}\n\\input{fig/plot.pdf_tex}\nText.\n\\end{document}\n")
+    r = g({"main.tex": src})
+    assert set(r.missing_includes) == {"glyphtounicode", "sections/method", "fig/plot.pdf_tex"}
+    assert r.missing_body_includes == ["sections/method"]
+
+
 def test_comment_environment_removed():
     r = g({"main.tex": DOC % "\\begin{comment}\\input{a}\\end{comment} ok", "a.tex": "A"})
     assert r.compile_files == ["main.tex"]

@@ -50,6 +50,24 @@ BIB = r"""
 """
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("article", "article"), ("INPROCEEDINGS", "inproceedings"), ("conference", "inproceedings"),
+    ("articl", "article"), ("inproeedings", "inproceedings"), ("articlebazan", "article"),
+    ("electronic", "online"), ("www", "online"), ("masterthesis", "mastersthesis"), ("data", "dataset"),
+    ("std", "standard"), ("bookchapter", "incollection"), ("software", "software"),
+    ("journal", "misc"), ("footnote", "misc"), ("unknown", "misc"), ("", "misc"),
+])
+def test_entry_type_normalization(raw, expected):
+    from src.m2.bib_parse import ENTRY_TYPES, normalize_entry_type
+    assert normalize_entry_type(raw) == expected
+    assert normalize_entry_type(raw) in ENTRY_TYPES
+
+
+def test_bib_entry_type_is_normalized():
+    ents, _ = parse_bib("@Inproeedings{k, title={A title here}, year={2020}}\n@www{w, title={Site}}")
+    assert [e.entry_type for e in ents] == ["inproceedings", "online"]
+
+
 def test_bib_parse_fields_strings_concat():
     ents = {e.key: e for e in parse_bib(BIB)[0]}
     v = ents["vaswani2017"]
@@ -128,7 +146,25 @@ REAL_BIBITEMS = [
      "Communication and Concurrency", "R. Milner", 1989, "regex"),
     (r"""\bibitem{Datta:2018thy} S.~Datta and Y.~Jiang, ``$T\bar{T}$ deformed partition functions,'' JHEP \textbf{08} (2018), 106 doi:10.1007/JHEP08(2018)106 [arXiv:1806.07426 [hep-th]].""",
      "$T\\bar{T}$ deformed partition functions", "S. Datta", 2018, "regex"),
+    # Vancouver-style "Surname Initials" without periods (2608.14007)
+    (r"""\bibitem{AkiRichards} Aki K, Richards P G. Quantitative Seismology: Theory and Methods. W. H. Freeman and Company, 1980.""",
+     "Quantitative Seismology: Theory and Methods", "K. Aki", 1980, "regex"),
+    (r"""\bibitem{Arens1999} Arens T. The scattering of plane elastic waves by a one-dimensional periodic surface. Mathematical Methods in the Applied Sciences, 1999, 22: 55-72.""",
+     "The scattering of plane elastic waves by a one-dimensional periodic surface", "T. Arens", 1999, "regex"),
+    (r"""\bibitem{JLF2006} Joly P, Li J-R, Fliss S. Exact boundary conditions for periodic waveguides containing a local perturbation. Communications in Computational Physics, 2006, 1: 945-973.""",
+     "Exact boundary conditions for periodic waveguides containing a local perturbation", "P. Joly", 2006, "regex"),
 ]
+
+
+@pytest.mark.parametrize("raw, bad_title", [
+    (r"\bibitem{freedman1975tail} David A. Freedman. On tail probabilities for martingales. The Annals of Probability, 3(1):100--118, 1975.", "Freedman"),
+    (r"\bibitem{Bonnell1997} Bonnell I. A., Bate M. R., Clarke C. J., Pringle J. E., 1997, MNRAS, 285, 201", "A., Bate M"),
+    (r"\bibitem{Lieb} Elliott H. Lieb, Robert Seiringer, Jan Philip Solovej and Jakob Yngvason, The Mathematics of the Bose Gas and its Condensation, Birkhauser Verlag, Basel, 2005.", None),
+])
+def test_first_name_initial_layouts_are_not_vancouver(raw, bad_title):
+    e = parse_bibitems(raw)[0]
+    assert e.title != bad_title
+    assert not (e.title or "").startswith("Lieb, Robert")
 
 
 @pytest.mark.parametrize("raw, title, first, year, method", REAL_BIBITEMS)
@@ -231,6 +267,43 @@ def test_within_version_duplicates_and_bib_outranks_bibitem():
     assert len(res.entries) == 1
     assert res.entries[0].key == "ldm"  # tie in version -> most cited
     assert res.entries[0].journal == "CVPR"
+
+
+def test_same_key_conflict_in_one_version_keeps_bib_entry():
+    # 2608.14102: a dead \bibitem{b11} (Dagan 2018) and the .bib b11 (Zhou 2025) share a key
+    v1 = [E("b1", 1, title="The entropy of lies: playing twenty questions with a liar",
+            authors=["Yuval Dagan"], year=2018),
+          E("b11", 1, title="Twenty Questions with Random Error", authors=["Lin Zhou"], year=2025,
+            doi="10.1561/0100000144"),
+          E("b11", 1, source="bibitem", title="The entropy of lies: playing twenty questions with a liar",
+            authors=["Y. Dagan", "Y. Filmus", "D. Kane", "S. Moran"], year=2018)]
+    res = dedup_paper({1: v1})
+    by = {e.key: e for e in res.entries}
+    assert sorted(by) == ["b1", "b11"]
+    assert by["b11"].title == "Twenty Questions with Random Error"
+    assert by["b11"].authors == ["Lin Zhou"]
+    assert by["b1"].doi == "" and by["b1"].merged_keys == ["b1"]
+    assert res.key_map[(1, "b1")] == "b1" and res.key_map[(1, "b11")] == "b11"
+    assert res.n_before == 3
+
+
+def test_veto_blocks_transitive_merge():
+    # a ~ c by title, b ~ c by DOI, but a and b have different DOIs: no group may hold both
+    a = E("a", 1, title="Graph neural networks for physics", authors=["A. Smith"], year=2020, doi="10.1/a")
+    b = E("b", 1, title="Something else entirely", authors=["B. Jones"], year=2020, doi="10.1/b")
+    c = E("c", 2, title="Graph neural networks for physics", authors=["A. Smith"], year=2020)
+    c2 = E("c2", 2, title="Unrelated", authors=["C. Doe"], year=2020, doi="10.1/b")
+    res = dedup_paper({1: [a, b], 2: [c, c2]})
+    groups = [set(e.merged_keys) for e in res.entries]
+    assert not any({"a", "b"} <= g for g in groups)
+    assert {"a", "c"} in groups and {"b", "c2"} in groups
+
+
+def test_same_key_across_versions_still_merges():
+    v1 = [E("k", 1, title="Some paper title here", authors=["A. B"], year=2021, journal="arXiv")]
+    v2 = [E("k", 2, title="Some paper title here", authors=["A. B"], year=2024, journal="JMLR")]
+    res = dedup_paper({1: v1, 2: v2})
+    assert len(res.entries) == 1 and res.entries[0].journal == "JMLR"
 
 
 def test_rename_cites():

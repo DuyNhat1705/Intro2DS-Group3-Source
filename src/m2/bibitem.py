@@ -461,6 +461,38 @@ def _newblock(e: BibEntry, raw: str, label_year: int | None) -> None:
     _type_and_conf(e, 0.85, _clean(rest), inproc)
 
 
+# Vancouver-style authors "Surname Initials" without periods, then ". Title. Venue":
+# "Aki K, Richards P G. Quantitative Seismology: Theory and Methods. W. H. Freeman, 1980."
+_VAN_NAME = r"[A-Z][A-Za-z'’\-]+(?:\s+[A-Z][a-z][A-Za-z'’\-]*)?\s+[A-Z](?:[\s\-]?[A-Z]){0,3}"
+_VANCOUVER_RE = re.compile(
+    rf"^(?P<a>{_VAN_NAME}(?:\s*(?:,|\band\b|&)\s*{_VAN_NAME})*(?:,?\s+et\s+al)?)\.\s+(?P<r>[A-Z0-9\"“(].+)$")
+
+
+def _vancouver_rest_ok(r: str) -> bool:
+    """The text after the Vancouver author list must start with a title, not with the rest of
+    a name ("Freedman. On tail ...", "A., Bate M. R.", "Lieb, Robert Seiringer, ...")."""
+    if re.match(r"[A-Z]\.", r) or re.match(r"\S+\s*(?:,|\band\b|&)", r):
+        return False
+    first = re.split(r"(?<=[\w)?!])\.\s+(?=[A-Z0-9]|arXiv|e-?print|preprint)", r, maxsplit=1)[0]
+    if len(re.findall(r"[A-Za-z]{2,}", first)) < 2 or re.search(r"\bet\s+al\b", first):
+        return False
+    return True
+
+
+def _van_name(s: str) -> str:
+    """``"Richards P G"`` -> ``"P. G. Richards"``, ``"Li J-R"`` -> ``"J.-R. Li"``."""
+    toks = s.split()
+    k = len(toks)
+    while k > 1 and re.fullmatch(r"[A-Z](?:-[A-Z])?|[A-Z]{2,3}", toks[k - 1]):
+        k -= 1
+    if k == len(toks) or toks[0] in ("et", "al"):
+        return s.strip()
+    ini = []
+    for t in toks[k:]:
+        ini.extend([".-".join(t.split("-")) + "."] if "-" in t else [c + "." for c in t])
+    return " ".join(ini + toks[:k])
+
+
 def _regex(e: BibEntry, raw: str, label_year: int | None) -> None:
     title = ""
     a_part = ""
@@ -506,6 +538,17 @@ def _regex(e: BibEntry, raw: str, label_year: int | None) -> None:
                         venue_raw = raw[g[2]:]
     cleaned = _clean(raw)
     # 3. plain layouts
+    if not title and not a_part:
+        van = _VANCOUVER_RE.match(cleaned)
+        if van and not _vancouver_rest_ok(van.group("r")):
+            van = None  # "David A. Freedman. Title" / "Bonnell I. A., Bate M. R." are not Vancouver
+        if van:
+            a_part = ", ".join(_van_name(x) for x in re.split(r"\s*(?:,|\band\b|&)\s*", van.group("a"))
+                               if x.strip())
+            parts = re.split(r"(?<=[\w)?!])\.\s+(?=[A-Z0-9]|arXiv|e-?print|preprint)",
+                             van.group("r"), maxsplit=1)
+            title = parts[0]
+            venue_raw = parts[1] if len(parts) > 1 else ""
     if not title and not a_part:
         apa = re.match(r"^(?P<a>.+?)\s*\(\s*(?P<y>(?:1[5-9]|20)\d{2})[a-z]?\s*\)\s*[.,:]?\s*(?P<r>.*)$", cleaned)
         if apa and _looks_like_author_list(apa.group("a")):

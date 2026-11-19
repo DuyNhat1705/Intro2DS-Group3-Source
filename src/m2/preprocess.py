@@ -679,6 +679,15 @@ def _substitute(body: str, args: list[str]) -> str:
                   if int(m.group(1)) <= len(args) else "", body)
 
 
+def _escaped_at(text: str, pos: int) -> bool:
+    """True when the backslash at ``pos`` is preceded by an odd number of backslashes."""
+    k, n = pos - 1, 0
+    while k >= 0 and text[k] == "\\":
+        n += 1
+        k -= 1
+    return n % 2 == 1
+
+
 def expand_macros(text: str, table: MacroTable, max_passes: int = C.MAX_MACRO_PASSES) -> str:
     """Expand author macros and environments, bounded in passes and growth."""
     if not table.macros and not table.envs:
@@ -708,6 +717,8 @@ def expand_macros(text: str, table: MacroTable, max_passes: int = C.MAX_MACRO_PA
             for m in mac_re.finditer(text):
                 if m.start() < pos:
                     continue
+                if m.start() and text[m.start() - 1] == "\\" and _escaped_at(text, m.start()):
+                    continue  # "\\F_m" is a line break followed by "F_m", not the macro \F
                 name = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else None)
                 mac = table.macros.get(name)
                 if mac is None:

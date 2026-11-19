@@ -12,7 +12,10 @@ the same reference if any rule holds:
    (candidates blocked on the first title token).
 
 Vetoes: rules 2-5 never merge entries whose DOIs differ, whose arXiv IDs differ, or whose years
-differ by more than one.
+differ by more than one. The veto also holds between groups: two groups are not joined when any
+pair of their members with different keys is vetoed, so transitive chains cannot merge two
+different works. Inside one version a key names one reference: if two sources of that version
+(``.bib`` and ``\bibitem``) give the same key to vetoed entries, only the preferred one is kept.
 
 Canonical key = the key used in the *latest* version containing the group (ties: most cited,
 then alphabetical). Fields are unioned: each field takes the non-empty value of the latest
@@ -130,21 +133,57 @@ def dedup_paper(entries_by_version: dict[int, list[BibEntry]],
                 threshold: int = FUZZY_THRESHOLD) -> DedupResult:
     cite_counts = cite_counts or {}
     flat: list[BibEntry] = []
+    n_before = 0
     for v in sorted(entries_by_version):
-        for e in entries_by_version[v]:
+        # one key means one reference inside a version: when two sources of the same version
+        # (.bib + \bibitem) give the same key to conflicting entries, keep the preferred one
+        # instead of unioning the fields of two different works
+        ents = entries_by_version[v]
+        kept: dict[str, BibEntry] = {}
+        dropped: set[int] = set()
+        for e in sorted(ents, key=lambda e: (e.source != "bib", -e.confidence)):
+            k0 = kept.get(e.key)
+            if k0 is not None and e.key and _vetoed(k0, e):
+                dropped.add(id(e))
+            else:
+                kept.setdefault(e.key, e)
+        for e in ents:
             e.version = v
-            flat.append(e)
-    res = DedupResult(n_before=len(flat))
+            n_before += 1
+            if id(e) not in dropped:
+                flat.append(e)
+    res = DedupResult(n_before=n_before)
     if not flat:
         return res
     uf = _UF(len(flat))
+    members: dict[int, list[int]] = {i: [i] for i in range(len(flat))}
+
+    def join(i: int, j: int, check: bool = True) -> None:
+        """Union unless some pair across the two groups is vetoed (different DOIs / arXiv IDs /
+        distant years): stops chains like ``b1 ~title~ x ~key~ b11`` from merging two works.
+        Pairs sharing a key are exempt, and rule 1 (same key) never checks, since a key keeps
+        its identity across versions."""
+        ri, rj = uf.find(i), uf.find(j)
+        if ri == rj:
+            return
+        gi, gj = members[ri], members[rj]
+        if check and len(gi) * len(gj) <= 2500:
+            for x in gi:
+                for y in gj:
+                    if flat[x].key != flat[y].key and _vetoed(flat[x], flat[y]):
+                        return
+        uf.union(ri, rj)
+        r = uf.find(ri)
+        members[r] = gi + gj
+        members.pop(rj if r == ri else ri, None)
+
     by_key: dict[str, int] = {}
     by_doi: dict[str, int] = {}
     by_ep: dict[str, int] = {}
     titles = [norm_title(e.title) for e in flat]
     for i, e in enumerate(flat):
         if e.key in by_key:
-            uf.union(by_key[e.key], i)
+            join(by_key[e.key], i, check=False)
         else:
             by_key[e.key] = i
     # rules 2/3 with vetoes
@@ -156,7 +195,7 @@ def dedup_paper(entries_by_version: dict[int, list[BibEntry]],
             if j is None:
                 idx[val] = i
             elif not _vetoed(flat[j], e):
-                uf.union(j, i)
+                join(j, i)
     # rules 4/5, blocked on the first title token
     blocks: dict[str, list[int]] = defaultdict(list)
     for i, t in enumerate(titles):
@@ -177,7 +216,7 @@ def dedup_paper(entries_by_version: dict[int, list[BibEntry]],
                 if a.key == b.key:
                     continue
                 if same_reference(a, b, threshold):
-                    uf.union(i, j)
+                    join(i, j)
     groups: dict[int, list[int]] = defaultdict(list)
     for i in range(len(flat)):
         groups[uf.find(i)].append(i)

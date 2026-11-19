@@ -339,14 +339,36 @@ Published tables (Parquet, zstd; `kind` and `entry_type` dictionary-encoded):
 | `hierarchy` | `arxiv_id` string, `version` int32, `element_id` string, `parent_id` string — one row per node→parent edge, in pre-order |
 | `bibtex` | `arxiv_id`, `citation_key`, `entry_type` dictionary, `title`, `authors` list<string>, `year` int32 nullable, `doi`, `journal`, `url` |
 
+`entry_type` is one of the 14 BibTeX types or a common biblatex type (`online`, `software`, `dataset`, `report`,
+`thesis`, `collection`, `patent`, `standard`, `periodical`, `reference`): aliases (`conference`, `electronic`,
+`www`, `masterthesis`) and typos in the source (`articl`, `inproeedings`) are mapped to it, anything else is `misc`.
+
 `element_id = <paper_key>#<prefix><n>` (`root<v>`, `h` headings, `a` abstract, `l` list, `i` item, `b` block,
 `s` sentence, `f` formula, `fig`, `tab`). Identical cleaned content across versions shares one id; each
 version remains a tree (identity = kind + content + occurrence index inside the version).
 
 Internal working data in `--work-dir`: `parse_status/` (status `ok / root_fallback / partial / empty / missing /
-failed`, reasons, file counts, per-stage times), `bibtex_full/` (all BibTeX fields, source, parse method,
+failed`, reasons, file counts, per-stage times, `coverage`), `bibtex_full/` (all BibTeX fields, source, parse method,
 confidence, versions, merged keys), `cite_key_map/`, `paper_stats/`, `manifest/` (checkpoints), `runs/`
 (run summaries) and `report_exports/` (small CSV/JSON files for the book).
+
+**Version status.** `ok` means that no signal of lost content was seen; any of the following makes the
+version `partial`, with the reasons `;`-joined in `failure_reason`:
+
+| Reason | Meaning |
+|---|---|
+| `syntax_recovery:n` | an environment, formula or heading had to be closed by recovery |
+| `no_sentences` | the source yields no sentence |
+| `no_begin_document` | the compiled text has no `\begin{document}` (wrong or missing root) |
+| `missing_include:n` | `.tex` files included from the body are not in the source |
+| `macro_growth_limit`, `include_or_size_limit` | an expansion / include / file-size safety limit was hit |
+| `low_coverage:x` | the tree keeps less than `MIN_COVERAGE` (0.5) of the body's prose letters |
+| `safe_mode` | the version was parsed again in safe mode after an error |
+
+Benign observations (several root candidates, `.bib` fallback, undecided `\if`, nested documents) stay in
+`notes`. `summary.json` reports both `success_rate_non_empty` (ok + root_fallback + partial) and the strict
+`ok_rate_non_empty`, plus `coverage_quantiles`. These are self-checks of the parser, not accuracy: accuracy
+comes from the gold sets below.
 
 ### 7. Tests and gold-set evaluation
 
