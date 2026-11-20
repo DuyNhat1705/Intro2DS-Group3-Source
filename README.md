@@ -53,10 +53,8 @@ Intro2DS-Group3-Source/
 |   ├── get_full_source.py           # Milestone 1: versioned .tex/.bib downloads
 |   ├── get_extracting_reference.py  # Milestone 1: citation API references
 |   ├── scraper.ipynb                # Milestone 1: collection and reporting
-|   ├── gather_clean_tex.py          # Milestone 2: gathering/cleanup interfaces
-|   ├── hierarchy.py                 # Milestone 2: tree and element-table interfaces
-|   ├── bibtex.py                    # Milestone 2: bibliography interfaces
-|   ├── parser.ipynb                 # Milestone 2: notebook placeholder
+|   ├── m2/                          # Milestone 2: parser package (see section VII)
+|   ├── parser.ipynb                 # Milestone 2: Colab/local runner and benchmark notebook
 |   ├── intro2ds-env.yml             # Conda environment (Python 3.12)
 |   └── requirements.txt             # Pinned Python dependencies
 ├── data/                            # Local generated corpus
@@ -101,30 +99,13 @@ End-to-end orchestration: entry discovery (batched arXiv API) → every version 
 
 ### 2. Milestone 2
 
-The following interfaces describe the intended processing stages.
-
-#### A. `src/gather_clean_tex.py`
-
-- `gather_tex(version_dir, encoding="utf-8-sig")`: Intended to find the compilation root, expand reachable inputs in compilation order, and collect referenced bibliography files. Returns a `GatherTex` object; an existing directory without TeX files represents an empty version, distinct from a missing directory, ambiguous root, or unresolved include.
-- `cleanup_latex(source)`: Intended to remove non-semantic formatting and normalize mathematics while preserving structural commands and citations.
-
-#### B. `src/hierarchy.py`
-
-- `Node`: Represents a node with a local identifier, optional parent identifier, kind, and content.
-- `construct_hierarchy(cleaned_tex)`: Intended to build one version's tree, including a document root with no parent.
-- `rewrite_citations(nodes, key_map)`: Intended to replace citation keys with canonical keys while preserving node identifiers and edges.
-- `build_element_tables(arxiv_id, nodes_by_version)`: Intended to deduplicate cleaned content across versions and return shared `elements` rows and version-specific `hierarchy` rows. `ElementRow` and `HierarchyRow` define their schemas.
-
-#### C. `src/bibtex.py`
-
-- `BibEntry`: Holds a citation key, entry type, and bibliography fields.
-- `extract_bibtex(tex)`: Intended to read referenced `.bib` files and convert reachable `\bibitem` entries.
-- `merge_bibtex(entries_by_version)`: Intended to merge duplicate entries and union their fields, returning unified entries and a citation-key mapping for each version.
-- `build_bibtex_rows(arxiv_id, entries)`: Intended to project merged entries into the final schema defined by `BibtexRow`.
-
-#### D. `src/parser.ipynb`
-
-Reserved for Milestone 2 orchestration. The intended order is gathering and cleanup per version, hierarchy and bibliography extraction, bibliography merging across versions, citation rewriting, then element deduplication and table assembly.
+The Milestone 2 parser is the package `src/m2/`, run by `src/parser.ipynb` (Colab or local) or by the
+command line `python -m src.m2.run`. Per version it gathers the compilation path (root detection,
+transitive includes, conditionals), builds the hierarchy (document → sections → … → sentences, block
+formulas, figures, tables; lists and theorem-like blocks as containers), cleans and normalizes the
+content, converts `\bibitem` entries to BibTeX, then deduplicates references (with `\cite` renaming
+and field union) and elements across versions, and writes the `elements`, `hierarchy` and `bibtex`
+tables. Modules, options, schemas and tests are documented in section VII.
 
 ---
 
@@ -221,3 +202,179 @@ The project uses the following libraries specified in `src/requirements.txt`:
 - [`pandas`](https://pypi.org/project/pandas/) (`==3.1.0`) and [`pyarrow`](https://pypi.org/project/pyarrow/) (`==26.0.0`): Data tables and Parquet output.
 - [`tqdm`](https://pypi.org/project/tqdm/) (`==4.70.1`): Progress bars.
 - [`matplotlib`](https://pypi.org/project/matplotlib/) (`==3.11.2`): Quick sanity-check plots in the notebook.
+
+---
+
+## VII. Milestone 2 — Hierarchical Parsing and Standardization (`src/m2`)
+
+The Milestone 2 parser lives in the package `src/m2/` (summarized in section III.2). It turns the Milestone 1 corpus (`data/<paper_key>/vN/*.tex|*.bib`, read-only) into the
+three tables of the statement — `elements`, `hierarchy`, `bibtex` — plus internal working data for the
+statistics. It never reads `references.json` (Milestone 3 must stay leakage free) and makes no network call.
+
+### 1. Package layout
+
+```text
+src/m2/
+├── config.py         # constants: command/environment/abbreviation lists, limits, PARSER_VERSION
+├── io_utils.py       # decoding (utf-8 → cp1252 → latin-1), version folders, "(n)" Drive copies, hashes
+├── discover.py       # papers and versions from data/, metadata.json and the M1 state (empty / missing)
+├── gather.py         # root detection, transitive includes, conditionals, one string + source map
+├── preprocess.py     # comments, \iffalse, verbatim masking, author macro expansion
+├── scanner.py        # error-tolerant tokenizer (bounded brace matching, never hangs)
+├── hierarchy.py      # rank-stack tree: sections, abstract, lists/items, blocks, leaves
+├── clean.py          # LaTeX cleanup, accents, \cite / \ref normalization, footnotes
+├── mathnorm.py       # inline → $...$, block → \begin{equation}...\end{equation} (aligned if multi-line)
+├── sentences.py      # rule-based sentence splitter with masking and a byte-bounded cache
+├── bib_parse.py      # tolerant .bib parser
+├── bibitem.py        # \bibitem → BibTeX (\bibinfo, \newblock, regex) with confidence
+├── bib_refine.py     # optional AnyStyle refinement (off by default)
+├── bib_dedup.py      # reference dedup (union-find, vetoes, canonical key, field union), \cite renaming
+├── dedup.py          # cross-version element dedup, element_id assignment
+├── pipeline.py       # process_paper(job): fixed stage order, never raises
+├── pool.py           # worker pool: watchdog, respawn, safe-mode retry, LPT, RSS recycling
+├── storage.py        # Parquet shards, manifest, checkpoint signatures, compaction
+├── run.py            # command-line entry point
+├── validate.py       # structural checks + accuracy proxies
+├── stats.py          # small CSV/JSON exports for the Jupyter Book
+├── inspect_tree.py   # print one version's tree with file:line locations
+├── profile_corpus.py # corpus profiling (Phase 1)
+├── profile_run.py    # cProfile / pyinstrument profile of a sample
+└── tests/            # pytest modules, gold sets (Python modules) and eval_gold.py
+src/parser.ipynb      # Colab (and local) runner and benchmark notebook
+```
+
+### 2. Environment
+
+Python 3.12 (tested with 3.12; the code needs ≥ 3.11 for possessive regex quantifiers).
+
+```bash
+# pip (venv)
+pip install -r src/requirements.txt
+# or conda
+conda env create -f src/intro2ds-env.yml     # or: conda env update -f src/intro2ds-env.yml --prune
+conda activate intro2ds
+```
+
+Runtime dependencies of the parser: `pyarrow`, `pandas`, `psutil`, `tqdm`, `rapidfuzz` (`plotly` for the
+report). Development only: `pytest`, `pyinstrument`; `bibtexparser` and `wtpsplit` are used only for the
+A/B comparisons.
+
+### 3. Command line
+
+Run from the repository root:
+
+```bash
+python -m src.m2.run --data-dir data --out data/tables --work-dir data/m2 --workers auto
+```
+
+| Option | Meaning |
+|---|---|
+| `--data-dir DIR` | Milestone 1 corpus root (read-only), default `data` |
+| `--out DIR` | published tables (`elements/`, `hierarchy/`, `bibtex/`), default `data/tables` |
+| `--work-dir DIR` | internal working data, default `data/m2` |
+| `--workers auto\|N\|0` | `auto` = min(CPUs, free RAM / per-worker estimate, cgroup aware); `0` = in-process (debug) |
+| `--limit K` / `--papers ID ...` / `--sample dev` | first K papers / given arXiv IDs or keys / the 200-paper dev sample |
+| `--ranges 2608:4007-9006 ...` | restrict to arXiv ID ranges (the M1 scraper ranges) |
+| `--log-dir DIR` | where run summaries go (default `<work-dir>/runs`); `validate`/`stats` take `--exports-dir` |
+| `--resume` | skip papers whose checkpoint signature (paths + sizes + contents + parser version) is unchanged |
+| `--compact`, `--compact-only`, `--n-shards N` | merge shards into N deterministic files sorted by `arxiv_id` |
+| `--timeout S` | per-paper deadline of the watchdog (default 60 s); a timed-out paper is retried once in safe mode |
+| `--refine-bibitem` | optional AnyStyle refinement of low-confidence `\bibitem`s |
+
+Then:
+
+```bash
+python -m src.m2.validate --out data/tables --work-dir data/m2 --data-dir data   # exit code 1 on violations
+python -m src.m2.stats    --out data/tables --work-dir data/m2                   # report exports
+python -m src.m2.inspect_tree 2608.04009 --version 1 --depth 3                   # debug one tree
+```
+
+### 4. Running on Google Colab (benchmark testbed)
+
+1. Open `src/parser.ipynb` in Colab with a **CPU** runtime. In the first cell choose the range(s) with
+   `RUN_RANGES` (same definition as `scraper.ipynb`), optionally `SAMPLE_N`, and check `DRIVE_PROJECT_DIR`.
+2. *Runtime → Run all*. The notebook installs the requirements, mounts Drive, packs `data/` once into a tar
+   on Drive (without `references.json`) and extracts it to `/content` — timed separately — then runs the unit
+   tests and the gold-set evaluation, the full run, compaction, validation and
+   statistics, and shows the report: parsing success, version coverage of every publication, counts before /
+   after deduplication, element kinds and depth, bibliography sources, accuracy proxies, running time and memory.
+3. Outputs are written directly to `<project>/statistics_data/parser/` (on Drive in Colab, in the repository
+   locally):
+
+   ```text
+   statistics_data/parser/
+   ├── tables/<WORKER>/{elements,hierarchy,bibtex}/   # the three tables (Parquet shards)
+   ├── report_exports/<WORKER>/                      # summary/validation/benchmark/gold JSON, CSVs, figures/
+   ├── run_logs/<WORKER>/                            # one summary per run
+   └── .state/<WORKER>/                              # checkpoints (manifest/) and internal working data
+   ```
+
+   `<WORKER>` is `R4`, `R1-R2`, … after the selected ranges (or `WORKER`). If a Colab session disconnects,
+   reconnect and *Run all* again: finished papers are skipped (`RESUME = True`), at most the last unflushed batch
+   (≤ 200 papers per worker) is redone, and an interrupted tar creation or extraction is never reused. For the
+   final benchmark set `RESUME = False`.
+
+The same notebook runs locally (Python 3.12, `src/requirements.txt`): it skips the Drive/clone steps and reads
+`<repo>/data`.
+
+### 5. Optional AnyStyle refinement
+
+Off by default; the parser works fully without Ruby. To enable:
+
+```bash
+sudo apt-get install ruby-full && gem install anystyle-cli
+python -m src.m2.run ... --refine-bibitem
+```
+
+Only low-confidence `\bibitem` entries are sent; a returned field is accepted only if its text appears in
+the original bibitem, and every change is logged.
+
+### 6. Output schemas
+
+Published tables (Parquet, zstd; `kind` and `entry_type` dictionary-encoded):
+
+| Table | Columns |
+|---|---|
+| `elements` | `element_id` string, `arxiv_id` string, `kind` dictionary (`document, part, chapter, section, subsection, subsubsection, paragraph, subparagraph, abstract, list, item, block, sentence, formula, figure, table`), `content` string |
+| `hierarchy` | `arxiv_id` string, `version` int32, `element_id` string, `parent_id` string — one row per node→parent edge, in pre-order |
+| `bibtex` | `arxiv_id`, `citation_key`, `entry_type` dictionary, `title`, `authors` list<string>, `year` int32 nullable, `doi`, `journal`, `url` |
+
+`entry_type` is one of the 14 BibTeX types or a common biblatex type (`online`, `software`, `dataset`, `report`,
+`thesis`, `collection`, `patent`, `standard`, `periodical`, `reference`): aliases (`conference`, `electronic`,
+`www`, `masterthesis`) and typos in the source (`articl`, `inproeedings`) are mapped to it, anything else is `misc`.
+
+`element_id = <paper_key>#<prefix><n>` (`root<v>`, `h` headings, `a` abstract, `l` list, `i` item, `b` block,
+`s` sentence, `f` formula, `fig`, `tab`). Identical cleaned content across versions shares one id; each
+version remains a tree (identity = kind + content + occurrence index inside the version).
+
+Internal working data in `--work-dir`: `parse_status/` (status `ok / root_fallback / partial / empty / missing /
+failed`, reasons, file counts, per-stage times, `coverage`), `bibtex_full/` (all BibTeX fields, source, parse method,
+confidence, versions, merged keys), `cite_key_map/`, `paper_stats/`, `manifest/` (checkpoints), `runs/`
+(run summaries) and `report_exports/` (small CSV/JSON files for the book).
+
+**Version status.** `ok` means that no signal of lost content was seen; any of the following makes the
+version `partial`, with the reasons `;`-joined in `failure_reason`:
+
+| Reason | Meaning |
+|---|---|
+| `syntax_recovery:n` | an environment, formula or heading had to be closed by recovery |
+| `no_sentences` | the source yields no sentence |
+| `no_begin_document` | the compiled text has no `\begin{document}` (wrong or missing root) |
+| `missing_include:n` | `.tex` files included from the body are not in the source |
+| `macro_growth_limit`, `include_or_size_limit` | an expansion / include / file-size safety limit was hit |
+| `low_coverage:x` | the tree keeps less than `MIN_COVERAGE` (0.5) of the body's prose letters |
+| `safe_mode` | the version was parsed again in safe mode after an error |
+
+Benign observations (several root candidates, `.bib` fallback, undecided `\if`, nested documents) stay in
+`notes`. `summary.json` reports both `success_rate_non_empty` (ok + root_fallback + partial) and the strict
+`ok_rate_non_empty`, plus `coverage_quantiles`. These are self-checks of the parser, not accuracy: accuracy
+comes from the gold sets below.
+
+### 7. Tests and gold-set evaluation
+
+```bash
+python -m pytest src/m2/tests -q            # unit tests (inline LaTeX/BibTeX fixtures)
+python -m src.m2.tests.eval_gold            # gold metrics: roots, headings, sentences, bibitems, ref-dedup
+python -m src.m2.tests.eval_gold --sat      # + SaT sentence-splitting A/B (downloads the model once)
+python -m src.m2.profile_run --sample dev   # profile the 200-paper dev sample
+```
