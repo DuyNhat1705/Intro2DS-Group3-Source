@@ -1,7 +1,10 @@
 arxiv==4.0.1
+bibtexparser==1.4.3
 requests==2.34.0
 psutil==7.2.2
 pandas==3.1.0
 pyarrow==26.0.0
 tqdm==4.70.1
 matplotlib==3.11.2
+wtpsplit==2.2.2
+onnxruntime==1.31.1

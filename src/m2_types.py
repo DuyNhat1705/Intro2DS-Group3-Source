@@ -23,7 +23,7 @@ class BibtexEntry:
     url: Optional[str] = None
     arxiv_id_hint: Optional[str] = None     # Bóc được arXiv ID gốc (phục vụ Milestone 3)
     confidence_score: float = 1.0           # Điểm chất lượng bóc tách (0.0 - 1.0)
-    source_method: str = "regex"            # "regex", "crossref", "llm"
+    source_method: str = "regex"            # "bib_file", "regex", "crossref", "llm"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -31,7 +31,7 @@ class BibtexEntry:
             "citation_key": self.citation_key,
             "entry_type": self.entry_type,
             "title": self.title,
-            "authors": self.authors,
+            "authors": list(self.authors),
             "year": self.year,
             "doi": self.doi,
             "journal": self.journal,
