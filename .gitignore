@@ -222,3 +222,7 @@ scraper_v2_prep
 # AWS credentials
 *accessKeys*.csv
 .env
+
+# ranking data
+scopus/
+dataset/
