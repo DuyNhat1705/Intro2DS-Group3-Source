@@ -13,6 +13,7 @@ import math
 import re
 import unicodedata
 from collections import Counter
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # Try high-performance C++ rapidfuzz, fallback to difflib if not yet installed
@@ -82,6 +83,7 @@ def clean_latex_markup(text: str) -> str:
     return s.strip()
 
 
+@lru_cache(maxsize=65536)
 def normalize_title(text: Optional[str]) -> str:
     """Deeply cleaned, lowercased, punctuation-free string for title comparison."""
     if not text:
@@ -215,26 +217,30 @@ def compute_containment(tokens_small: Sequence[str], tokens_large: Sequence[str]
     return len(s_small & s_large) / float(len(s_small))
 
 
+@lru_cache(maxsize=65536)
+def _char_ngram_counts(s: str, n: int) -> Tuple[Counter, float]:
+    ng = Counter(s[i:i + n] for i in range(max(0, len(s) - n + 1)))
+    norm = math.sqrt(sum(v * v for v in ng.values()))
+    return ng, norm
+
+
 def compute_cosine_char_ngram(s1: str, s2: str, n: int = 3) -> float:
     """Fast character n-gram cosine similarity (subword matching)."""
     if s1 == s2:
         return 1.0
     if not s1 or not s2:
         return 0.0
-        
-    ng1 = Counter(s1[i:i + n] for i in range(max(0, len(s1) - n + 1)))
-    ng2 = Counter(s2[i:i + n] for i in range(max(0, len(s2) - n + 1)))
-    
-    all_keys = set(ng1.keys()) & set(ng2.keys())
-    if not all_keys:
-        return 0.0
-        
-    dot = sum(ng1[k] * ng2[k] for k in all_keys)
-    norm1 = math.sqrt(sum(v * v for v in ng1.values()))
-    norm2 = math.sqrt(sum(v * v for v in ng2.values()))
-    
+
+    ng1, norm1 = _char_ngram_counts(s1, n)
+    ng2, norm2 = _char_ngram_counts(s2, n)
     if norm1 == 0.0 or norm2 == 0.0:
         return 0.0
+
+    all_keys = ng1.keys() & ng2.keys()
+    if not all_keys:
+        return 0.0
+
+    dot = sum(ng1[k] * ng2[k] for k in all_keys)
     return dot / (norm1 * norm2)
 
 

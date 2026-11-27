@@ -1,11 +1,12 @@
 """Unified Dataset Builder for Milestone 3 Reference Matching.
 
 Combines:
+- Labels from Manh Dat (src/m3/manual_truth.csv & src/m3/auto_truth.csv)
 - Text & NLP similarity features (src/features_text.py - Nhu Y)
 - Metadata features, candidate pair matrix & train/valid/test split (src/features_meta.py - Nhu Ngoc)
 
 Usage:
-    python src/build_dataset.py --bibtex <path> --references <path> --labels <path> --out data/matching
+    python src/build_dataset.py --bibtex <path_or_glob> --references <path_or_glob> --out data/matching
     python src/build_dataset.py --selftest
 """
 
@@ -19,6 +20,8 @@ import pandas as pd
 
 from features_meta import (
     LABEL_COL_ARXIV_ID,
+    LABEL_COL_CITATION_KEY,
+    LABEL_COL_GROUNDTRUTH,
     LABEL_COL_SOURCE,
     build_pair_table,
     collect_references_from_json,
@@ -39,6 +42,70 @@ ALL_FEATURE_FNS = (
 )
 
 
+def load_and_merge_labels(
+    manual_path: str | Path = "src/m3/manual_truth.csv",
+    auto_path: str | Path = "src/m3/auto_truth.csv",
+) -> pd.DataFrame:
+    """Load Manh Dat's manual and automatic label CSVs into unified schema.
+
+    - Keeps only valid matched entries (label_status == 'matched' and non-empty groundtruth_arxiv_id).
+    - Standardizes label_source to 'manual' / 'auto' (required by features_meta.split_publications).
+    - Deduplicates (arxiv_id, citation_key), giving priority to manual labels.
+    """
+    frames: list[pd.DataFrame] = []
+
+    if manual_path and Path(manual_path).is_file():
+        df_m = pd.read_csv(manual_path, dtype=str)
+        df_m[LABEL_COL_SOURCE] = "manual"
+        frames.append(df_m)
+
+    if auto_path and Path(auto_path).is_file():
+        df_a = pd.read_csv(auto_path, dtype=str)
+        if LABEL_COL_SOURCE in df_a.columns:
+            df_a[LABEL_COL_SOURCE] = (
+                df_a[LABEL_COL_SOURCE]
+                .fillna("auto")
+                .str.strip()
+                .str.lower()
+                .replace({"automatic": "auto"})
+            )
+        else:
+            df_a[LABEL_COL_SOURCE] = "auto"
+        frames.append(df_a)
+
+    if not frames:
+        raise FileNotFoundError(f"No label files found at {manual_path} or {auto_path}")
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Keep only valid matched rows per M3 specification
+    if "label_status" in df.columns:
+        df = df[df["label_status"].astype(str).str.strip().str.lower() == "matched"]
+
+    df[LABEL_COL_GROUNDTRUTH] = df[LABEL_COL_GROUNDTRUTH].fillna("").astype(str).str.strip()
+    df = df[df[LABEL_COL_GROUNDTRUTH] != ""]
+
+    df[LABEL_COL_ARXIV_ID] = df[LABEL_COL_ARXIV_ID].astype(str).str.strip()
+    df[LABEL_COL_CITATION_KEY] = df[LABEL_COL_CITATION_KEY].astype(str).str.strip()
+
+    # Manual comes first in `frames`, so keep="first" prefers manual on overlap
+    df = df.drop_duplicates(subset=[LABEL_COL_ARXIV_ID, LABEL_COL_CITATION_KEY], keep="first")
+
+    return df[[LABEL_COL_ARXIV_ID, LABEL_COL_CITATION_KEY, LABEL_COL_GROUNDTRUTH, LABEL_COL_SOURCE]].reset_index(drop=True)
+
+
+def load_many_tables(paths: list[str], table_subdir: str | None = None) -> pd.DataFrame:
+    """Load and concatenate one or more parquet files/directories."""
+    dfs = []
+    for p_str in paths:
+        p = Path(p_str)
+        if p.is_dir() and table_subdir and (p / table_subdir).exists():
+            dfs.append(load_table(p / table_subdir))
+        else:
+            dfs.append(load_table(p))
+    return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+
+
 def build_and_save_dataset(
     bibtex_df: pd.DataFrame,
     references_df: pd.DataFrame,
@@ -52,6 +119,15 @@ def build_and_save_dataset(
     t0 = time.perf_counter()
 
     # 1. Extract distinct labeled publications and entry counts
+    labeled_ids = set(labels_df[LABEL_COL_ARXIV_ID].astype(str).str.strip())
+    bibtex_df = bibtex_df[bibtex_df["arxiv_id"].astype(str).str.strip().isin(labeled_ids)].copy()
+    references_df = references_df[references_df["arxiv_id"].astype(str).str.strip().isin(labeled_ids)].copy()
+    print(
+        f"Filtered to {len(labeled_ids):,} labeled publications -> "
+        f"{len(bibtex_df):,} bibtex rows, {len(references_df):,} reference rows.",
+        flush=True,
+    )
+
     labeled_pubs_df = (
         labels_df[[LABEL_COL_ARXIV_ID, LABEL_COL_SOURCE]]
         .drop_duplicates()
@@ -63,18 +139,80 @@ def build_and_save_dataset(
     # 2. Split publications into train / valid / test (k manual + k auto in valid & test)
     split_map = split_publications(labeled_pubs_df, k=k, seed=seed)
 
-    # 3. Build candidate pair matrix & compute all text + meta features
-    pairs_df, stats = build_pair_table(
-        bibtex_df=bibtex_df,
-        references_df=references_df,
-        labels_df=labels_df,
-        partition_of=split_map,
-        feature_fns=ALL_FEATURE_FNS,
-        max_neg_per_query=max_neg_per_query,
-        seed=seed,
-    )
+    # 3. Build candidate pair matrix & compute all text + meta features in batches for live progress
+    all_pub_ids = sorted(labeled_ids)
+    batch_size = 250
+    chunk_dfs = []
+    agg_stats = {
+        "total_pairs": 0,
+        "total_qids": 0,
+        "total_publications": 0,
+        "by_partition": {
+            p: {"n_pubs": 0, "n_qids": 0, "n_pairs": 0, "n_pos": 0, "pos_ratio": 0.0}
+            for p in ("train", "valid", "test")
+        },
+        "positive_ratio_overall": 0.0,
+        "all_negative_qids": 0,
+        "gt_not_in_refs": 0,
+        "skipped_bib_not_found": 0,
+    }
+
+    bib_groups = {aid: df_g for aid, df_g in bibtex_df.groupby("arxiv_id", sort=False)}
+    ref_groups_df = {aid: df_g for aid, df_g in references_df.groupby("arxiv_id", sort=False)}
+    lbl_groups = {aid: df_g for aid, df_g in labels_df.groupby(LABEL_COL_ARXIV_ID, sort=False)}
+
+    total_batches = (len(all_pub_ids) + batch_size - 1) // batch_size
+    for b_idx in range(total_batches):
+        batch_ids = all_pub_ids[b_idx * batch_size : (b_idx + 1) * batch_size]
+        b_bib = pd.concat([bib_groups[i] for i in batch_ids if i in bib_groups], ignore_index=True) if any(i in bib_groups for i in batch_ids) else bibtex_df.iloc[0:0]
+        b_ref = pd.concat([ref_groups_df[i] for i in batch_ids if i in ref_groups_df], ignore_index=True) if any(i in ref_groups_df for i in batch_ids) else references_df.iloc[0:0]
+        b_lbl = pd.concat([lbl_groups[i] for i in batch_ids if i in lbl_groups], ignore_index=True)
+
+        c_df, c_stats = build_pair_table(
+            bibtex_df=b_bib,
+            references_df=b_ref,
+            labels_df=b_lbl,
+            partition_of=split_map,
+            feature_fns=ALL_FEATURE_FNS,
+            max_neg_per_query=max_neg_per_query,
+            seed=seed,
+        )
+        if len(c_df) > 0:
+            chunk_dfs.append(c_df)
+
+        agg_stats["total_pairs"] += c_stats["total_pairs"]
+        agg_stats["total_qids"] += c_stats["total_qids"]
+        agg_stats["total_publications"] += c_stats["total_publications"]
+        agg_stats["all_negative_qids"] += c_stats["all_negative_qids"]
+        agg_stats["gt_not_in_refs"] += c_stats["gt_not_in_refs"]
+        agg_stats["skipped_bib_not_found"] += c_stats["skipped_bib_not_found"]
+        for p in ("train", "valid", "test"):
+            for k_stat in ("n_pubs", "n_qids", "n_pairs", "n_pos"):
+                agg_stats["by_partition"][p][k_stat] += c_stats["by_partition"][p][k_stat]
+
+        done_pubs = min((b_idx + 1) * batch_size, len(all_pub_ids))
+        print(
+            f"  [Batch {b_idx + 1}/{total_batches}] {done_pubs}/{len(all_pub_ids)} pubs | "
+            f"pairs so far: {agg_stats['total_pairs']:,} | elapsed: {time.perf_counter() - t0:.1f}s",
+            flush=True,
+        )
+
+    pairs_df = pd.concat(chunk_dfs, ignore_index=True) if chunk_dfs else pd.DataFrame()
+    if len(pairs_df) > 0:
+        pairs_df = pairs_df.sort_values(
+            by=["partition", "arxiv_id", "citation_key", "ref_arxiv_id"],
+            ignore_index=True,
+        )
+
+    total_pos = sum(agg_stats["by_partition"][p]["n_pos"] for p in ("train", "valid", "test"))
+    agg_stats["positive_ratio_overall"] = (total_pos / agg_stats["total_pairs"]) if agg_stats["total_pairs"] > 0 else 0.0
+    for p in ("train", "valid", "test"):
+        npairs = agg_stats["by_partition"][p]["n_pairs"]
+        agg_stats["by_partition"][p]["pos_ratio"] = (agg_stats["by_partition"][p]["n_pos"] / npairs) if npairs > 0 else 0.0
+    stats = agg_stats
 
     # 4. Save unified pairs.parquet + split.json + individual partition parquet files
+    print("Saving parquet files...", flush=True)
     out_path = Path(out_dir)
     pq_path, split_path = save_pair_table(pairs_df, split_map, out_dir=out_path)
 
@@ -188,14 +326,12 @@ def _run_integration_selftest() -> None:
     )
 
     assert len(pairs_df) == 5
-    # Verify both text and meta feature columns exist
     assert "title_token_set" in pairs_df.columns
     assert "title_exact_match" in pairs_df.columns
     assert "first_author_match" in pairs_df.columns
     assert "year_diff" in pairs_df.columns
     assert "arxiv_hint_match" in pairs_df.columns
 
-    # Check positive row for devlin2018 (subtitle truncation)
     devlin_row = pairs_df[pairs_df["citation_key"] == "devlin2018"].iloc[0]
     assert devlin_row["label"] == 1
     assert devlin_row["title_token_set"] == 1.0
@@ -210,9 +346,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build unified Milestone 3 dataset (Text + Metadata features & Train/Valid/Test split)."
     )
-    parser.add_argument("--bibtex", type=str, help="Path to unified bibtex table (parquet file or dir).")
-    parser.add_argument("--references", type=str, help="Path to references table (parquet file or dir).")
-    parser.add_argument("--labels", type=str, help="Path to labels table from Manh Dat (parquet/csv/json).")
+    parser.add_argument("--bibtex", nargs="+", help="Path(s) to unified bibtex parquet file(s) or dir(s).")
+    parser.add_argument("--references", nargs="+", help="Path(s) to references parquet file(s) or dir(s).")
+    parser.add_argument("--manual-labels", type=str, default="src/m3/manual_truth.csv", help="Path to manual_truth.csv.")
+    parser.add_argument("--auto-labels", type=str, default="src/m3/auto_truth.csv", help="Path to auto_truth.csv.")
+    parser.add_argument("--labels", type=str, default=None, help="Optional single unified labels file (overrides manual/auto).")
     parser.add_argument("--out", type=str, default="data/matching", help="Output directory (default: data/matching).")
     parser.add_argument("--k", type=int, default=1, help="Number of manual & auto pubs in valid/test (default: 1).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
@@ -225,16 +363,22 @@ def main() -> None:
         _run_integration_selftest()
         return
 
-    if not args.bibtex or not args.labels:
+    if not args.bibtex:
         parser.print_help()
-        print("\nError: --bibtex and --labels are required when not running --selftest.")
+        print("\nError: --bibtex is required when not running --selftest.")
         return
 
     print("=== Milestone 3: Building Unified Dataset (Text + Metadata) ===")
-    bib_df = load_table(args.bibtex)
-    labels_df = load_table(args.labels)
+    bib_df = load_many_tables(args.bibtex)
+
+    if args.labels:
+        labels_df = load_table(args.labels)
+    else:
+        labels_df = load_and_merge_labels(args.manual_labels, args.auto_labels)
+    print(f"Loaded {len(labels_df):,} valid matched label entries.")
+
     if args.references:
-        ref_df = load_table(args.references)
+        ref_df = load_many_tables(args.references)
     else:
         print("No --references specified, gathering from data/*/references.json...")
         ref_df = collect_references_from_json("data")
@@ -262,4 +406,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
