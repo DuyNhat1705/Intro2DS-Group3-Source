@@ -13,6 +13,7 @@
 - [Installation and Setup](#iv-installation-and-setup)
 - [Usage](#v-usage)
 - [Dependencies](#vi-dependencies)
+- [Milestone 3 automatic labeling](src/m3/auto_label.py)
 
 ---
 
@@ -55,6 +56,7 @@ Intro2DS-Group3-Source/
 |   ├── scraper.ipynb                # Milestone 1: collection and reporting
 |   ├── m2/                          # Milestone 2: parser package (see section VII)
 |   ├── parser.ipynb                 # Milestone 2: Colab/local runner and benchmark notebook
+|   ├── m3/                          # Milestone 3: automatic citation labeling and evaluation
 |   ├── intro2ds-env.yml             # Conda environment (Python 3.12)
 |   └── requirements.txt             # Pinned Python dependencies
 ├── data/                            # Local generated corpus
