@@ -368,3 +368,27 @@ class CachedTextFeatureExtractor:
         # Uses standard function, but warm caches accelerate repeated titles
         return extract_text_features(bib_title, ref_title, bib_journal, ref_venue)
 
+
+def _safe_str(val: Any) -> Optional[str]:
+    """Convert None, float NaN, or non-string safely to str or None."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+
+def compute_text_features(bib: Dict[str, Any], ref: Dict[str, Any]) -> Dict[str, float]:
+    """Pluggable feature adapter compatible with features_meta.build_pair_table.
+
+    Accepts a prepared (or raw) BibTeX dict and Reference dict, extracts title & venue
+    fields safely, and returns all 17 text similarity features.
+    """
+    bib_title = _safe_str(bib.get("title"))
+    ref_title = _safe_str(ref.get("ref_title") if ref.get("ref_title") is not None else ref.get("title"))
+    bib_journal = _safe_str(bib.get("journal") if bib.get("journal") is not None else bib.get("booktitle"))
+    ref_venue = _safe_str(ref.get("ref_venue") if ref.get("ref_venue") is not None else ref.get("venue"))
+    return extract_text_features(bib_title, ref_title, bib_journal, ref_venue)
+
+
